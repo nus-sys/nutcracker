@@ -13,7 +13,7 @@ include "mlir/Interfaces/LoopLikeInterface.td"
 include "mlir/Interfaces/MemorySlotInterfaces.td"
 include "mlir/Interfaces/SideEffectInterfaces.td"
 
-include "Dialect/PDG/IR/PDGDialect.td"
+include "Dialect/PDG/PDGDialect.td"
 
 // Base PDG Operations
 class PDG_Op<string mnemonic, list<Trait> traits = []> :

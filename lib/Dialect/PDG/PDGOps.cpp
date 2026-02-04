@@ -34,3 +34,7 @@
 using namespace mlir;
 using namespace mlir::LLVM;
 using namespace mlir::pdg;
+
+#define GET_OP_CLASSES
+#include "Dialect/PDG/PDGDialect.cpp.inc"
+#include "Dialect/PDG/PDGOps.cpp.inc"
