@@ -6,8 +6,9 @@
 #include "Dialect/PDG/PDGOps.h"
 
 using namespace mlir;
+using namespace mlir::pdg;
 
-void mlir::pdg::PDGDialect::initialize() {
+void PDGDialect::initialize() {
     std::cout << "Initializing PDG Dialect..." << std::endl;
     addOperations<
 #define GET_OP_LIST
