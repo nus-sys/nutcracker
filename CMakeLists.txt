@@ -66,8 +66,8 @@ set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/bin)
 
 # Subdirectories for your project components
-#add_subdirectory(include)
-#add_subdirectory(lib)
+add_subdirectory(include)
+add_subdirectory(lib)
 # add_subdirectory(tests)
 add_subdirectory(tools)
 
