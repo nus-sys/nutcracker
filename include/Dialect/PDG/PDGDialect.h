@@ -5,6 +5,6 @@
 
 #include "mlir/IR/Dialect.h"
 
-#include "Dialect/PDG/PDGOpsDialect.h.inc"
+#include "Dialect/PDG/PDGDialect.h.inc"
 
 #endif // PDG_DIALECT_PDGDIALECT_H_
