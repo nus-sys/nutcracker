@@ -8,6 +8,6 @@
 #include "mlir/IR/OpDefinition.h"
 
 #define GET_OP_CLASSES
-#include "Dialect/PDG/IR/PDGOps.h.inc"
+#include "Dialect/PDG/PDGOps.h.inc"
 
 #endif // PDG_DIALECT_PDGOPS_H_
