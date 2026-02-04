@@ -1,6 +1,6 @@
 // PDG Dialect.h - Program Dependence Graph Dialect -*- C++ -*-
 
-#ifdef PDG_DIALECT_PDGDIALECT_H_
+#ifndef PDG_DIALECT_PDGDIALECT_H_
 #define PDG_DIALECT_PDGDIALECT_H_
 
 #include "mlir/IR/Dialect.h"
