@@ -1,0 +1,61 @@
+;; Hardware topology definition
+(hardware CPU)
+(hardware DRMT)
+(hardware DPA)
+
+;; Communication links
+(link CPU DRMT 10.0 1.0)
+(link DRMT CPU 10.0 1.0)
+(link CPU DPA 50.0 0.5)
+(link DPA CPU 50.0 0.5)
+
+;; Operation cost annotations
+(function cpu_add (Type Type) Type :cost 5)
+(function cpu_check (Type) Type :cost 8)
+(function drmt_add (Type Type) Type :cost 2)
+(function drmt_check (Type) Type :cost 3)
+(function dpa_add (Type Type) Type :cost 1)
+(function dpa_check (Type) Type :cost 2)
+
+;; Define operations for block 1 - CPU version
+(let blk1_cpu_op0 (cpu_check input1))
+(let blk1_cpu_op1 (cpu_add blk1_cpu_op0 constant1))
+(let blk1_cpu_ops (vec-of blk1_cpu_op0 blk1_cpu_op1))
+
+;; Define operations for block 1 - DRMT version
+(let blk1_drmt_op0 (drmt_check input1))
+(let blk1_drmt_op1 (drmt_add blk1_drmt_op0 constant1))
+(let blk1_drmt_ops (vec-of blk1_drmt_op0 blk1_drmt_op1))
+
+;; Define operations for block 1 - DPA version
+(let blk1_dpa_op0 (dpa_check input1))
+(let blk1_dpa_op1 (dpa_add blk1_dpa_op0 constant1))
+(let blk1_dpa_ops (vec-of blk1_dpa_op0 blk1_dpa_op1))
+
+;; Block 1 implementations
+(implement blk1_cpu CPU () blk1_cpu_ops)
+(implement blk1_drmt DRMT () blk1_drmt_ops)
+(implement blk1_dpa DPA () blk1_dpa_ops)
+
+;; Define operations for block 2 - CPU version (depends on blk1)
+(let blk2_cpu_op0 (cpu_add result1 input2))
+(let blk2_cpu_ops (vec-of blk2_cpu_op0))
+
+;; Define operations for block 2 - DRMT version
+(let blk2_drmt_op0 (drmt_add result1 input2))
+(let blk2_drmt_ops (vec-of blk2_drmt_op0))
+
+;; Define operations for block 2 - DPA version
+(let blk2_dpa_op0 (dpa_add result1 input2))
+(let blk2_dpa_ops (vec-of blk2_dpa_op0))
+
+;; Block 2 implementations (depends on blk1)
+(implement blk2_cpu CPU (blk1) blk2_cpu_ops)
+(implement blk2_drmt DRMT (blk1) blk2_drmt_ops)
+(implement blk2_dpa DPA (blk1) blk2_dpa_ops)
+
+;; Optional: Rewrite rules (for compatibility)
+(rewrite blk1_cpu blk1_drmt)
+(rewrite blk1_cpu blk1_dpa)
+(rewrite blk2_cpu blk2_drmt)
+(rewrite blk2_cpu blk2_dpa)

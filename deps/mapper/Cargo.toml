@@ -1,0 +1,13 @@
+[package]
+name = "mapper"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+egglog-ast = { path = "./egglog_ast" }
+ordered-float = "4.0"
+thiserror = "1.0"
+clap = { version = "4.0", features = ["derive"] }
+egg = "0.9"
