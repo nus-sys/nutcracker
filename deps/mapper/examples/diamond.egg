@@ -1,0 +1,82 @@
+;; Hardware topology
+(hardware CPU)
+(hardware DRMT)
+(hardware DPA)
+
+(link CPU DRMT 10.0 1.0)
+(link DRMT CPU 10.0 1.0)
+(link CPU DPA 50.0 0.5)
+(link DPA CPU 50.0 0.5)
+
+;; CPU operations
+(function cpu_parse (Type) Type :cost 10)
+(function cpu_validate (Type) Type :cost 8)
+(function cpu_hash (Type) Type :cost 15)
+(function cpu_lookup (Type Type) Type :cost 20)
+
+;; DRMT operations (optimized)
+(function drmt_parse (Type) Type :cost 5)
+(function drmt_validate (Type) Type :cost 3)
+(function drmt_hash (Type) Type :cost 8)
+(function drmt_lookup (Type Type) Type :cost 10)
+
+;; DPA operations (very fast)
+(function dpa_validate (Type) Type :cost 2)
+
+;; Block 1: Parse (root block)
+(let blk1_cpu_op0 (cpu_parse header))
+(let blk1_cpu_ops (vec-of blk1_cpu_op0))
+
+(let blk1_drmt_op0 (drmt_parse header))
+(let blk1_drmt_ops (vec-of blk1_drmt_op0))
+
+(implement blk1_cpu CPU () blk1_cpu_ops)
+(implement blk1_drmt DRMT () blk1_drmt_ops)
+
+;; Block 2: Validate IPv4 (depends on blk1)
+(let blk2_cpu_op0 (cpu_validate blk1_result))
+(let blk2_cpu_ops (vec-of blk2_cpu_op0))
+
+(let blk2_drmt_op0 (drmt_validate blk1_result))
+(let blk2_drmt_ops (vec-of blk2_drmt_op0))
+
+(let blk2_dpa_op0 (dpa_validate blk1_result))
+(let blk2_dpa_ops (vec-of blk2_dpa_op0))
+
+(implement blk2_cpu CPU (blk1) blk2_cpu_ops)
+(implement blk2_drmt DRMT (blk1) blk2_drmt_ops)
+(implement blk2_dpa DPA (blk1) blk2_dpa_ops)
+
+;; Block 3: Validate TCP (also depends on blk1)
+(let blk3_cpu_op0 (cpu_validate blk1_result))
+(let blk3_cpu_ops (vec-of blk3_cpu_op0))
+
+(let blk3_drmt_op0 (drmt_validate blk1_result))
+(let blk3_drmt_ops (vec-of blk3_drmt_op0))
+
+(let blk3_dpa_op0 (dpa_validate blk1_result))
+(let blk3_dpa_ops (vec-of blk3_dpa_op0))
+
+(implement blk3_cpu CPU (blk1) blk3_cpu_ops)
+(implement blk3_drmt DRMT (blk1) blk3_drmt_ops)
+(implement blk3_dpa DPA (blk1) blk3_dpa_ops)
+
+;; Block 4: Compute hash (depends on blk2)
+(let blk4_cpu_op0 (cpu_hash blk2_result))
+(let blk4_cpu_ops (vec-of blk4_cpu_op0))
+
+(let blk4_drmt_op0 (drmt_hash blk2_result))
+(let blk4_drmt_ops (vec-of blk4_drmt_op0))
+
+(implement blk4_cpu CPU (blk2) blk4_cpu_ops)
+(implement blk4_drmt DRMT (blk2) blk4_drmt_ops)
+
+;; Block 5: Table lookup (depends on blk3 AND blk4 - diamond join!)
+(let blk5_cpu_op0 (cpu_lookup blk3_result blk4_result))
+(let blk5_cpu_ops (vec-of blk5_cpu_op0))
+
+(let blk5_drmt_op0 (drmt_lookup blk3_result blk4_result))
+(let blk5_drmt_ops (vec-of blk5_drmt_op0))
+
+(implement blk5_cpu CPU (blk3 blk4) blk5_cpu_ops)
+(implement blk5_drmt DRMT (blk3 blk4) blk5_drmt_ops)
