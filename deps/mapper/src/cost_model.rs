@@ -4,20 +4,25 @@ use std::fmt;
 
 use crate::dataflow::{Hardware, HardwareTopology};
 
+/// Operation type for modeling parallelism
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpType {
+    Stateless,  // Independent operations (default)
+    Stateful,   // Shared-resource operations
+}
+
+impl Default for OpType {
+    fn default() -> Self {
+        OpType::Stateless
+    }
+}
+
 /// Multi-objective cost with three dimensions
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cost {
-    /// Latency: time to complete (cycles, ms) - LOWER is better
     pub latency: f64,
-    
-    /// Throughput: operations per unit time - HIGHER is better
-    /// We store 1/throughput so lower is better for consistency
     pub inverse_throughput: f64,
-    
-    /// Energy: total energy consumption (joules) - LOWER is better
     pub energy: f64,
-    
-    /// Communication cost (latency component)
     pub communication: f64,
 }
 
@@ -31,7 +36,6 @@ impl Cost {
         }
     }
 
-    #[allow(dead_code)]
     pub fn with_comm(latency: f64, throughput: f64, energy: f64, communication: f64) -> Self {
         Self {
             latency,
@@ -59,7 +63,6 @@ impl Cost {
         }
     }
 
-    /// Get actual throughput (inverse of inverse_throughput)
     pub fn throughput(&self) -> f64 {
         if self.inverse_throughput > 0.0 {
             1.0 / self.inverse_throughput
@@ -68,12 +71,10 @@ impl Cost {
         }
     }
 
-    /// Total latency including communication
     pub fn total_latency(&self) -> f64 {
         self.latency + self.communication
     }
 
-    /// Check if feasible
     pub fn is_feasible(&self) -> bool {
         self.latency.is_finite()
             && self.inverse_throughput.is_finite()
@@ -81,32 +82,24 @@ impl Cost {
             && self.communication.is_finite()
     }
 
-    /// Add two costs (for sequential composition)
     pub fn add_sequential(&self, other: &Cost) -> Cost {
         Cost {
             latency: self.latency + other.latency,
-            // Sequential: throughput limited by slowest stage
             inverse_throughput: self.inverse_throughput.max(other.inverse_throughput),
             energy: self.energy + other.energy,
             communication: self.communication + other.communication,
         }
     }
 
-    /// Add costs for parallel composition
-    #[allow(dead_code)]
     pub fn add_parallel(&self, other: &Cost) -> Cost {
         Cost {
-            // Parallel: latency is max of both paths
             latency: self.latency.max(other.latency),
-            // Parallel: throughput is min of both (bottleneck)
             inverse_throughput: self.inverse_throughput.max(other.inverse_throughput),
-            // Energy: sum of both
             energy: self.energy + other.energy,
             communication: self.communication + other.communication,
         }
     }
 
-    /// Pareto dominance: better in all objectives
     pub fn dominates(&self, other: &Cost) -> bool {
         let better_latency = self.total_latency() < other.total_latency();
         let better_throughput = self.inverse_throughput < other.inverse_throughput;
@@ -122,7 +115,6 @@ impl Cost {
             && not_worse_energy
     }
 
-    /// Weighted sum for single-objective optimization
     pub fn weighted_sum(&self, weights: &ObjectiveWeights) -> f64 {
         if !self.is_feasible() {
             return f64::INFINITY;
@@ -146,6 +138,61 @@ impl fmt::Display for Cost {
     }
 }
 
+/// Detailed operation cost with type information
+#[derive(Debug, Clone, Copy)]
+pub struct OpCost {
+    pub latency: f64,
+    pub energy: f64,
+    pub throughput: f64,
+    pub op_type: OpType,
+    pub sigma: f64,  // Contention factor for stateful ops (only used if op_type == Stateful)
+}
+
+impl OpCost {
+    pub fn new_stateless(latency: f64, energy: f64, throughput: f64) -> Self {
+        Self {
+            latency,
+            energy,
+            throughput,
+            op_type: OpType::Stateless,
+            sigma: 0.0,
+        }
+    }
+
+    pub fn new_stateful(latency: f64, energy: f64, throughput: f64, sigma: f64) -> Self {
+        Self {
+            latency,
+            energy,
+            throughput,
+            op_type: OpType::Stateful,
+            sigma,
+        }
+    }
+}
+
+/// Hardware configuration with parallelism parameters
+#[derive(Debug, Clone)]
+pub struct HardwareConfig {
+    pub num_cores: usize,
+    pub default_sigma: f64,  // Default contention factor for this hardware
+}
+
+impl HardwareConfig {
+    pub fn new(num_cores: usize, default_sigma: f64) -> Self {
+        Self {
+            num_cores,
+            default_sigma,
+        }
+    }
+
+    pub fn single_core() -> Self {
+        Self {
+            num_cores: 1,
+            default_sigma: 0.0,
+        }
+    }
+}
+
 /// Weights for multi-objective optimization
 #[derive(Debug, Clone, Copy)]
 pub struct ObjectiveWeights {
@@ -155,7 +202,6 @@ pub struct ObjectiveWeights {
 }
 
 impl ObjectiveWeights {
-    /// Optimize for minimum latency
     pub fn min_latency() -> Self {
         Self {
             latency: 1.0,
@@ -164,7 +210,6 @@ impl ObjectiveWeights {
         }
     }
 
-    /// Optimize for maximum throughput
     pub fn max_throughput() -> Self {
         Self {
             latency: 0.0,
@@ -173,7 +218,6 @@ impl ObjectiveWeights {
         }
     }
 
-    /// Optimize for minimum energy
     pub fn min_energy() -> Self {
         Self {
             latency: 0.0,
@@ -182,7 +226,6 @@ impl ObjectiveWeights {
         }
     }
 
-    /// Balanced optimization
     pub fn balanced() -> Self {
         Self {
             latency: 1.0,
@@ -191,8 +234,6 @@ impl ObjectiveWeights {
         }
     }
 
-    /// Custom weights
-    #[allow(dead_code)]
     pub fn custom(latency: f64, throughput: f64, energy: f64) -> Self {
         Self {
             latency,
@@ -204,8 +245,11 @@ impl ObjectiveWeights {
 
 /// Cost model with three objectives
 pub struct CostModel {
-    /// Operation costs: (op_name, hardware) -> Cost
-    pub op_costs: HashMap<(String, String), Cost>,
+    /// Detailed operation costs: (op_name, hardware) -> OpCost
+    pub op_costs: HashMap<(String, String), OpCost>,
+
+    /// Hardware configurations: hardware_name -> HardwareConfig
+    pub hw_configs: HashMap<String, HardwareConfig>,
 
     /// Hardware topology (defines communication costs)
     pub topology: HardwareTopology,
@@ -221,34 +265,59 @@ impl CostModel {
     pub fn from_topology(topology: HardwareTopology, weights: ObjectiveWeights) -> Self {
         Self {
             op_costs: HashMap::new(),
+            hw_configs: HashMap::new(),
             topology,
             transfer_sizes: HashMap::new(),
             weights,
         }
     }
 
-    pub fn set_op_cost(&mut self, op_name: &str, hw: &Hardware, cost: Cost) {
-        self.op_costs.insert((op_name.to_string(), hw.name().to_string()), cost);
+    /// Set detailed operation cost with type information
+    pub fn set_op_cost_detailed(&mut self, op_name: &str, hw: &Hardware, op_cost: OpCost) {
+        self.op_costs.insert((op_name.to_string(), hw.name().to_string()), op_cost);
     }
 
-    pub fn get_op_cost(&self, op_name: &str, hw: &Hardware) -> Cost {
+    /// Legacy method for backward compatibility
+    pub fn set_op_cost(&mut self, op_name: &str, hw: &Hardware, cost: Cost) {
+        let op_cost = OpCost::new_stateless(cost.latency, cost.energy, cost.throughput());
+        self.set_op_cost_detailed(op_name, hw, op_cost);
+    }
+
+    /// Get detailed operation cost
+    pub fn get_op_cost_detailed(&self, op_name: &str, hw: &Hardware) -> OpCost {
         self.op_costs
             .get(&(op_name.to_string(), hw.name().to_string()))
             .copied()
-            .unwrap_or_else(|| Cost::new(1.0, 1.0, 1.0))
+            .unwrap_or_else(|| OpCost::new_stateless(1.0, 1.0, 1.0))
+    }
+
+    /// Legacy method - returns simplified Cost
+    pub fn get_op_cost(&self, op_name: &str, hw: &Hardware) -> Cost {
+        let op_cost = self.get_op_cost_detailed(op_name, hw);
+        Cost::new(op_cost.latency, op_cost.throughput, op_cost.energy)
+    }
+
+    /// Set hardware configuration
+    pub fn set_hw_config(&mut self, hw_name: &str, config: HardwareConfig) {
+        self.hw_configs.insert(hw_name.to_string(), config);
+    }
+
+    /// Get hardware configuration (default: single core)
+    pub fn get_hw_config(&self, hw: &Hardware) -> HardwareConfig {
+        self.hw_configs
+            .get(hw.name())
+            .cloned()
+            .unwrap_or_else(HardwareConfig::single_core)
     }
 
     pub fn get_comm_cost(&self, from_hw: &Hardware, to_hw: &Hardware, data_size: f64) -> f64 {
-        // Same hardware - zero cost
         if from_hw.name() == to_hw.name() {
             return 0.0;
         }
 
-        // Look up communication link
         if let Some(link) = self.topology.get_link(from_hw.name(), to_hw.name()) {
             link.latency_per_unit * data_size
         } else {
-            // No link defined - infinite cost (disconnected)
             f64::INFINITY
         }
     }
@@ -257,14 +326,55 @@ impl CostModel {
         self.topology.is_connected(from_hw.name(), to_hw.name())
     }
 
+    /// Compute block cost using paper's formula:
+    /// L_Comp = Cost_indep + Cost_shared × (1 + σ(P-1))
+    /// T_Comp = P / L_Comp
     pub fn compute_block_cost(&self, ops: &[String], hw: &Hardware) -> Cost {
-        let mut total = Cost::zero();
-        for op in ops {
-            let op_cost = self.get_op_cost(op, hw);
-            // Sequential within a block
-            total = total.add_sequential(&op_cost);
+        let hw_config = self.get_hw_config(hw);
+        let P = hw_config.num_cores as f64;
+
+        let mut cost_indep = 0.0;
+        let mut cost_shared = 0.0;
+        let mut energy_indep = 0.0;
+        let mut energy_shared = 0.0;
+        let mut max_sigma: f64 = 0.0;
+
+        for op_name in ops {
+            let op_cost = self.get_op_cost_detailed(op_name, hw);
+
+            match op_cost.op_type {
+                OpType::Stateless => {
+                    cost_indep += op_cost.latency;
+                    energy_indep += op_cost.energy;
+                }
+                OpType::Stateful => {
+                    cost_shared += op_cost.latency;
+                    energy_shared += op_cost.energy;
+                    // Use max sigma among all stateful ops in block
+                    max_sigma = max_sigma.max(op_cost.sigma);
+                }
+            }
         }
-        total
+
+        // If no stateful ops have sigma set, use hardware default
+        if max_sigma == 0.0 && cost_shared > 0.0 {
+            max_sigma = hw_config.default_sigma;
+        }
+
+        // Paper's formula: L_Comp = Cost_indep + Cost_shared × (1 + σ(P-1))
+        let total_latency = cost_indep + cost_shared * (1.0 + max_sigma * (P - 1.0));
+
+        // Throughput: T_Comp = P / L_Comp
+        let throughput = if total_latency > 0.0 {
+            P / total_latency
+        } else {
+            f64::INFINITY
+        };
+
+        // Energy: simple sum (no multi-core overhead for now)
+        let total_energy = energy_indep + energy_shared;
+
+        Cost::new(total_latency, throughput, total_energy)
     }
 }
 
@@ -321,19 +431,15 @@ impl BlockMapping {
             return;
         }
 
-        // Build a map from block ID to CostedBlock for dependency lookup
         let mut block_map: HashMap<String, &CostedBlock> = HashMap::new();
         for block in &self.blocks {
-            // Extract block ID from implementation name (e.g., "blk1_cpu" -> "blk1")
             let block_id = self.extract_block_id(&block.name);
             block_map.insert(block_id.to_string(), block);
         }
 
-        // Compute costs considering dataflow structure
         let mut block_costs: HashMap<String, Cost> = HashMap::new();
         let mut feasible = true;
 
-        // Topological sort to compute costs in dependency order
         let sorted = self.topological_sort();
 
         for block_name in &sorted {
@@ -343,7 +449,6 @@ impl BlockMapping {
             }) {
                 let mut total_cost = block.cost;
 
-                // Add communication costs from dependencies
                 for dep_block_id in &block.deps {
                     if let Some(dep_block) = block_map.get(dep_block_id) {
                         let data_size = cost_model
@@ -378,8 +483,6 @@ impl BlockMapping {
             return;
         }
 
-        // Compute final cost (depends on graph structure)
-        // For now, assume sequential execution (conservative)
         let mut total = Cost::zero();
         for block_name in &sorted {
             if let Some(cost) = block_costs.get(block_name) {
@@ -391,17 +494,14 @@ impl BlockMapping {
         self.is_feasible = true;
     }
 
-    /// Extract block ID from implementation name (e.g., "blk1_cpu" -> "blk1")
     fn extract_block_id<'a>(&self, impl_name: &'a str) -> &'a str {
         impl_name.split('_').next().unwrap_or(impl_name)
     }
 
-    /// Topological sort of blocks (by block ID, not implementation name)
     fn topological_sort(&self) -> Vec<String> {
         let mut visited = std::collections::HashSet::new();
         let mut result = Vec::new();
 
-        // Build dependency map by block ID
         let mut dep_map: HashMap<String, Vec<String>> = HashMap::new();
         for block in &self.blocks {
             let block_id = self.extract_block_id(&block.name);
@@ -452,50 +552,87 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cost_creation() {
-        let cost = Cost::new(10.0, 5.0, 3.0);
-        assert_eq!(cost.latency, 10.0);
-        assert_eq!(cost.throughput(), 5.0);
-        assert_eq!(cost.energy, 3.0);
+    fn test_stateless_parallelism() {
+        let mut cost_model = CostModel::from_topology(
+            HardwareTopology::new(),
+            ObjectiveWeights::balanced(),
+        );
+
+        let hw = Hardware::new("DPA".to_string());
+        cost_model.set_hw_config("DPA", HardwareConfig::new(8, 0.5));
+
+        // Two stateless ops, 10 cycles each
+        cost_model.set_op_cost_detailed(
+            "hash",
+            &hw,
+            OpCost::new_stateless(10.0, 5.0, 1.0),
+        );
+
+        let cost = cost_model.compute_block_cost(&vec!["hash".to_string(), "hash".to_string()], &hw);
+
+        // Cost_indep = 20, Cost_shared = 0
+        // L_Comp = 20 + 0 = 20 cycles
+        // T_Comp = 8 / 20 = 0.4 ops/cycle
+        assert_eq!(cost.latency, 20.0);
+        assert!((cost.throughput() - 0.4).abs() < 0.01);
     }
 
     #[test]
-    fn test_hardware_topology_in_cost_model() {
-        let mut topo = HardwareTopology::new();
-        topo.add_hardware("CPU".to_string());
-        topo.add_hardware("GPU".to_string());
-        topo.add_link("CPU".to_string(), "GPU".to_string(), 10.0, 1.0);
+    fn test_stateful_contention() {
+        let mut cost_model = CostModel::from_topology(
+            HardwareTopology::new(),
+            ObjectiveWeights::balanced(),
+        );
 
-        let cost_model = CostModel::from_topology(topo, ObjectiveWeights::balanced());
+        let hw = Hardware::new("DPA".to_string());
+        cost_model.set_hw_config("DPA", HardwareConfig::new(8, 0.5));
 
-        let cpu = Hardware::new("CPU".to_string());
-        let gpu = Hardware::new("GPU".to_string());
+        // Stateful op with sigma=1.0
+        cost_model.set_op_cost_detailed(
+            "table_lookup",
+            &hw,
+            OpCost::new_stateful(20.0, 10.0, 1.0, 1.0),
+        );
 
-        // Same hardware - zero cost
-        assert_eq!(cost_model.get_comm_cost(&cpu, &cpu, 1.0), 0.0);
-        
-        // Connected path
-        assert_eq!(cost_model.get_comm_cost(&cpu, &gpu, 1.0), 10.0);
-        assert_eq!(cost_model.get_comm_cost(&cpu, &gpu, 2.0), 20.0);
-        
-        // Disconnected (no link defined for GPU->CPU)
-        assert!(cost_model.get_comm_cost(&gpu, &cpu, 1.0).is_infinite());
+        let cost = cost_model.compute_block_cost(&vec!["table_lookup".to_string()], &hw);
+
+        // Cost_shared = 20, P = 8, sigma = 1.0
+        // L_Comp = 0 + 20 × (1 + 1.0 × (8-1)) = 20 × 8 = 160 cycles
+        // T_Comp = 8 / 160 = 0.05 ops/cycle
+        assert_eq!(cost.latency, 160.0);
+        assert!((cost.throughput() - 0.05).abs() < 0.01);
     }
 
     #[test]
-    fn test_is_connected() {
-        let mut topo = HardwareTopology::new();
-        topo.add_hardware("CPU".to_string());
-        topo.add_hardware("GPU".to_string());
-        topo.add_link("CPU".to_string(), "GPU".to_string(), 10.0, 1.0);
+    fn test_mixed_workload() {
+        let mut cost_model = CostModel::from_topology(
+            HardwareTopology::new(),
+            ObjectiveWeights::balanced(),
+        );
 
-        let cost_model = CostModel::from_topology(topo, ObjectiveWeights::balanced());
+        let hw = Hardware::new("DPA".to_string());
+        cost_model.set_hw_config("DPA", HardwareConfig::new(4, 0.5));
 
-        let cpu = Hardware::new("CPU".to_string());
-        let gpu = Hardware::new("GPU".to_string());
+        cost_model.set_op_cost_detailed(
+            "hash",
+            &hw,
+            OpCost::new_stateless(10.0, 5.0, 1.0),
+        );
+        cost_model.set_op_cost_detailed(
+            "lookup",
+            &hw,
+            OpCost::new_stateful(30.0, 15.0, 1.0, 0.8),
+        );
 
-        assert!(cost_model.is_connected(&cpu, &cpu));
-        assert!(cost_model.is_connected(&cpu, &gpu));
-        assert!(!cost_model.is_connected(&gpu, &cpu));
+        let cost = cost_model.compute_block_cost(
+            &vec!["hash".to_string(), "lookup".to_string()],
+            &hw,
+        );
+
+        // Cost_indep = 10, Cost_shared = 30, P = 4, sigma = 0.8
+        // L_Comp = 10 + 30 × (1 + 0.8 × 3) = 10 + 30 × 3.4 = 112 cycles
+        // T_Comp = 4 / 112 = 0.0357 ops/cycle
+        assert_eq!(cost.latency, 112.0);
+        assert!((cost.throughput() - 0.0357).abs() < 0.001);
     }
 }

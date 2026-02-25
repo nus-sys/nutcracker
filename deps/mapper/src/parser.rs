@@ -263,6 +263,9 @@ impl SexpParser {
 pub struct BlockParser {
     defined_ops: HashMap<String, Sexp>,
     pub op_costs: HashMap<String, f64>,
+    pub op_types: HashMap<String, crate::cost_model::OpType>,
+    pub op_sigmas: HashMap<String, f64>,
+    pub hw_configs: HashMap<String, crate::cost_model::HardwareConfig>,
 }
 
 impl BlockParser {
@@ -270,6 +273,9 @@ impl BlockParser {
         Self {
             defined_ops: HashMap::new(),
             op_costs: HashMap::new(),
+            op_types: HashMap::new(),
+            op_sigmas: HashMap::new(),
+            hw_configs: HashMap::new(),
         }
     }
 
@@ -301,18 +307,31 @@ impl BlockParser {
                         if !args.is_empty() {
                             let func_name = args[0].expect_atom()?;
                             let cost = self.extract_cost_from_function(args)?;
-                            self.op_costs.insert(func_name, cost);
+                            let op_type = self.extract_op_type_from_function(args)?;
+                            let sigma = self.extract_sigma_from_function(args)?;
+                            
+                            self.op_costs.insert(func_name.clone(), cost);
+                            self.op_types.insert(func_name.clone(), op_type);
+                            self.op_sigmas.insert(func_name, sigma);
                         }
                     }
                     "hardware" => {
-                        // (hardware CPU)
+                        // (hardware CPU :cores 16 :sigma 1.0)
                         if !args.is_empty() {
                             let hw_name = args[0].expect_atom()?;
-                            topology.add_hardware(hw_name);
+                            topology.add_hardware(hw_name.clone());
+                            
+                            // Extract cores and sigma
+                            let cores = self.extract_keyword_int(args, ":cores")?.unwrap_or(1);
+                            let sigma = self.extract_keyword_float(args, ":sigma")?.unwrap_or(0.0);
+                            
+                            self.hw_configs.insert(
+                                hw_name,
+                                crate::cost_model::HardwareConfig::new(cores as usize, sigma),
+                            );
                         }
                     }
                     "link" => {
-                        // (link CPU DRMT 10.0 1.0) - latency and bandwidth
                         if args.len() >= 3 {
                             let from = args[0].expect_atom()?;
                             let to = args[1].expect_atom()?;
@@ -320,12 +339,12 @@ impl BlockParser {
                             let bandwidth = if args.len() >= 4 {
                                 self.extract_float(&args[3])?
                             } else {
-                                1.0 // Default bandwidth
+                                1.0
                             };
                             topology.add_link(from, to, latency, bandwidth);
                         }
                     }
-                    "implement" | "Impt" => {  // Support both keywords
+                    "implement" | "Impt" => {
                         let impl_def = self.parse_implementation(args)?;
                         let block_id = self.extract_block_id(&impl_def.name);
                         blocks_map
@@ -359,8 +378,31 @@ impl BlockParser {
         Ok(DataflowGraph { blocks, rewrites, topology })
     }
 
+    fn extract_keyword_int(&self, args: &[Sexp], keyword: &str) -> Result<Option<i64>, ParseError> {
+        for i in 0..args.len() {
+            if let Sexp::Atom(kw, _) = &args[i] {
+                if kw == keyword && i + 1 < args.len() {
+                    if let Sexp::Literal(Literal::Int(val), _) = &args[i + 1] {
+                        return Ok(Some(*val));
+                    }
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    fn extract_keyword_float(&self, args: &[Sexp], keyword: &str) -> Result<Option<f64>, ParseError> {
+        for i in 0..args.len() {
+            if let Sexp::Atom(kw, _) = &args[i] {
+                if kw == keyword && i + 1 < args.len() {
+                    return Ok(Some(self.extract_float(&args[i + 1])?));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn extract_cost_from_function(&self, args: &[Sexp]) -> Result<f64, ParseError> {
-        // Look for :cost keyword followed by number
         for i in 0..args.len() {
             if let Sexp::Atom(keyword, _) = &args[i] {
                 if keyword == ":cost" && i + 1 < args.len() {
@@ -373,7 +415,38 @@ impl BlockParser {
                 }
             }
         }
-        Ok(1.0) // Default cost
+        Ok(1.0)
+    }
+
+    fn extract_op_type_from_function(&self, args: &[Sexp]) -> Result<crate::cost_model::OpType, ParseError> {
+        for i in 0..args.len() {
+            if let Sexp::Atom(keyword, _) = &args[i] {
+                if keyword == ":type" && i + 1 < args.len() {
+                    if let Sexp::Atom(type_str, _) = &args[i + 1] {
+                        match type_str.as_str() {
+                            "stateless" => return Ok(crate::cost_model::OpType::Stateless),
+                            "stateful" => return Ok(crate::cost_model::OpType::Stateful),
+                            _ => return Err(ParseError::Syntax(format!(
+                                "Unknown op type: {}. Expected 'stateless' or 'stateful'",
+                                type_str
+                            ))),
+                        }
+                    }
+                }
+            }
+        }
+        Ok(crate::cost_model::OpType::Stateless) // Default
+    }
+
+    fn extract_sigma_from_function(&self, args: &[Sexp]) -> Result<f64, ParseError> {
+        for i in 0..args.len() {
+            if let Sexp::Atom(keyword, _) = &args[i] {
+                if keyword == ":sigma" && i + 1 < args.len() {
+                    return self.extract_float(&args[i + 1]);
+                }
+            }
+        }
+        Ok(0.0) // Default
     }
 
     fn extract_float(&self, sexp: &Sexp) -> Result<f64, ParseError> {

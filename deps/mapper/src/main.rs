@@ -9,7 +9,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use parser::BlockParser;
-use cost_model::{CostModel, ObjectiveWeights, Cost};
+use cost_model::{CostModel, ObjectiveWeights, OpCost, OpType};
 use extractor::{BlockExtractor, EGraphData, BlockImpl};
 
 #[derive(ClapParser)]
@@ -197,7 +197,6 @@ fn extract_op_names(ops: &[dataflow::Operation]) -> Vec<String> {
         .collect()
 }
 
-/// Set up cost model from parsed data
 fn setup_cost_model(
     parser: &BlockParser,
     graph: &dataflow::DataflowGraph,
@@ -205,29 +204,39 @@ fn setup_cost_model(
 ) -> CostModel {
     let mut cost_model = CostModel::from_topology(graph.topology.clone(), weights);
 
-    // Load operation costs from parser
-    // Parser provides latency from :cost annotation
+    // Load hardware configs from parser
+    for (hw_name, hw_config) in &parser.hw_configs {
+        cost_model.set_hw_config(hw_name, hw_config.clone());
+    }
+
+    // Load operation costs from parser with type information
     for (op_name, latency) in &parser.op_costs {
+        let op_type = parser.op_types.get(op_name).copied().unwrap_or(OpType::Stateless);
+        let sigma = parser.op_sigmas.get(op_name).copied().unwrap_or(0.0);
+
         for hw_name in &graph.topology.hardware_types {
             let hw = dataflow::Hardware::new(hw_name.clone());
             
-            // Model hardware characteristics based on common types
-            // You can customize these multipliers based on hardware type
             let (latency_factor, throughput, energy_factor) = match hw_name.as_str() {
-                "CPU" | "ARM_CPU" | "x86_CPU" => (1.5, 2.0, 2.0),   // Slower, low throughput, high energy
-                "DRMT" | "SmartNIC" => (1.0, 5.0, 1.0),              // Baseline
-                "DPA" | "FPGA" => (0.5, 10.0, 0.5),                  // Faster, high throughput, low energy
-                _ => (1.0, 1.0, 1.0), // Default for unknown hardware
+                "CPU" | "ARM_CPU" | "x86_CPU" => (1.5, 2.0, 2.0),
+                "DRMT" | "SmartNIC" => (1.0, 5.0, 1.0),
+                "DPA" | "FPGA" => (0.5, 10.0, 0.5),
+                _ => (1.0, 1.0, 1.0),
             };
 
             let op_latency = latency * latency_factor;
             let op_energy = latency * energy_factor;
 
-            cost_model.set_op_cost(op_name, &hw, Cost::new(op_latency, throughput, op_energy));
+            let op_cost = match op_type {
+                OpType::Stateless => OpCost::new_stateless(op_latency, op_energy, throughput),
+                OpType::Stateful => OpCost::new_stateful(op_latency, op_energy, throughput, sigma),
+            };
+
+            cost_model.set_op_cost_detailed(op_name, &hw, op_cost);
         }
     }
 
-    // Set default costs for operations not explicitly defined in parser
+    // Set default costs for operations not explicitly defined
     for block in graph.blocks.values() {
         for impl_def in &block.implementations {
             for op in &impl_def.ops {
@@ -237,24 +246,21 @@ fn setup_cost_model(
                     _ => continue,
                 };
 
-                // Check if already set
-                let current_cost = cost_model.get_op_cost(&op_name, &impl_def.hardware);
+                let current_cost = cost_model.get_op_cost_detailed(&op_name, &impl_def.hardware);
                 if current_cost.latency == 1.0 && current_cost.energy == 1.0 {
-                    // Not set, use hardware-specific defaults
                     let hw_name = impl_def.hardware.name();
                     let default_cost = match hw_name {
-                        "CPU" | "ARM_CPU" | "x86_CPU" => Cost::new(10.0, 2.0, 20.0),
-                        "DRMT" | "SmartNIC" => Cost::new(5.0, 5.0, 10.0),
-                        "DPA" | "FPGA" => Cost::new(2.0, 10.0, 3.0),
-                        _ => Cost::new(5.0, 5.0, 10.0),
+                        "CPU" | "ARM_CPU" | "x86_CPU" => OpCost::new_stateless(10.0, 20.0, 2.0),
+                        "DRMT" | "SmartNIC" => OpCost::new_stateless(5.0, 10.0, 5.0),
+                        "DPA" | "FPGA" => OpCost::new_stateless(2.0, 3.0, 10.0),
+                        _ => OpCost::new_stateless(5.0, 10.0, 5.0),
                     };
-                    cost_model.set_op_cost(&op_name, &impl_def.hardware, default_cost);
+                    cost_model.set_op_cost_detailed(&op_name, &impl_def.hardware, default_cost);
                 }
             }
         }
     }
 
-    // Set data transfer sizes (default to 1.0 unit)
     for block_id in graph.blocks.keys() {
         cost_model.transfer_sizes.insert(block_id.clone(), 1.0);
     }

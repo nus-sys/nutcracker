@@ -1,0 +1,40 @@
+; Define hardware with parallelism
+(hardware DRMT :cores 1 :sigma 0.0)
+(hardware DPA :cores 8 :sigma 0.5)
+(hardware CPU :cores 16 :sigma 1.0)
+
+; Define communication links
+(link DRMT DPA 50.0 1.0)
+(link DPA DRMT 30.0 1.0)
+(link DPA CPU 200.0 0.5)
+
+; Define functions with type and contention
+(function drmt_validate (Type) Type :cost 3 :type stateless)
+(function drmt_hash (Type) Type :cost 8 :type stateless)
+(function drmt_lookup (Type Type) Type :cost 10 :type stateful :sigma 0.3)
+
+(function dpa_hash (Type) Type :cost 50 :type stateless)
+(function dpa_lookup (Type Type) Type :cost 60 :type stateful :sigma 1.0)
+
+(function cpu_hash (Type) Type :cost 200 :type stateless)
+(function cpu_lookup (Type Type) Type :cost 300 :type stateful :sigma 1.5)
+
+; Define operations
+(let validate_op (drmt_validate pkt))
+(let hash_op_drmt (drmt_hash pkt))
+(let lookup_op_drmt (drmt_lookup key val))
+
+(let hash_op_dpa (dpa_hash pkt))
+(let lookup_op_dpa (dpa_lookup key val))
+
+; Define blocks
+(let blk1_ops (vec-of validate_op hash_op_drmt))
+(let blk2_ops (vec-of lookup_op_drmt))
+
+(implement blk1_drmt DRMT () blk1_ops)
+(implement blk2_drmt DRMT (blk1) blk2_ops)
+
+(implement blk2_dpa DPA (blk1) (vec-of hash_op_dpa lookup_op_dpa))
+
+; Rewrites
+(rewrite blk2_drmt blk2_dpa)

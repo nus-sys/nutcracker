@@ -1,0 +1,282 @@
+;; ============================================================================
+;; Hardware Configuration
+;; ============================================================================
+
+(hardware DRMT :cores 1 :sigma 0.0)
+(hardware DPA :cores 8 :sigma 0.5)
+(hardware ARM :cores 16 :sigma 1.0)
+
+;; ============================================================================
+;; Communication Links (BlueField-3 Topology)
+;; ============================================================================
+
+;; DRMT internal (loopback)
+(link DRMT DRMT 10.0 1.0)
+
+;; DRMT → DPA (packet recirculation to DPA cores)
+(link DRMT DPA 50.0 1.0)
+
+;; DPA → DRMT (return from DPA processing)
+(link DPA DRMT 30.0 1.0)
+
+;; DPA → ARM (offload to general-purpose cores via PCIe)
+(link DPA ARM 200.0 0.5)
+
+;; Note: No ARM→DPA or ARM→DRMT (ARM is exception path only)
+;; Note: No DRMT→ARM (must route through DPA)
+
+;; ============================================================================
+;; Operation Definitions (with costs and types)
+;; ============================================================================
+
+;; P4HIR dialect operations (base/generic)
+(function p4hir_struct_extract_ref (Type) Type :cost 5 :type stateless)
+(function p4hir_const (Type) Type :cost 2 :type stateless)
+(function p4hir_cast (Type) Type :cost 3 :type stateless)
+(function p4hir_assign (Type) Type :cost 5 :type stateful :sigma 0.3)
+(function p4hir_read (Type) Type :cost 4 :type stateless)
+(function p4hir_cmp (Type) Type :cost 5 :type stateless)
+(function p4hir_yield (Type) Type :cost 1 :type stateless)
+(function p4hir_if (Type) Type :cost 10 :type stateless)
+(function p4hir_variable (Type) Type :cost 3 :type stateless)
+
+;; BF3 DRMT dialect operations
+(function bf3drmt_struct_extract_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_constant (Type) Type :cost 1 :type stateless)
+(function bf3drmt_cast (Type) Type :cost 1 :type stateless)
+(function bf3drmt_assign (Type) Type :cost 2 :type stateful :sigma 0.1)
+(function bf3drmt_read (Type) Type :cost 1 :type stateless)
+(function bf3drmt_match_key (Type) Type :cost 3 :type stateless)
+
+;; BF3 DPA dialect operations
+(function bf3dpa_struct_extract_ref (Type) Type :cost 10 :type stateless)
+(function bf3dpa_constant (Type) Type :cost 5 :type stateless)
+(function bf3dpa_assign (Type) Type :cost 15 :type stateful :sigma 1.0)
+(function bf3dpa_read (Type) Type :cost 8 :type stateless)
+(function bf3dpa_cmp (Type) Type :cost 12 :type stateless)
+(function bf3dpa_if (Type) Type :cost 20 :type stateless)
+(function bf3dpa_yield (Type) Type :cost 2 :type stateless)
+
+;; ARM operations (slow, general-purpose)
+(function arm_struct_extract_ref (Type) Type :cost 20 :type stateless)
+(function arm_constant (Type) Type :cost 10 :type stateless)
+(function arm_assign (Type) Type :cost 25 :type stateful :sigma 1.5)
+(function arm_read (Type) Type :cost 15 :type stateless)
+(function arm_cmp (Type) Type :cost 18 :type stateless)
+(function arm_if (Type) Type :cost 30 :type stateless)
+
+;; ============================================================================
+;; Block 2: Metadata Initialization
+;; Valid on: DRMT, DPA, ARM
+;; ============================================================================
+
+(let blk2_drmt_op0 (p4hir_variable "Type"))
+(let blk2_drmt_op1 (bf3drmt_struct_extract_ref "Type"))
+(let blk2_drmt_op2 (bf3drmt_constant "Type"))
+(let blk2_drmt_op3 (bf3drmt_cast "Type"))
+(let blk2_drmt_op4 (bf3drmt_assign "Type"))
+(let blk2_drmt_ops (vec-of blk2_drmt_op0 blk2_drmt_op1 blk2_drmt_op2 blk2_drmt_op3 blk2_drmt_op4))
+
+(let blk2_dpa_op0 (p4hir_variable "Type"))
+(let blk2_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
+(let blk2_dpa_op2 (bf3dpa_constant "Type"))
+(let blk2_dpa_op3 (bf3dpa_assign "Type"))
+(let blk2_dpa_ops (vec-of blk2_dpa_op0 blk2_dpa_op1 blk2_dpa_op2 blk2_dpa_op3))
+
+(let blk2_arm_op0 (p4hir_variable "Type"))
+(let blk2_arm_op1 (arm_struct_extract_ref "Type"))
+(let blk2_arm_op2 (arm_constant "Type"))
+(let blk2_arm_op3 (arm_assign "Type"))
+(let blk2_arm_ops (vec-of blk2_arm_op0 blk2_arm_op1 blk2_arm_op2 blk2_arm_op3))
+
+(implement blk2_drmt DRMT () blk2_drmt_ops)
+(implement blk2_dpa DPA () blk2_dpa_ops)
+(implement blk2_arm ARM () blk2_arm_ops)
+
+;; ============================================================================
+;; Block 3: IPv4 Validity Check
+;; Valid on: DRMT, DPA, ARM
+;; ============================================================================
+
+(let blk3_drmt_op0 (p4hir_variable "Type"))
+(let blk3_drmt_op1 (bf3drmt_struct_extract_ref "Type"))
+(let blk3_drmt_op2 (bf3drmt_struct_extract_ref "Type"))
+(let blk3_drmt_op3 (bf3drmt_read "Type"))
+(let blk3_drmt_op4 (bf3drmt_constant "Type"))
+(let blk3_drmt_op5 (bf3drmt_match_key "Type"))
+(let blk3_drmt_ops (vec-of blk3_drmt_op0 blk3_drmt_op1 blk3_drmt_op2 blk3_drmt_op3 blk3_drmt_op4 blk3_drmt_op5))
+
+(let blk3_dpa_op0 (p4hir_variable "Type"))
+(let blk3_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
+(let blk3_dpa_op2 (bf3dpa_struct_extract_ref "Type"))
+(let blk3_dpa_op3 (bf3dpa_read "Type"))
+(let blk3_dpa_op4 (bf3dpa_constant "Type"))
+(let blk3_dpa_op5 (bf3dpa_cmp "Type"))
+(let blk3_dpa_op6 (p4hir_yield "Type"))
+(let blk3_dpa_op7 (bf3dpa_if "Type"))
+(let blk3_dpa_ops (vec-of blk3_dpa_op0 blk3_dpa_op1 blk3_dpa_op2 blk3_dpa_op3 blk3_dpa_op4 blk3_dpa_op5 blk3_dpa_op6 blk3_dpa_op7))
+
+(let blk3_arm_op0 (p4hir_variable "Type"))
+(let blk3_arm_op1 (arm_struct_extract_ref "Type"))
+(let blk3_arm_op2 (arm_struct_extract_ref "Type"))
+(let blk3_arm_op3 (arm_read "Type"))
+(let blk3_arm_op4 (arm_constant "Type"))
+(let blk3_arm_op5 (arm_cmp "Type"))
+(let blk3_arm_op6 (p4hir_yield "Type"))
+(let blk3_arm_op7 (arm_if "Type"))
+(let blk3_arm_ops (vec-of blk3_arm_op0 blk3_arm_op1 blk3_arm_op2 blk3_arm_op3 blk3_arm_op4 blk3_arm_op5 blk3_arm_op6 blk3_arm_op7))
+
+(implement blk3_drmt DRMT (blk2) blk3_drmt_ops)
+(implement blk3_dpa DPA (blk2) blk3_dpa_ops)
+(implement blk3_arm ARM (blk2) blk3_arm_ops)
+
+;; ============================================================================
+;; Block 6: Variable Declaration
+;; Valid on: DRMT, DPA, ARM
+;; ============================================================================
+
+(let blk6_drmt_op0 (p4hir_variable "Type"))
+(let blk6_drmt_op1 (p4hir_variable "Type"))
+(let blk6_drmt_op2 (p4hir_variable "Type"))
+(let blk6_drmt_ops (vec-of blk6_drmt_op0 blk6_drmt_op1 blk6_drmt_op2))
+
+(let blk6_dpa_op0 (p4hir_variable "Type"))
+(let blk6_dpa_op1 (p4hir_variable "Type"))
+(let blk6_dpa_op2 (p4hir_variable "Type"))
+(let blk6_dpa_ops (vec-of blk6_dpa_op0 blk6_dpa_op1 blk6_dpa_op2))
+
+(let blk6_arm_op0 (p4hir_variable "Type"))
+(let blk6_arm_op1 (p4hir_variable "Type"))
+(let blk6_arm_op2 (p4hir_variable "Type"))
+(let blk6_arm_ops (vec-of blk6_arm_op0 blk6_arm_op1 blk6_arm_op2))
+
+(implement blk6_drmt DRMT (blk3) blk6_drmt_ops)
+(implement blk6_dpa DPA (blk3) blk6_dpa_ops)
+(implement blk6_arm ARM (blk3) blk6_arm_ops)
+
+;; ============================================================================
+;; Block 7: Counter Update (Stateful, High Contention)
+;; Valid on: DPA, ARM only (DRMT has limited stateful ops)
+;; ============================================================================
+
+(function dpa_counter_update (Type) Type :cost 80 :type stateful :sigma 1.5)
+(function dpa_atomic_add (Type) Type :cost 60 :type stateful :sigma 1.2)
+(function arm_counter_update (Type) Type :cost 150 :type stateful :sigma 2.0)
+
+(let blk7_dpa_op0 (p4hir_variable "Type"))
+(let blk7_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
+(let blk7_dpa_op2 (dpa_atomic_add "Type"))
+(let blk7_dpa_ops (vec-of blk7_dpa_op0 blk7_dpa_op1 blk7_dpa_op2))
+
+(let blk7_arm_op0 (p4hir_variable "Type"))
+(let blk7_arm_op1 (arm_struct_extract_ref "Type"))
+(let blk7_arm_op2 (arm_counter_update "Type"))
+(let blk7_arm_ops (vec-of blk7_arm_op0 blk7_arm_op1 blk7_arm_op2))
+
+(implement blk7_dpa DPA (blk6) blk7_dpa_ops)
+(implement blk7_arm ARM (blk6) blk7_arm_ops)
+
+;; ============================================================================
+;; Block 8: Hash Computation (Stateless)
+;; Valid on: DRMT, DPA, ARM
+;; ============================================================================
+
+(function drmt_hash (Type) Type :cost 5 :type stateless)
+(function dpa_hash (Type) Type :cost 50 :type stateless)
+(function arm_hash (Type) Type :cost 200 :type stateless)
+
+(let blk8_drmt_op0 (p4hir_variable "Type"))
+(let blk8_drmt_op1 (drmt_hash "Type"))
+(let blk8_drmt_ops (vec-of blk8_drmt_op0 blk8_drmt_op1))
+
+(let blk8_dpa_op0 (p4hir_variable "Type"))
+(let blk8_dpa_op1 (dpa_hash "Type"))
+(let blk8_dpa_ops (vec-of blk8_dpa_op0 blk8_dpa_op1))
+
+(let blk8_arm_op0 (p4hir_variable "Type"))
+(let blk8_arm_op1 (arm_hash "Type"))
+(let blk8_arm_ops (vec-of blk8_arm_op0 blk8_arm_op1))
+
+(implement blk8_drmt DRMT (blk3) blk8_drmt_ops)
+(implement blk8_dpa DPA (blk3) blk8_dpa_ops)
+(implement blk8_arm ARM (blk3) blk8_arm_ops)
+
+;; ============================================================================
+;; Block 9: Table Lookup (Stateful)
+;; Valid on: DRMT, DPA, ARM
+;; ============================================================================
+
+(function drmt_table_lookup (Type) Type :cost 8 :type stateful :sigma 0.3)
+(function dpa_table_lookup (Type) Type :cost 60 :type stateful :sigma 1.0)
+(function arm_table_lookup (Type) Type :cost 300 :type stateful :sigma 1.8)
+
+(let blk9_drmt_op0 (p4hir_variable "Type"))
+(let blk9_drmt_op1 (bf3drmt_struct_extract_ref "Type"))
+(let blk9_drmt_op2 (drmt_table_lookup "Type"))
+(let blk9_drmt_ops (vec-of blk9_drmt_op0 blk9_drmt_op1 blk9_drmt_op2))
+
+(let blk9_dpa_op0 (p4hir_variable "Type"))
+(let blk9_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
+(let blk9_dpa_op2 (dpa_table_lookup "Type"))
+(let blk9_dpa_ops (vec-of blk9_dpa_op0 blk9_dpa_op1 blk9_dpa_op2))
+
+(let blk9_arm_op0 (p4hir_variable "Type"))
+(let blk9_arm_op1 (arm_struct_extract_ref "Type"))
+(let blk9_arm_op2 (arm_table_lookup "Type"))
+(let blk9_arm_ops (vec-of blk9_arm_op0 blk9_arm_op1 blk9_arm_op2))
+
+(implement blk9_drmt DRMT (blk8) blk9_drmt_ops)
+(implement blk9_dpa DPA (blk8) blk9_dpa_ops)
+(implement blk9_arm ARM (blk8) blk9_arm_ops)
+
+;; ============================================================================
+;; Block 10: Forwarding Decision (depends on blk7 and blk9)
+;; Valid on: DRMT, DPA, ARM
+;; ============================================================================
+
+(let blk10_drmt_op0 (p4hir_variable "Type"))
+(let blk10_drmt_op1 (bf3drmt_assign "Type"))
+(let blk10_drmt_ops (vec-of blk10_drmt_op0 blk10_drmt_op1))
+
+(let blk10_dpa_op0 (p4hir_variable "Type"))
+(let blk10_dpa_op1 (bf3dpa_assign "Type"))
+(let blk10_dpa_ops (vec-of blk10_dpa_op0 blk10_dpa_op1))
+
+(let blk10_arm_op0 (p4hir_variable "Type"))
+(let blk10_arm_op1 (arm_assign "Type"))
+(let blk10_arm_ops (vec-of blk10_arm_op0 blk10_arm_op1))
+
+(implement blk10_drmt DRMT (blk7 blk9) blk10_drmt_ops)
+(implement blk10_dpa DPA (blk7 blk9) blk10_dpa_ops)
+(implement blk10_arm ARM (blk7 blk9) blk10_arm_ops)
+
+;; ============================================================================
+;; Rewrite Rules
+;; ============================================================================
+
+;; Block 2
+(rewrite blk2_drmt blk2_dpa)
+(rewrite blk2_dpa blk2_arm)
+
+;; Block 3
+(rewrite blk3_drmt blk3_dpa)
+(rewrite blk3_dpa blk3_arm)
+
+;; Block 6
+(rewrite blk6_drmt blk6_dpa)
+(rewrite blk6_dpa blk6_arm)
+
+;; Block 7 (no DRMT)
+(rewrite blk7_dpa blk7_arm)
+
+;; Block 8
+(rewrite blk8_drmt blk8_dpa)
+(rewrite blk8_dpa blk8_arm)
+
+;; Block 9
+(rewrite blk9_drmt blk9_dpa)
+(rewrite blk9_dpa blk9_arm)
+
+;; Block 10
+(rewrite blk10_drmt blk10_dpa)
+(rewrite blk10_dpa blk10_arm)
