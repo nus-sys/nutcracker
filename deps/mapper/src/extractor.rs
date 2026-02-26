@@ -42,7 +42,10 @@ impl<'a> BlockExtractor<'a> {
 
     /// Extract best feasible mapping (single-objective)
     pub fn extract_best_mapping(&self) -> Option<BlockMapping> {
-        let block_names: Vec<_> = self.egraph.block_equivalences.keys().cloned().collect();
+        let mut block_names: Vec<_> = self.egraph.block_equivalences.keys().cloned().collect();
+        
+        // Sort for deterministic ordering and better cache locality
+        block_names.sort();
 
         if block_names.is_empty() {
             return Some(BlockMapping::new());
@@ -53,6 +56,8 @@ impl<'a> BlockExtractor<'a> {
 
         // Use a map to track which implementation was chosen for each block
         let mut chosen_impls: HashMap<String, usize> = HashMap::new();
+        // Pre-allocate space
+        chosen_impls.reserve(block_names.len());
 
         self.search_assignments(
             &block_names,
@@ -75,23 +80,24 @@ impl<'a> BlockExtractor<'a> {
     ) {
         if idx == block_names.len() {
             // Build the mapping from chosen implementations
-            let mut blocks = Vec::new();
+            let mut blocks = Vec::with_capacity(block_names.len());
             for block_name in block_names {
                 let impl_idx = chosen_impls[block_name];
                 let impl_def = &self.egraph.block_equivalences[block_name][impl_idx];
                 
+                // Avoid cloning dependencies by using get without cloned
                 let deps = self
                     .egraph
                     .dependencies
                     .get(block_name)
-                    .cloned()
-                    .unwrap_or_default();
+                    .map(|d| d.as_slice())
+                    .unwrap_or(&[]);
 
                 let costed = CostedBlock::new(
                     impl_def.name.clone(),
                     impl_def.hw.clone(),
                     impl_def.ops.clone(),
-                    deps,
+                    deps.to_vec(),
                     self.cost_model,
                 );
                 blocks.push(costed);
@@ -116,20 +122,24 @@ impl<'a> BlockExtractor<'a> {
             return;
         }
 
+        // Early pruning: if current cost already exceeds best, skip
+        // (This would require incremental cost computation for maximum effect)
+
         let block_name = &block_names[idx];
         let implementations = &self.egraph.block_equivalences[block_name];
 
+        // Get dependencies once
+        let deps = self
+            .egraph
+            .dependencies
+            .get(block_name)
+            .map(|d| d.as_slice())
+            .unwrap_or(&[]);
+
         for (impl_idx, impl_def) in implementations.iter().enumerate() {
             // Check if this implementation is feasible given already chosen implementations
-            let deps = self
-                .egraph
-                .dependencies
-                .get(block_name)
-                .cloned()
-                .unwrap_or_default();
-
             let mut feasible = true;
-            for dep_block_name in &deps {
+            for dep_block_name in deps {
                 // Check if dependency has been assigned
                 if let Some(&dep_impl_idx) = chosen_impls.get(dep_block_name) {
                     let dep_impl = &self.egraph.block_equivalences[dep_block_name][dep_impl_idx];
@@ -153,7 +163,10 @@ impl<'a> BlockExtractor<'a> {
 
     /// Extract Pareto-optimal solutions (multi-objective)
     pub fn extract_pareto_front(&self) -> Vec<BlockMapping> {
-        let block_names: Vec<_> = self.egraph.block_equivalences.keys().cloned().collect();
+        let mut block_names: Vec<_> = self.egraph.block_equivalences.keys().cloned().collect();
+        
+        // Sort for deterministic ordering
+        block_names.sort();
 
         if block_names.is_empty() {
             return vec![BlockMapping::new()];
@@ -161,6 +174,7 @@ impl<'a> BlockExtractor<'a> {
 
         let mut all_feasible = Vec::new();
         let mut chosen_impls: HashMap<String, usize> = HashMap::new();
+        chosen_impls.reserve(block_names.len());
         
         self.collect_all_feasible(&block_names, 0, &mut chosen_impls, &mut all_feasible);
 
@@ -177,7 +191,7 @@ impl<'a> BlockExtractor<'a> {
     ) {
         if idx == block_names.len() {
             // Build the mapping from chosen implementations
-            let mut blocks = Vec::new();
+            let mut blocks = Vec::with_capacity(block_names.len());
             for block_name in block_names {
                 let impl_idx = chosen_impls[block_name];
                 let impl_def = &self.egraph.block_equivalences[block_name][impl_idx];
@@ -186,14 +200,14 @@ impl<'a> BlockExtractor<'a> {
                     .egraph
                     .dependencies
                     .get(block_name)
-                    .cloned()
-                    .unwrap_or_default();
+                    .map(|d| d.as_slice())
+                    .unwrap_or(&[]);
 
                 let costed = CostedBlock::new(
                     impl_def.name.clone(),
                     impl_def.hw.clone(),
                     impl_def.ops.clone(),
-                    deps,
+                    deps.to_vec(),
                     self.cost_model,
                 );
                 blocks.push(costed);
@@ -214,17 +228,18 @@ impl<'a> BlockExtractor<'a> {
 
         let block_name = &block_names[idx];
         let implementations = &self.egraph.block_equivalences[block_name];
+        
+        // Get dependencies once
+        let deps = self
+            .egraph
+            .dependencies
+            .get(block_name)
+            .map(|d| d.as_slice())
+            .unwrap_or(&[]);
 
         for (impl_idx, impl_def) in implementations.iter().enumerate() {
-            let deps = self
-                .egraph
-                .dependencies
-                .get(block_name)
-                .cloned()
-                .unwrap_or_default();
-
             let mut feasible = true;
-            for dep_block_name in &deps {
+            for dep_block_name in deps {
                 if let Some(&dep_impl_idx) = chosen_impls.get(dep_block_name) {
                     let dep_impl = &self.egraph.block_equivalences[dep_block_name][dep_impl_idx];
                     if !self.cost_model.is_connected(&dep_impl.hw, &impl_def.hw) {
@@ -268,7 +283,10 @@ impl<'a> BlockExtractor<'a> {
 
     /// Extract optimal for each single objective
     pub fn extract_per_objective(&self) -> ObjectiveSolutions {
-        let block_names: Vec<_> = self.egraph.block_equivalences.keys().cloned().collect();
+        let mut block_names: Vec<_> = self.egraph.block_equivalences.keys().cloned().collect();
+        
+        // Sort for deterministic ordering
+        block_names.sort();
 
         if block_names.is_empty() {
             return ObjectiveSolutions {
@@ -280,6 +298,7 @@ impl<'a> BlockExtractor<'a> {
 
         let mut all_feasible = Vec::new();
         let mut chosen_impls: HashMap<String, usize> = HashMap::new();
+        chosen_impls.reserve(block_names.len());
         
         self.collect_all_feasible(&block_names, 0, &mut chosen_impls, &mut all_feasible);
 

@@ -3,280 +3,729 @@
 ;; ============================================================================
 
 (hardware DRMT :cores 1 :sigma 0.0)
-(hardware DPA :cores 8 :sigma 0.5)
+(hardware DPA :cores 190 :sigma 0.5)
 (hardware ARM :cores 16 :sigma 1.0)
 
 ;; ============================================================================
 ;; Communication Links (BlueField-3 Topology)
 ;; ============================================================================
 
-;; DRMT internal (loopback)
-(link DRMT DRMT 10.0 1.0)
-
-;; DRMT → DPA (packet recirculation to DPA cores)
-(link DRMT DPA 50.0 1.0)
-
-;; DPA → DRMT (return from DPA processing)
-(link DPA DRMT 30.0 1.0)
-
-;; DPA → ARM (offload to general-purpose cores via PCIe)
-(link DPA ARM 200.0 0.5)
-
-;; Note: No ARM→DPA or ARM→DRMT (ARM is exception path only)
-;; Note: No DRMT→ARM (must route through DPA)
+(link DRMT ARM 1.0 1.0)
 
 ;; ============================================================================
 ;; Operation Definitions (with costs and types)
 ;; ============================================================================
 
-;; P4HIR dialect operations (base/generic)
-(function p4hir_struct_extract_ref (Type) Type :cost 5 :type stateless)
-(function p4hir_const (Type) Type :cost 2 :type stateless)
-(function p4hir_cast (Type) Type :cost 3 :type stateless)
-(function p4hir_assign (Type) Type :cost 5 :type stateful :sigma 0.3)
-(function p4hir_read (Type) Type :cost 4 :type stateless)
-(function p4hir_cmp (Type) Type :cost 5 :type stateless)
-(function p4hir_yield (Type) Type :cost 1 :type stateless)
-(function p4hir_if (Type) Type :cost 10 :type stateless)
-(function p4hir_variable (Type) Type :cost 3 :type stateless)
+;; ----------------------------------------------------------------------------
+;; BF3 DRMT Dialect Operations (Hardware Dataplane - SRAM/TCAM)
+;; ----------------------------------------------------------------------------
 
-;; BF3 DRMT dialect operations
+(function bf3drmt_variable (Type) Type :cost 1 :type stateless)
+(function bf3drmt_read (Type) Type :cost 1 :type stateless)
+(function bf3drmt_assign (Type) Type :cost 1 :type stateful :sigma 0.1)
 (function bf3drmt_struct_extract_ref (Type) Type :cost 1 :type stateless)
 (function bf3drmt_constant (Type) Type :cost 1 :type stateless)
 (function bf3drmt_cast (Type) Type :cost 1 :type stateless)
-(function bf3drmt_assign (Type) Type :cost 2 :type stateful :sigma 0.1)
-(function bf3drmt_read (Type) Type :cost 1 :type stateless)
-(function bf3drmt_match_key (Type) Type :cost 3 :type stateless)
+(function bf3drmt_binop (Type) Type :cost 1 :type stateless)
+(function bf3drmt_shl (Type) Type :cost 1 :type stateless)
+(function bf3drmt_shr (Type) Type :cost 1 :type stateless)
+(function bf3drmt_concat (Type) Type :cost 1 :type stateless)
+(function bf3drmt_slice (Type) Type :cost 1 :type stateless)
+(function bf3drmt_match_key (Type) Type :cost 1 :type stateless)
+(function bf3drmt_bool () Type :cost 1 :type stateless)
 
-;; BF3 DPA dialect operations
+;; ----------------------------------------------------------------------------
+;; BF3 DPA Dialect Operations (NPU - Programmable Dataplane)
+;; ----------------------------------------------------------------------------
+
+(function bf3dpa_variable (Type) Type :cost 10 :type stateless)
+(function bf3dpa_read (Type) Type :cost 20 :type stateless)
+(function bf3dpa_assign (Type) Type :cost 10 :type stateful :sigma 1.0)
 (function bf3dpa_struct_extract_ref (Type) Type :cost 10 :type stateless)
 (function bf3dpa_constant (Type) Type :cost 5 :type stateless)
-(function bf3dpa_assign (Type) Type :cost 15 :type stateful :sigma 1.0)
-(function bf3dpa_read (Type) Type :cost 8 :type stateless)
-(function bf3dpa_cmp (Type) Type :cost 12 :type stateless)
+(function bf3dpa_cast (Type) Type :cost 5 :type stateless)
+(function bf3dpa_binop (Type) Type :cost 20 :type stateless)
+(function bf3dpa_shl (Type) Type :cost 20 :type stateless)
+(function bf3dpa_shr (Type) Type :cost 20 :type stateless)
+(function bf3dpa_slice (Type) Type :cost 20 :type stateless)
+(function bf3dpa_cmp (Type) Type :cost 20 :type stateless)
 (function bf3dpa_if (Type) Type :cost 20 :type stateless)
-(function bf3dpa_yield (Type) Type :cost 2 :type stateless)
+(function bf3dpa_yield (Type) Type :cost 5 :type stateless)
+(function bf3dpa_bool () Type :cost 5 :type stateless)
 
-;; ARM operations (slow, general-purpose)
-(function arm_struct_extract_ref (Type) Type :cost 20 :type stateless)
-(function arm_constant (Type) Type :cost 10 :type stateless)
-(function arm_assign (Type) Type :cost 25 :type stateful :sigma 1.5)
-(function arm_read (Type) Type :cost 15 :type stateless)
-(function arm_cmp (Type) Type :cost 18 :type stateless)
-(function arm_if (Type) Type :cost 30 :type stateless)
+;; ----------------------------------------------------------------------------
+;; LLVM Dialect Operations (CPU/ARM)
+;; ----------------------------------------------------------------------------
+(function llvm_ptr () Type :cost 2 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; Arithmetic Operations
+;; ----------------------------------------------------------------------------
+(function llvm_add (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_sub (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_mul (Op Op Type) Op :cost 5 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; Bitwise Operations
+;; ----------------------------------------------------------------------------
+(function llvm_and (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_or (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_xor (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_shl (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_lshr (Op Op Type) Op :cost 5 :type stateless)
+(function llvm_ashr (Op Op Type) Op :cost 5 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; Memory Operations
+;; ----------------------------------------------------------------------------
+
+;; Stack allocation - essentially free (just moves stack pointer)
+(function llvm_alloca (AttrPair AttrPair Type) Op :cost 1 :type stateless)
+
+;; Load from memory - 3-4 cycles if L1 hit, more if cache miss
+(function llvm_load (Op Type) Op :cost 3 :type stateless)
+
+;; Store to memory - 1-2 cycles (write-through), but may stall pipeline
+(function llvm_store (Op Op) Op :cost 2 :type stateful :sigma 0.1)
+
+;; Pointer arithmetic (GEP) - 1-2 cycles (simple address calculation)
+(function llvm_getelementptr (Op AttrPair AttrPair Type) Op :cost 2 :type stateless)
+
+(function llvm_mlir_constant (AttrPair Type) Op :cost 1 :type stateless)
+(function llvm_icmp (Op Op AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_cond_br (Op AttrPair AttrPair) Op :cost 5 :type stateless)
 
 ;; ============================================================================
 ;; Block 2: Metadata Initialization
 ;; Valid on: DRMT, DPA, ARM
+;; Dependencies: none
 ;; ============================================================================
 
-(let blk2_drmt_op0 (p4hir_variable "Type"))
-(let blk2_drmt_op1 (bf3drmt_struct_extract_ref "Type"))
-(let blk2_drmt_op2 (bf3drmt_constant "Type"))
-(let blk2_drmt_op3 (bf3drmt_cast "Type"))
-(let blk2_drmt_op4 (bf3drmt_assign "Type"))
+;; Block 2 CPU (LLVM)
+(let blk2_cpu_op0 (Value 1 (llvm_ptr)))
+(let blk2_cpu_op1 (llvm_getelementptr blk2_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 0) (I32))) (llvm_ptr)))
+(let blk2_cpu_op2 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 0 (Int 3))) (Int 3)))
+(let blk2_cpu_op3 (llvm_store blk2_cpu_op2 blk2_cpu_op1))
+(let blk2_cpu_ops (vec-of blk2_cpu_op0 blk2_cpu_op1 blk2_cpu_op2 blk2_cpu_op3))
+
+;; Block 2 DPA
+(let blk2_dpa_op0 (Value 1 (bf3dpa_ref (bf3dpa_struct (NamedAttr "name" (StringAttr "metadata")) (NamedAttr "int_node" (TypeAttr (bf3dpa_bits 3))) (NamedAttr "switch_id" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1)))))))
+(let blk2_dpa_op1 (bf3dpa_struct_extract_ref blk2_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3dpa_ref (bf3dpa_bits 3))))
+(let blk2_dpa_op2 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 0 (bf3dpa_bits 3))) (bf3dpa_bits 3)))
+(let blk2_dpa_op3 (bf3dpa_cast blk2_dpa_op2 (bf3dpa_bits 3)))
+(let blk2_dpa_op4 (bf3dpa_assign blk2_dpa_op3 blk2_dpa_op1))
+(let blk2_dpa_ops (vec-of blk2_dpa_op0 blk2_dpa_op1 blk2_dpa_op2 blk2_dpa_op3 blk2_dpa_op4))
+
+;; Block 2 DRMT
+(let blk2_drmt_op0 (Value 1 (bf3drmt_ref (bf3drmt_struct (NamedAttr "name" (StringAttr "metadata")) (NamedAttr "int_node" (TypeAttr (bf3drmt_bits 3))) (NamedAttr "switch_id" (TypeAttr (bf3drmt_bits 32))) (NamedAttr "reserved1" (TypeAttr (bf3drmt_bits 1)))))))
+(let blk2_drmt_op1 (bf3drmt_struct_extract_ref blk2_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3drmt_ref (bf3drmt_bits 3))))
+(let blk2_drmt_op2 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 0 (bf3drmt_bits 3))) (bf3drmt_bits 3)))
+(let blk2_drmt_op3 (bf3drmt_cast blk2_drmt_op2 (bf3drmt_bits 3)))
+(let blk2_drmt_op4 (bf3drmt_assign blk2_drmt_op3 blk2_drmt_op1))
 (let blk2_drmt_ops (vec-of blk2_drmt_op0 blk2_drmt_op1 blk2_drmt_op2 blk2_drmt_op3 blk2_drmt_op4))
 
-(let blk2_dpa_op0 (p4hir_variable "Type"))
-(let blk2_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
-(let blk2_dpa_op2 (bf3dpa_constant "Type"))
-(let blk2_dpa_op3 (bf3dpa_assign "Type"))
-(let blk2_dpa_ops (vec-of blk2_dpa_op0 blk2_dpa_op1 blk2_dpa_op2 blk2_dpa_op3))
-
-(let blk2_arm_op0 (p4hir_variable "Type"))
-(let blk2_arm_op1 (arm_struct_extract_ref "Type"))
-(let blk2_arm_op2 (arm_constant "Type"))
-(let blk2_arm_op3 (arm_assign "Type"))
-(let blk2_arm_ops (vec-of blk2_arm_op0 blk2_arm_op1 blk2_arm_op2 blk2_arm_op3))
-
+;; Block 2 Implementations
 (implement blk2_drmt DRMT () blk2_drmt_ops)
 (implement blk2_dpa DPA () blk2_dpa_ops)
-(implement blk2_arm ARM () blk2_arm_ops)
+(implement blk2_cpu ARM () blk2_cpu_ops)
+
+;; Block 2 Equivalences
+(rewrite blk2_cpu blk2_drmt)
+(rewrite blk2_cpu blk2_dpa)
 
 ;; ============================================================================
-;; Block 3: IPv4 Validity Check
+;; Block 3: IPv4 Valid Check
 ;; Valid on: DRMT, DPA, ARM
+;; Dependencies: blk2
 ;; ============================================================================
 
-(let blk3_drmt_op0 (p4hir_variable "Type"))
-(let blk3_drmt_op1 (bf3drmt_struct_extract_ref "Type"))
-(let blk3_drmt_op2 (bf3drmt_struct_extract_ref "Type"))
-(let blk3_drmt_op3 (bf3drmt_read "Type"))
-(let blk3_drmt_op4 (bf3drmt_constant "Type"))
-(let blk3_drmt_op5 (bf3drmt_match_key "Type"))
+;; Block 3 CPU (LLVM) - conditional branch based on IPv4 validity
+(let blk3_cpu_op0 (Value 0 (llvm_ptr)))
+(let blk3_cpu_op1 (llvm_getelementptr blk3_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 1) (I32))) (llvm_ptr)))
+(let blk3_cpu_op2 (llvm_getelementptr blk3_cpu_op1 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 13) (I32))) (llvm_ptr)))
+(let blk3_cpu_op3 (llvm_load blk3_cpu_op2 (I1)))
+(let blk3_cpu_op4 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 1 (I1))) (I1)))
+(let blk3_cpu_op5 (llvm_icmp blk3_cpu_op3 blk3_cpu_op4 (NamedAttr "predicate" (IntegerAttr 0 (I64))) (I1)))
+(let blk3_cpu_op6 (llvm_cond_br blk3_cpu_op5 (NamedAttr "trueDest" (UnitAttr)) (NamedAttr "falseDest" (UnitAttr))))
+(let blk3_cpu_ops (vec-of blk3_cpu_op0 blk3_cpu_op1 blk3_cpu_op2 blk3_cpu_op3 blk3_cpu_op4 blk3_cpu_op5 blk3_cpu_op6))
+
+;; Block 3 DPA (simplified - use your full version)
+(let blk3_dpa_op0 (Value 0 (bf3dpa_ref (bf3dpa_struct))))
+(let blk3_dpa_op1 (bf3dpa_struct_extract_ref blk3_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3dpa_ref (bf3dpa_header))))
+(let blk3_dpa_op2 (bf3dpa_struct_extract_ref blk3_dpa_op1 (NamedAttr "fieldIndex" (IntegerAttr 13 (I32))) (bf3dpa_ref (bf3dpa_valid_bit))))
+(let blk3_dpa_op3 (bf3dpa_read blk3_dpa_op2 (bf3dpa_valid_bit)))
+(let blk3_dpa_op4 (bf3dpa_constant (NamedAttr "value" (bf3dpa_validity_bit "valid" (bf3dpa_valid_bit))) (bf3dpa_valid_bit)))
+(let blk3_dpa_op5 (bf3dpa_cmp blk3_dpa_op3 blk3_dpa_op4 (NamedAttr "kind" (IntegerAttr 5 (I32))) (bf3dpa_bool)))
+(let blk3_dpa_op6 (bf3dpa_if blk3_dpa_op5 (Reg (vec-of (Blk (vec-of (bf3dpa_yield)))))))
+(let blk3_dpa_ops (vec-of blk3_dpa_op0 blk3_dpa_op1 blk3_dpa_op2 blk3_dpa_op3 blk3_dpa_op4 blk3_dpa_op5 blk3_dpa_op6))
+
+;; Block 3 DRMT (simplified - use your full version)
+(let blk3_drmt_op0 (Value 0 (bf3drmt_ref (bf3drmt_struct))))
+(let blk3_drmt_op1 (bf3drmt_struct_extract_ref blk3_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3drmt_ref (bf3drmt_header))))
+(let blk3_drmt_op2 (bf3drmt_struct_extract_ref blk3_drmt_op1 (NamedAttr "fieldIndex" (IntegerAttr 13 (I32))) (bf3drmt_ref (bf3drmt_valid_bit))))
+(let blk3_drmt_op3 (bf3drmt_read blk3_drmt_op2 (bf3drmt_valid_bit)))
+(let blk3_drmt_op4 (bf3drmt_constant (NamedAttr "value" (bf3drmt_validity_bit "valid" (bf3drmt_valid_bit))) (bf3drmt_valid_bit)))
+(let blk3_drmt_op5 (bf3drmt_match_key blk3_drmt_op3 blk3_drmt_op4 (NamedAttr "kind" (IntegerAttr 5 (I32))) (bf3drmt_bool)))
 (let blk3_drmt_ops (vec-of blk3_drmt_op0 blk3_drmt_op1 blk3_drmt_op2 blk3_drmt_op3 blk3_drmt_op4 blk3_drmt_op5))
 
-(let blk3_dpa_op0 (p4hir_variable "Type"))
-(let blk3_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
-(let blk3_dpa_op2 (bf3dpa_struct_extract_ref "Type"))
-(let blk3_dpa_op3 (bf3dpa_read "Type"))
-(let blk3_dpa_op4 (bf3dpa_constant "Type"))
-(let blk3_dpa_op5 (bf3dpa_cmp "Type"))
-(let blk3_dpa_op6 (p4hir_yield "Type"))
-(let blk3_dpa_op7 (bf3dpa_if "Type"))
-(let blk3_dpa_ops (vec-of blk3_dpa_op0 blk3_dpa_op1 blk3_dpa_op2 blk3_dpa_op3 blk3_dpa_op4 blk3_dpa_op5 blk3_dpa_op6 blk3_dpa_op7))
-
-(let blk3_arm_op0 (p4hir_variable "Type"))
-(let blk3_arm_op1 (arm_struct_extract_ref "Type"))
-(let blk3_arm_op2 (arm_struct_extract_ref "Type"))
-(let blk3_arm_op3 (arm_read "Type"))
-(let blk3_arm_op4 (arm_constant "Type"))
-(let blk3_arm_op5 (arm_cmp "Type"))
-(let blk3_arm_op6 (p4hir_yield "Type"))
-(let blk3_arm_op7 (arm_if "Type"))
-(let blk3_arm_ops (vec-of blk3_arm_op0 blk3_arm_op1 blk3_arm_op2 blk3_arm_op3 blk3_arm_op4 blk3_arm_op5 blk3_arm_op6 blk3_arm_op7))
-
+;; Block 3 Implementations
 (implement blk3_drmt DRMT (blk2) blk3_drmt_ops)
 (implement blk3_dpa DPA (blk2) blk3_dpa_ops)
-(implement blk3_arm ARM (blk2) blk3_arm_ops)
+(implement blk3_cpu ARM (blk2) blk3_cpu_ops)
+
+;; Block 3 Equivalences
+(rewrite blk3_cpu blk3_drmt)
+(rewrite blk3_cpu blk3_dpa)
 
 ;; ============================================================================
-;; Block 6: Variable Declaration
+;; Block 6: Counter Value Check (counter_val >= 100)
 ;; Valid on: DRMT, DPA, ARM
+;; Dependencies: blk3 (uses counter_val variable from earlier blocks)
 ;; ============================================================================
 
-(let blk6_drmt_op0 (p4hir_variable "Type"))
-(let blk6_drmt_op1 (p4hir_variable "Type"))
-(let blk6_drmt_op2 (p4hir_variable "Type"))
-(let blk6_drmt_ops (vec-of blk6_drmt_op0 blk6_drmt_op1 blk6_drmt_op2))
+;; ----------------------------------------------------------------------------
+;; Block 6 CPU (LLVM) - Corrected with llvm_alloca
+;; ----------------------------------------------------------------------------
 
-(let blk6_dpa_op0 (p4hir_variable "Type"))
-(let blk6_dpa_op1 (p4hir_variable "Type"))
-(let blk6_dpa_op2 (p4hir_variable "Type"))
-(let blk6_dpa_ops (vec-of blk6_dpa_op0 blk6_dpa_op1 blk6_dpa_op2))
+;; Allocate stack space for counter_val variable
+(let blk6_cpu_op0 (llvm_alloca (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))
 
-(let blk6_arm_op0 (p4hir_variable "Type"))
-(let blk6_arm_op1 (p4hir_variable "Type"))
-(let blk6_arm_op2 (p4hir_variable "Type"))
-(let blk6_arm_ops (vec-of blk6_arm_op0 blk6_arm_op1 blk6_arm_op2))
+;; Load the value from the allocated variable
+(let blk6_cpu_op1 (llvm_load blk6_cpu_op0 (Int 16)))
+
+;; Create constant 100
+(let blk6_cpu_op2 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 100 (Int 16))) (Int 16)))
+
+;; Compare: counter_val >= 100 (predicate 9 = unsigned greater-or-equal)
+(let blk6_cpu_op3 (llvm_icmp blk6_cpu_op1 blk6_cpu_op2 (NamedAttr "predicate" (IntegerAttr 9 (I64))) (I1)))
+
+;; Conditional branch based on comparison
+(let blk6_cpu_op4 (llvm_cond_br blk6_cpu_op3 (NamedAttr "trueDest" (UnitAttr)) (NamedAttr "falseDest" (UnitAttr))))
+
+(let blk6_cpu_ops (vec-of blk6_cpu_op0 blk6_cpu_op1 blk6_cpu_op2 blk6_cpu_op3 blk6_cpu_op4))
+
+;; ----------------------------------------------------------------------------
+;; Block 6 DPA (unchanged)
+;; ----------------------------------------------------------------------------
+
+(let blk6_dpa_op0 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_val")) (bf3dpa_ref (bf3dpa_bits 16))))
+(let blk6_dpa_op1 (bf3dpa_read blk6_dpa_op0 (bf3dpa_bits 16)))
+(let blk6_dpa_op2 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 100 (bf3dpa_bits 16))) (bf3dpa_bits 16)))
+(let blk6_dpa_op3 (bf3dpa_cmp blk6_dpa_op1 blk6_dpa_op2 (NamedAttr "kind" (IntegerAttr 4 (I32))) (bf3dpa_bool)))
+(let blk6_dpa_op4 (bf3dpa_if blk6_dpa_op3 (Reg (vec-of (Blk (vec-of (bf3dpa_yield)))))))
+(let blk6_dpa_ops (vec-of blk6_dpa_op0 blk6_dpa_op1 blk6_dpa_op2 blk6_dpa_op3 blk6_dpa_op4))
+
+;; ----------------------------------------------------------------------------
+;; Block 6 DRMT (unchanged)
+;; ----------------------------------------------------------------------------
+
+(let blk6_drmt_op0 (bf3drmt_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_val")) (bf3drmt_ref (bf3drmt_bits 16))))
+(let blk6_drmt_op1 (bf3drmt_read blk6_drmt_op0 (bf3drmt_bits 16)))
+(let blk6_drmt_op2 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 100 (bf3drmt_bits 16))) (bf3drmt_bits 16)))
+(let blk6_drmt_op3 (bf3drmt_match_key blk6_drmt_op1 blk6_drmt_op2 (NamedAttr "kind" (IntegerAttr 4 (I32))) (bf3drmt_bool)))
+(let blk6_drmt_ops (vec-of blk6_drmt_op0 blk6_drmt_op1 blk6_drmt_op2 blk6_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 6 Implementations - depends on blk3
+;; ----------------------------------------------------------------------------
 
 (implement blk6_drmt DRMT (blk3) blk6_drmt_ops)
 (implement blk6_dpa DPA (blk3) blk6_dpa_ops)
-(implement blk6_arm ARM (blk3) blk6_arm_ops)
+(implement blk6_cpu ARM (blk3) blk6_cpu_ops)
+
+;; Block 6 Equivalences
+(rewrite blk6_cpu blk6_drmt)
+(rewrite blk6_cpu blk6_dpa)
 
 ;; ============================================================================
-;; Block 7: Counter Update (Stateful, High Contention)
-;; Valid on: DPA, ARM only (DRMT has limited stateful ops)
-;; ============================================================================
-
-(function dpa_counter_update (Type) Type :cost 80 :type stateful :sigma 1.5)
-(function dpa_atomic_add (Type) Type :cost 60 :type stateful :sigma 1.2)
-(function arm_counter_update (Type) Type :cost 150 :type stateful :sigma 2.0)
-
-(let blk7_dpa_op0 (p4hir_variable "Type"))
-(let blk7_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
-(let blk7_dpa_op2 (dpa_atomic_add "Type"))
-(let blk7_dpa_ops (vec-of blk7_dpa_op0 blk7_dpa_op1 blk7_dpa_op2))
-
-(let blk7_arm_op0 (p4hir_variable "Type"))
-(let blk7_arm_op1 (arm_struct_extract_ref "Type"))
-(let blk7_arm_op2 (arm_counter_update "Type"))
-(let blk7_arm_ops (vec-of blk7_arm_op0 blk7_arm_op1 blk7_arm_op2))
-
-(implement blk7_dpa DPA (blk6) blk7_dpa_ops)
-(implement blk7_arm ARM (blk6) blk7_arm_ops)
-
-;; ============================================================================
-;; Block 8: Hash Computation (Stateless)
+;; Block 8: MAC Address Swap and TTL Decrement
 ;; Valid on: DRMT, DPA, ARM
+;; Dependencies: blk6
 ;; ============================================================================
 
-(function drmt_hash (Type) Type :cost 5 :type stateless)
-(function dpa_hash (Type) Type :cost 50 :type stateless)
-(function arm_hash (Type) Type :cost 200 :type stateless)
+;; ----------------------------------------------------------------------------
+;; Block 8 CPU (LLVM)
+;; ----------------------------------------------------------------------------
 
-(let blk8_drmt_op0 (p4hir_variable "Type"))
-(let blk8_drmt_op1 (drmt_hash "Type"))
-(let blk8_drmt_ops (vec-of blk8_drmt_op0 blk8_drmt_op1))
+;; Assign srcAddr (Value 2) to headers.ethernet.srcAddr
+(let blk8_cpu_op0 (Value 0 (llvm_ptr)))
+(let blk8_cpu_op1 (llvm_getelementptr blk8_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 0) (I32))) (llvm_ptr)))
+(let blk8_cpu_op2 (llvm_getelementptr blk8_cpu_op1 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 1) (I32))) (llvm_ptr)))
+(let blk8_cpu_op3 (llvm_store (Value 2 (Int 48)) blk8_cpu_op2))
 
-(let blk8_dpa_op0 (p4hir_variable "Type"))
-(let blk8_dpa_op1 (dpa_hash "Type"))
-(let blk8_dpa_ops (vec-of blk8_dpa_op0 blk8_dpa_op1))
+;; Assign dstAddr (Value 3) to headers.ethernet.dstAddr
+(let blk8_cpu_op4 (llvm_getelementptr blk8_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 0) (I32))) (llvm_ptr)))
+(let blk8_cpu_op5 (llvm_getelementptr blk8_cpu_op4 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 0) (I32))) (llvm_ptr)))
+(let blk8_cpu_op6 (llvm_store (Value 3 (Int 48)) blk8_cpu_op5))
 
-(let blk8_arm_op0 (p4hir_variable "Type"))
-(let blk8_arm_op1 (arm_hash "Type"))
-(let blk8_arm_ops (vec-of blk8_arm_op0 blk8_arm_op1))
+;; TTL decrement: load TTL, subtract 1, store back
+(let blk8_cpu_op7 (llvm_getelementptr blk8_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 1) (I32))) (llvm_ptr)))
+(let blk8_cpu_op8 (llvm_getelementptr blk8_cpu_op7 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 8) (I32))) (llvm_ptr)))
+(let blk8_cpu_op9 (llvm_load blk8_cpu_op8 (Int 8)))
+(let blk8_cpu_op10 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 1 (Int 8))) (Int 8)))
+(let blk8_cpu_op11 (llvm_sub blk8_cpu_op9 blk8_cpu_op10 (Int 8)))
+(let blk8_cpu_op12 (llvm_store blk8_cpu_op11 blk8_cpu_op8))
 
-(implement blk8_drmt DRMT (blk3) blk8_drmt_ops)
-(implement blk8_dpa DPA (blk3) blk8_dpa_ops)
-(implement blk8_arm ARM (blk3) blk8_arm_ops)
+(let blk8_cpu_ops (vec-of blk8_cpu_op0 blk8_cpu_op1 blk8_cpu_op2 blk8_cpu_op3 blk8_cpu_op4 blk8_cpu_op5 blk8_cpu_op6 blk8_cpu_op7 blk8_cpu_op8 blk8_cpu_op9 blk8_cpu_op10 blk8_cpu_op11 blk8_cpu_op12))
+
+;; ----------------------------------------------------------------------------
+;; Block 8 DPA
+;; ----------------------------------------------------------------------------
+
+;; Common headers reference
+(let blk8_dpa_op0 (Value 0 (bf3dpa_ref (bf3dpa_struct (NamedAttr "name" (StringAttr "headers")) (NamedAttr "ethernet" (TypeAttr (bf3dpa_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3dpa_bits 1)))))) (NamedAttr "ipv4" (TypeAttr (bf3dpa_header (NamedAttr "name" (StringAttr "ipv4_t")) (NamedAttr "version" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "ihl" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "dscp" (TypeAttr (bf3dpa_bits 6))) (NamedAttr "ecn" (TypeAttr (bf3dpa_bits 2))) (NamedAttr "totalLen" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "identification" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "flags" (TypeAttr (bf3dpa_bits 3))) (NamedAttr "fragOffset" (TypeAttr (bf3dpa_bits 13))) (NamedAttr "ttl" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "protocol" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "hdrChecksum" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 32)))))) (NamedAttr "tcp" (TypeAttr (bf3dpa_header (NamedAttr "name" (StringAttr "tcp_t")) (NamedAttr "srcPort" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "dstPort" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "seqNo" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "ackNo" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "dataOffset" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "res" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "flags" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "window" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "checksum" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "urgentPtr" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3dpa_bits 1))))))))))
+
+;; Assign srcAddr: headers.ethernet.srcAddr = Value 2
+(let blk8_dpa_op1 (bf3dpa_struct_extract_ref blk8_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3dpa_ref (bf3dpa_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3dpa_bits 1)))))))
+(let blk8_dpa_op2 (bf3dpa_struct_extract_ref blk8_dpa_op1 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3dpa_ref (bf3dpa_bits 48))))
+(let blk8_dpa_op3 (bf3dpa_assign (Value 2 (bf3dpa_bits 48)) blk8_dpa_op2))
+
+;; Assign dstAddr: headers.ethernet.dstAddr = Value 3
+(let blk8_dpa_op4 (bf3dpa_struct_extract_ref blk8_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3dpa_ref (bf3dpa_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3dpa_bits 1)))))))
+(let blk8_dpa_op5 (bf3dpa_struct_extract_ref blk8_dpa_op4 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3dpa_ref (bf3dpa_bits 48))))
+(let blk8_dpa_op6 (bf3dpa_assign (Value 3 (bf3dpa_bits 48)) blk8_dpa_op5))
+
+;; TTL decrement: headers.ipv4.ttl = headers.ipv4.ttl - 1
+(let blk8_dpa_op7 (bf3dpa_struct_extract_ref blk8_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3dpa_ref (bf3dpa_header (NamedAttr "name" (StringAttr "ipv4_t")) (NamedAttr "version" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "ihl" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "dscp" (TypeAttr (bf3dpa_bits 6))) (NamedAttr "ecn" (TypeAttr (bf3dpa_bits 2))) (NamedAttr "totalLen" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "identification" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "flags" (TypeAttr (bf3dpa_bits 3))) (NamedAttr "fragOffset" (TypeAttr (bf3dpa_bits 13))) (NamedAttr "ttl" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "protocol" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "hdrChecksum" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 32)))))))
+(let blk8_dpa_op8 (bf3dpa_read blk8_dpa_op7 (bf3dpa_header (NamedAttr "name" (StringAttr "ipv4_t")) (NamedAttr "version" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "ihl" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "dscp" (TypeAttr (bf3dpa_bits 6))) (NamedAttr "ecn" (TypeAttr (bf3dpa_bits 2))) (NamedAttr "totalLen" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "identification" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "flags" (TypeAttr (bf3dpa_bits 3))) (NamedAttr "fragOffset" (TypeAttr (bf3dpa_bits 13))) (NamedAttr "ttl" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "protocol" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "hdrChecksum" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 32))))))
+(let blk8_dpa_op9 (bf3dpa_struct_extract blk8_dpa_op8 (NamedAttr "fieldIndex" (IntegerAttr 8 (I32))) (bf3dpa_bits 8)))
+(let blk8_dpa_op10 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 1 (bf3dpa_bits 8))) (bf3dpa_bits 8)))
+(let blk8_dpa_op11 (bf3dpa_binop blk8_dpa_op9 blk8_dpa_op10 (NamedAttr "kind" (IntegerAttr 5 (I32))) (bf3dpa_bits 8)))
+(let blk8_dpa_op12 (bf3dpa_struct_extract_ref blk8_dpa_op7 (NamedAttr "fieldIndex" (IntegerAttr 8 (I32))) (bf3dpa_ref (bf3dpa_bits 8))))
+(let blk8_dpa_op13 (bf3dpa_assign blk8_dpa_op11 blk8_dpa_op12))
+
+(let blk8_dpa_ops (vec-of blk8_dpa_op0 blk8_dpa_op1 blk8_dpa_op2 blk8_dpa_op3 blk8_dpa_op4 blk8_dpa_op5 blk8_dpa_op6 blk8_dpa_op7 blk8_dpa_op8 blk8_dpa_op9 blk8_dpa_op10 blk8_dpa_op11 blk8_dpa_op12 blk8_dpa_op13))
+
+;; ----------------------------------------------------------------------------
+;; Block 8 DRMT
+;; ----------------------------------------------------------------------------
+
+(let blk8_drmt_op0 (Value 0 (bf3drmt_ref (bf3drmt_struct (NamedAttr "name" (StringAttr "headers")) (NamedAttr "ethernet" (TypeAttr (bf3drmt_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3drmt_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3drmt_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3drmt_bits 1)))))) (NamedAttr "ipv4" (TypeAttr (bf3drmt_header (NamedAttr "name" (StringAttr "ipv4_t")) (NamedAttr "version" (TypeAttr (bf3drmt_bits 4))) (NamedAttr "ihl" (TypeAttr (bf3drmt_bits 4))) (NamedAttr "dscp" (TypeAttr (bf3drmt_bits 6))) (NamedAttr "ecn" (TypeAttr (bf3drmt_bits 2))) (NamedAttr "totalLen" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "identification" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "flags" (TypeAttr (bf3drmt_bits 3))) (NamedAttr "fragOffset" (TypeAttr (bf3drmt_bits 13))) (NamedAttr "ttl" (TypeAttr (bf3drmt_bits 8))) (NamedAttr "protocol" (TypeAttr (bf3drmt_bits 8))) (NamedAttr "hdrChecksum" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "srcAddr" (TypeAttr (bf3drmt_bits 32))) (NamedAttr "dstAddr" (TypeAttr (bf3drmt_bits 32)))))) (NamedAttr "tcp" (TypeAttr (bf3drmt_header (NamedAttr "name" (StringAttr "tcp_t")) (NamedAttr "srcPort" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "dstPort" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "seqNo" (TypeAttr (bf3drmt_bits 32))) (NamedAttr "ackNo" (TypeAttr (bf3drmt_bits 32))) (NamedAttr "dataOffset" (TypeAttr (bf3drmt_bits 4))) (NamedAttr "res" (TypeAttr (bf3drmt_bits 4))) (NamedAttr "flags" (TypeAttr (bf3drmt_bits 8))) (NamedAttr "window" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "checksum" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "urgentPtr" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3drmt_bits 1))))))))))
+
+;; Assign srcAddr
+(let blk8_drmt_op1 (bf3drmt_struct_extract_ref blk8_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3drmt_ref (bf3drmt_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3drmt_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3drmt_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3drmt_bits 1)))))))
+(let blk8_drmt_op2 (bf3drmt_struct_extract_ref blk8_drmt_op1 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3drmt_ref (bf3drmt_bits 48))))
+(let blk8_drmt_op3 (bf3drmt_assign (Value 2 (bf3drmt_bits 48)) blk8_drmt_op2))
+
+;; Assign dstAddr
+(let blk8_drmt_op4 (bf3drmt_struct_extract_ref blk8_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3drmt_ref (bf3drmt_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3drmt_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3drmt_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3drmt_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3drmt_bits 1)))))))
+(let blk8_drmt_op5 (bf3drmt_struct_extract_ref blk8_drmt_op4 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3drmt_ref (bf3drmt_bits 48))))
+(let blk8_drmt_op6 (bf3drmt_assign (Value 3 (bf3drmt_bits 48)) blk8_drmt_op5))
+
+;; TTL decrement
+(let blk8_drmt_op7 (bf3drmt_struct_extract_ref blk8_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3drmt_ref (bf3drmt_header (NamedAttr "name" (StringAttr "ipv4_t")) (NamedAttr "version" (TypeAttr (bf3drmt_bits 4))) (NamedAttr "ihl" (TypeAttr (bf3drmt_bits 4))) (NamedAttr "dscp" (TypeAttr (bf3drmt_bits 6))) (NamedAttr "ecn" (TypeAttr (bf3drmt_bits 2))) (NamedAttr "totalLen" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "identification" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "flags" (TypeAttr (bf3drmt_bits 3))) (NamedAttr "fragOffset" (TypeAttr (bf3drmt_bits 13))) (NamedAttr "ttl" (TypeAttr (bf3drmt_bits 8))) (NamedAttr "protocol" (TypeAttr (bf3drmt_bits 8))) (NamedAttr "hdrChecksum" (TypeAttr (bf3drmt_bits 16))) (NamedAttr "srcAddr" (TypeAttr (bf3drmt_bits 32))) (NamedAttr "dstAddr" (TypeAttr (bf3drmt_bits 32)))))))
+(let blk8_drmt_op8 (bf3drmt_struct_extract_ref blk8_drmt_op7 (NamedAttr "fieldIndex" (IntegerAttr 8 (I32))) (bf3drmt_ref (bf3drmt_bits 8))))
+(let blk8_drmt_op9 (bf3drmt_read blk8_drmt_op8 (bf3drmt_bits 8)))
+(let blk8_drmt_op10 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 1 (bf3drmt_bits 8))) (bf3drmt_bits 8)))
+(let blk8_drmt_op11 (bf3drmt_binop blk8_drmt_op9 blk8_drmt_op10 (NamedAttr "kind" (IntegerAttr 5 (I32))) (bf3drmt_bits 8)))
+(let blk8_drmt_op12 (bf3drmt_assign blk8_drmt_op11 blk8_drmt_op8))
+
+(let blk8_drmt_ops (vec-of blk8_drmt_op0 blk8_drmt_op1 blk8_drmt_op2 blk8_drmt_op3 blk8_drmt_op4 blk8_drmt_op5 blk8_drmt_op6 blk8_drmt_op7 blk8_drmt_op8 blk8_drmt_op9 blk8_drmt_op10 blk8_drmt_op11 blk8_drmt_op12))
+
+;; ----------------------------------------------------------------------------
+;; Block 8 Implementations
+;; ----------------------------------------------------------------------------
+
+(implement blk8_drmt DRMT (blk6) blk8_drmt_ops)
+(implement blk8_dpa DPA (blk6) blk8_dpa_ops)
+(implement blk8_cpu ARM (blk6) blk8_cpu_ops)
+
+;; Block 8 Equivalences
+(rewrite blk8_cpu blk8_drmt)
+(rewrite blk8_cpu blk8_dpa)
 
 ;; ============================================================================
-;; Block 9: Table Lookup (Stateful)
+;; Block 13: Hash Computation for Bloom Filter
 ;; Valid on: DRMT, DPA, ARM
+;; Dependencies: blk8
+;; Description: Extracts srcAddr from IPv4 header, computes hash, generates counter position
 ;; ============================================================================
 
-(function drmt_table_lookup (Type) Type :cost 8 :type stateful :sigma 0.3)
-(function dpa_table_lookup (Type) Type :cost 60 :type stateful :sigma 1.0)
-(function arm_table_lookup (Type) Type :cost 300 :type stateful :sigma 1.8)
+;; ----------------------------------------------------------------------------
+;; Block 13 CPU (LLVM) - Hash computation using multiplication
+;; ----------------------------------------------------------------------------
 
-(let blk9_drmt_op0 (p4hir_variable "Type"))
-(let blk9_drmt_op1 (bf3drmt_struct_extract_ref "Type"))
-(let blk9_drmt_op2 (drmt_table_lookup "Type"))
-(let blk9_drmt_ops (vec-of blk9_drmt_op0 blk9_drmt_op1 blk9_drmt_op2))
+;; Declare local variables (alloca)
+(let blk13_cpu_op0 (llvm_alloca (NamedAttr "init" (UnitAttr)) (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))  ;; counter_val
+(let blk13_cpu_op1 (llvm_alloca (NamedAttr "init" (UnitAttr)) (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))  ;; srcIp
+(let blk13_cpu_op2 (llvm_alloca (NamedAttr "init" (UnitAttr)) (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))  ;; MULT_HASH_A
+(let blk13_cpu_op3 (llvm_alloca (NamedAttr "init" (UnitAttr)) (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))  ;; hash_val
+(let blk13_cpu_op4 (llvm_alloca (NamedAttr "init" (UnitAttr)) (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))  ;; counter_pos
+(let blk13_cpu_op5 (Value 0 (llvm_ptr)))
+(let blk13_cpu_op6 (llvm_load blk13_cpu_op5 (llvm_struct "headers" (llvm_struct "ethernet_t") (llvm_struct "ipv4_t") (llvm_struct "tcp_t"))))
+(let blk13_cpu_op7 (llvm_getelementptr blk13_cpu_op5 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 1) (I32))) (llvm_ptr)))
+(let blk13_cpu_op8 (llvm_load blk13_cpu_op7 (llvm_struct "ipv4_t")))
+(let blk13_cpu_op9 (llvm_getelementptr blk13_cpu_op7 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 11) (I32))) (llvm_ptr)))
+(let blk13_cpu_op10 (llvm_load blk13_cpu_op9 (Int 32)))
+(let blk13_cpu_op11 (llvm_store blk13_cpu_op10 blk13_cpu_op1))  ;; Store srcAddr to srcIp
+(let blk13_cpu_op12 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 1234 (Int 32))) (Int 32)))
+(let blk13_cpu_op13 (llvm_store blk13_cpu_op12 blk13_cpu_op2))
+(let blk13_cpu_op14 (llvm_load blk13_cpu_op1 (Int 32)))  ;; Load srcIp
+(let blk13_cpu_op15 (llvm_load blk13_cpu_op2 (Int 32)))  ;; Load MULT_HASH_A
+(let blk13_cpu_op16 (llvm_mul blk13_cpu_op14 blk13_cpu_op15 (Int 32)))  ;; srcIp * MULT_HASH_A
+(let blk13_cpu_op17 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 20 (Int 16))) (Int 16)))
+(let blk13_cpu_op18 (llvm_lshr blk13_cpu_op16 blk13_cpu_op17 (Int 32)))  ;; >> 20
+(let blk13_cpu_op19 (llvm_store blk13_cpu_op18 blk13_cpu_op3))  ;; Store to hash_val
+(let blk13_cpu_op20 (llvm_load blk13_cpu_op3 (Int 32)))  ;; Load hash_val
+(let blk13_cpu_op21 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 4095 (Int 32))) (Int 32)))
+(let blk13_cpu_op22 (llvm_and blk13_cpu_op20 blk13_cpu_op21 (Int 32)))  ;; hash_val & 4095
+(let blk13_cpu_op23 (llvm_store blk13_cpu_op22 blk13_cpu_op4))  ;; Store to counter_pos
 
-(let blk9_dpa_op0 (p4hir_variable "Type"))
-(let blk9_dpa_op1 (bf3dpa_struct_extract_ref "Type"))
-(let blk9_dpa_op2 (dpa_table_lookup "Type"))
-(let blk9_dpa_ops (vec-of blk9_dpa_op0 blk9_dpa_op1 blk9_dpa_op2))
+(let blk13_cpu_ops (vec-of blk13_cpu_op0 blk13_cpu_op1 blk13_cpu_op2 blk13_cpu_op3 blk13_cpu_op4 blk13_cpu_op5 blk13_cpu_op6 blk13_cpu_op7 blk13_cpu_op8 blk13_cpu_op9 blk13_cpu_op10 blk13_cpu_op11 blk13_cpu_op12 blk13_cpu_op13 blk13_cpu_op14 blk13_cpu_op15 blk13_cpu_op16 blk13_cpu_op17 blk13_cpu_op18 blk13_cpu_op19 blk13_cpu_op20 blk13_cpu_op21 blk13_cpu_op22 blk13_cpu_op23))
 
-(let blk9_arm_op0 (p4hir_variable "Type"))
-(let blk9_arm_op1 (arm_struct_extract_ref "Type"))
-(let blk9_arm_op2 (arm_table_lookup "Type"))
-(let blk9_arm_ops (vec-of blk9_arm_op0 blk9_arm_op1 blk9_arm_op2))
+;; ----------------------------------------------------------------------------
+;; Block 13 DPA - Hash computation using multiplication
+;; ----------------------------------------------------------------------------
 
-(implement blk9_drmt DRMT (blk8) blk9_drmt_ops)
-(implement blk9_dpa DPA (blk8) blk9_dpa_ops)
-(implement blk9_arm ARM (blk8) blk9_arm_ops)
+;; Declare variables
+(let blk13_dpa_op0 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_val")) (bf3dpa_ref (bf3dpa_bits 16))))
+(let blk13_dpa_op1 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "srcIp")) (bf3dpa_ref (bf3dpa_bits 32))))
+(let blk13_dpa_op2 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "MULT_HASH_A")) (bf3dpa_ref (bf3dpa_bits 32))))
+(let blk13_dpa_op3 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "hash_val")) (bf3dpa_ref (bf3dpa_bits 32))))
+(let blk13_dpa_op4 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_pos")) (bf3dpa_ref (bf3dpa_bits 32))))
+
+;; Extract srcAddr from headers.ipv4.srcAddr
+(let blk13_dpa_op5 (Value 0 (bf3dpa_ref (bf3dpa_struct (NamedAttr "name" (StringAttr "headers")) (NamedAttr "ethernet" (TypeAttr (bf3dpa_header (NamedAttr "name" (StringAttr "ethernet_t")) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 48))) (NamedAttr "etherType" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved4" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved5" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved6" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved7" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved8" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved9" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved10" (TypeAttr (bf3dpa_bits 1)))))) (NamedAttr "ipv4" (TypeAttr (bf3dpa_header (NamedAttr "name" (StringAttr "ipv4_t")) (NamedAttr "version" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "ihl" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "dscp" (TypeAttr (bf3dpa_bits 6))) (NamedAttr "ecn" (TypeAttr (bf3dpa_bits 2))) (NamedAttr "totalLen" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "identification" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "flags" (TypeAttr (bf3dpa_bits 3))) (NamedAttr "fragOffset" (TypeAttr (bf3dpa_bits 13))) (NamedAttr "ttl" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "protocol" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "hdrChecksum" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "srcAddr" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "dstAddr" (TypeAttr (bf3dpa_bits 32)))))) (NamedAttr "tcp" (TypeAttr (bf3dpa_header (NamedAttr "name" (StringAttr "tcp_t")) (NamedAttr "srcPort" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "dstPort" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "seqNo" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "ackNo" (TypeAttr (bf3dpa_bits 32))) (NamedAttr "dataOffset" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "res" (TypeAttr (bf3dpa_bits 4))) (NamedAttr "flags" (TypeAttr (bf3dpa_bits 8))) (NamedAttr "window" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "checksum" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "urgentPtr" (TypeAttr (bf3dpa_bits 16))) (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved2" (TypeAttr (bf3dpa_bits 1))) (NamedAttr "reserved3" (TypeAttr (bf3dpa_bits 1))))))))))
+(let blk13_dpa_op6 (bf3dpa_read blk13_dpa_op5 (bf3dpa_struct)))
+(let blk13_dpa_op7 (bf3dpa_struct_extract blk13_dpa_op6 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3dpa_header)))
+(let blk13_dpa_op8 (bf3dpa_struct_extract blk13_dpa_op7 (NamedAttr "fieldIndex" (IntegerAttr 11 (I32))) (bf3dpa_bits 32)))
+(let blk13_dpa_op9 (bf3dpa_assign blk13_dpa_op8 blk13_dpa_op1))  ;; srcIp = headers.ipv4.srcAddr
+
+;; Initialize MULT_HASH_A = 1234
+(let blk13_dpa_op10 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 1234 (bf3dpa_bits 32))) (bf3dpa_bits 32)))
+(let blk13_dpa_op11 (bf3dpa_cast blk13_dpa_op10 (bf3dpa_bits 32)))
+(let blk13_dpa_op12 (bf3dpa_assign blk13_dpa_op11 blk13_dpa_op2))
+
+;; Compute hash: hash_val = (srcIp * MULT_HASH_A) >> 20
+(let blk13_dpa_op13 (bf3dpa_read blk13_dpa_op1 (bf3dpa_bits 32)))  ;; Read srcIp
+(let blk13_dpa_op14 (bf3dpa_read blk13_dpa_op2 (bf3dpa_bits 32)))  ;; Read MULT_HASH_A
+(let blk13_dpa_op15 (bf3dpa_binop blk13_dpa_op13 blk13_dpa_op14 (NamedAttr "kind" (IntegerAttr 1 (I32))) (bf3dpa_bits 32)))
+(let blk13_dpa_op16 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 20 (bf3dpa_bits 16))) (bf3dpa_bits 16)))
+(let blk13_dpa_op17 (bf3dpa_shr blk13_dpa_op15 blk13_dpa_op16 (bf3dpa_bits 32)))  ;; >> 20
+(let blk13_dpa_op18 (bf3dpa_assign blk13_dpa_op17 blk13_dpa_op3))
+
+;; Compute counter_pos = hash_val & 4095
+(let blk13_dpa_op19 (bf3dpa_read blk13_dpa_op3 (bf3dpa_bits 32)))  ;; Read hash_val
+(let blk13_dpa_op20 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 4095 (bf3dpa_bits 32))) (bf3dpa_bits 32)))
+(let blk13_dpa_op21 (bf3dpa_binop blk13_dpa_op19 blk13_dpa_op20 (NamedAttr "kind" (IntegerAttr 10 (I32))) (bf3dpa_bits 32)))
+(let blk13_dpa_op22 (bf3dpa_assign blk13_dpa_op21 blk13_dpa_op4))
+
+(let blk13_dpa_ops (vec-of blk13_dpa_op0 blk13_dpa_op1 blk13_dpa_op2 blk13_dpa_op3 blk13_dpa_op4 blk13_dpa_op5 blk13_dpa_op6 blk13_dpa_op7 blk13_dpa_op8 blk13_dpa_op9 blk13_dpa_op10 blk13_dpa_op11 blk13_dpa_op12 blk13_dpa_op13 blk13_dpa_op14 blk13_dpa_op15 blk13_dpa_op16 blk13_dpa_op17 blk13_dpa_op18 blk13_dpa_op19 blk13_dpa_op20 blk13_dpa_op21 blk13_dpa_op22))
+
+;; ----------------------------------------------------------------------------
+;; Block 13 DRMT - Hash computation using shifts (hardware-friendly)
+;; ----------------------------------------------------------------------------
+
+;; Declare variables
+(let blk13_drmt_op0 (bf3drmt_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_val")) (bf3drmt_ref (bf3drmt_bits 16))))
+(let blk13_drmt_op1 (bf3drmt_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "srcIp")) (bf3drmt_ref (bf3drmt_bits 32))))
+(let blk13_drmt_op2 (bf3drmt_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "MULT_HASH_A")) (bf3drmt_ref (bf3drmt_bits 32))))
+(let blk13_drmt_op3 (bf3drmt_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "hash_val")) (bf3drmt_ref (bf3drmt_bits 32))))
+(let blk13_drmt_op4 (bf3drmt_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_pos")) (bf3drmt_ref (bf3drmt_bits 32))))
+
+;; Extract srcAddr from headers.ipv4.srcAddr
+(let blk13_drmt_op5 (Value 0 (bf3drmt_ref (bf3drmt_struct (NamedAttr "name" (StringAttr "headers")) (NamedAttr "ethernet" (TypeAttr (bf3drmt_header))) (NamedAttr "ipv4" (TypeAttr (bf3drmt_header))) (NamedAttr "tcp" (TypeAttr (bf3drmt_header)))))))
+(let blk13_drmt_op6 (bf3drmt_struct_extract_ref blk13_drmt_op5 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3drmt_ref (bf3drmt_header))))
+(let blk13_drmt_op7 (bf3drmt_struct_extract_ref blk13_drmt_op6 (NamedAttr "fieldIndex" (IntegerAttr 11 (I32))) (bf3drmt_ref (bf3drmt_bits 32))))
+(let blk13_drmt_op8 (bf3drmt_read blk13_drmt_op7 (bf3drmt_bits 32)))
+(let blk13_drmt_op9 (bf3drmt_assign blk13_drmt_op8 blk13_drmt_op1))  ;; srcIp = headers.ipv4.srcAddr
+
+;; Initialize MULT_HASH_A = 73 (using shift-add approximation)
+(let blk13_drmt_op10 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 73 (bf3drmt_bits 32))) (bf3drmt_bits 32)))
+(let blk13_drmt_op11 (bf3drmt_cast blk13_drmt_op10 (bf3drmt_bits 32)))
+(let blk13_drmt_op12 (bf3drmt_assign blk13_drmt_op11 blk13_drmt_op2))
+
+;; Compute hash using shift-add: hash = ((srcIp << 6) + (srcIp << 3) + srcIp) >> 20
+(let blk13_drmt_op13 (bf3drmt_read blk13_drmt_op1 (bf3drmt_bits 32)))  ;; Read srcIp
+(let blk13_drmt_op14 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 6 (bf3drmt_bits 32))) (bf3drmt_bits 32)))
+(let blk13_drmt_op15 (bf3drmt_shl blk13_drmt_op13 blk13_drmt_op14 (bf3drmt_bits 32)))  ;; srcIp << 6
+(let blk13_drmt_op16 (bf3drmt_read blk13_drmt_op1 (bf3drmt_bits 32)))
+(let blk13_drmt_op17 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 3 (bf3drmt_bits 32))) (bf3drmt_bits 32)))
+(let blk13_drmt_op18 (bf3drmt_shl blk13_drmt_op16 blk13_drmt_op17 (bf3drmt_bits 32)))  ;; srcIp << 3
+(let blk13_drmt_op19 (bf3drmt_binop blk13_drmt_op15 blk13_drmt_op18 (NamedAttr "kind" (IntegerAttr 4 (I32))) (bf3drmt_bits 32)))  ;; +
+(let blk13_drmt_op20 (bf3drmt_read blk13_drmt_op1 (bf3drmt_bits 32)))
+(let blk13_drmt_op21 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 0 (bf3drmt_bits 32))) (bf3drmt_bits 32)))
+(let blk13_drmt_op22 (bf3drmt_shl blk13_drmt_op20 blk13_drmt_op21 (bf3drmt_bits 32)))  ;; srcIp << 0 (identity)
+(let blk13_drmt_op23 (bf3drmt_binop blk13_drmt_op19 blk13_drmt_op22 (NamedAttr "kind" (IntegerAttr 4 (I32))) (bf3drmt_bits 32)))  ;; +
+(let blk13_drmt_op24 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 20 (bf3drmt_bits 16))) (bf3drmt_bits 16)))
+(let blk13_drmt_op25 (bf3drmt_shr blk13_drmt_op23 blk13_drmt_op24 (bf3drmt_bits 32)))  ;; >> 20
+(let blk13_drmt_op26 (bf3drmt_assign blk13_drmt_op25 blk13_drmt_op3))
+
+;; Compute counter_pos = hash_val[11:0] (slice bits 0-11)
+(let blk13_drmt_op27 (bf3drmt_read blk13_drmt_op3 (bf3drmt_bits 32)))
+(let blk13_drmt_op28 (bf3drmt_slice blk13_drmt_op27 (NamedAttr "highBit" (IntegerAttr 11 (I32))) (NamedAttr "lowBit" (IntegerAttr 0 (I32))) (bf3drmt_bits 32)))
+(let blk13_drmt_op29 (bf3drmt_assign blk13_drmt_op28 blk13_drmt_op4))
+
+(let blk13_drmt_ops (vec-of blk13_drmt_op0 blk13_drmt_op1 blk13_drmt_op2 blk13_drmt_op3 blk13_drmt_op4 blk13_drmt_op5 blk13_drmt_op6 blk13_drmt_op7 blk13_drmt_op8 blk13_drmt_op9 blk13_drmt_op10 blk13_drmt_op11 blk13_drmt_op12 blk13_drmt_op13 blk13_drmt_op14 blk13_drmt_op15 blk13_drmt_op16 blk13_drmt_op17 blk13_drmt_op18 blk13_drmt_op19 blk13_drmt_op20 blk13_drmt_op21 blk13_drmt_op22 blk13_drmt_op23 blk13_drmt_op24 blk13_drmt_op25 blk13_drmt_op26 blk13_drmt_op27 blk13_drmt_op28 blk13_drmt_op29))
+
+;; ----------------------------------------------------------------------------
+;; Block 13 Implementations
+;; ----------------------------------------------------------------------------
+
+(implement blk13_drmt DRMT (blk8) blk13_drmt_ops)
+(implement blk13_dpa DPA (blk8) blk13_dpa_ops)
+(implement blk13_cpu ARM (blk8) blk13_cpu_ops)
+
+;; Block 13 Equivalences
+(rewrite blk13_cpu blk13_drmt)
+(rewrite blk13_cpu blk13_dpa)
 
 ;; ============================================================================
-;; Block 10: Forwarding Decision (depends on blk7 and blk9)
+;; Block 14: Register Read from Bloom Filter
+;; Valid on: DPA, ARM (NOT on DRMT - no register support)
+;; Dependencies: blk13 (uses counter_pos computed in blk13)
+;; Description: Reads value from bloom filter register at computed position
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 14 CPU (LLVM) - Register operations via function calls
+;; ----------------------------------------------------------------------------
+
+;; Create register with size 4096
+(let blk14_cpu_op0 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 4096 (Int 32))) (Int 32)))
+(let blk14_cpu_op1 (llvm_call (NamedAttr "callee" (SymbolRefAttr "register_create")) blk14_cpu_op0 (llvm_ptr)))
+
+;; Allocate space for output value
+(let blk14_cpu_op2 (llvm_alloca (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))
+
+;; Allocate space for counter_pos (index)
+(let blk14_cpu_op3 (llvm_alloca (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))
+(let blk14_cpu_op4 (llvm_load blk14_cpu_op3 (Int 32)))
+
+;; Call register_read(register, &value_out, counter_pos)
+(let blk14_cpu_op5 (llvm_call_void (NamedAttr "callee" (SymbolRefAttr "register_read")) blk14_cpu_op1 blk14_cpu_op2 blk14_cpu_op4))
+
+;; Allocate counter_val
+(let blk14_cpu_op6 (llvm_alloca (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))
+
+;; Load value from value_out
+(let blk14_cpu_op7 (llvm_load blk14_cpu_op2 (Int 16)))
+
+;; Store to counter_val
+(let blk14_cpu_op8 (llvm_store blk14_cpu_op7 blk14_cpu_op6))
+
+(let blk14_cpu_ops (vec-of blk14_cpu_op0 blk14_cpu_op1 blk14_cpu_op2 blk14_cpu_op3 blk14_cpu_op4 blk14_cpu_op5 blk14_cpu_op6 blk14_cpu_op7 blk14_cpu_op8))
+
+;; ----------------------------------------------------------------------------
+;; Block 14 DPA - Register operations via call_method
+;; ----------------------------------------------------------------------------
+
+;; Declare variables
+(let blk14_dpa_op0 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_val")) (bf3dpa_ref (bf3dpa_bits 16))))
+(let blk14_dpa_op1 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "value_out_arg")) (bf3dpa_ref (bf3dpa_bits 16))))
+(let blk14_dpa_op2 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_pos")) (bf3dpa_ref (bf3dpa_bits 32))))
+
+;; Instantiate Register<16, 32> with size 4096
+(let blk14_dpa_op3 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 4096 (bf3dpa_bits 32))) (bf3dpa_bits 32)))
+(let blk14_dpa_op4 (bf3dpa_instantiate blk14_dpa_op3 
+                        (NamedAttr "callee" (SymbolRefAttr "Register")) 
+                        (NamedAttr "name" (StringAttr "bloom_filter")) 
+                        (bf3dpa_extern "Register" (bf3dpa_bits 16) (bf3dpa_bits 32))))
+
+;; Read counter_pos value
+(let blk14_dpa_op5 (bf3dpa_read blk14_dpa_op2 (bf3dpa_bits 32)))
+
+;; Call Register::read(bloom_filter, value_out_arg, counter_pos)
+(let blk14_dpa_op6 (bf3dpa_call_method blk14_dpa_op4 blk14_dpa_op1 blk14_dpa_op5 
+                        (NamedAttr "callee" (SymbolRefAttr "Register::read"))))
+
+;; Read value from value_out_arg
+(let blk14_dpa_op7 (bf3dpa_read blk14_dpa_op1 (bf3dpa_bits 16)))
+
+;; Assign to counter_val
+(let blk14_dpa_op8 (bf3dpa_assign blk14_dpa_op7 blk14_dpa_op0))
+
+(let blk14_dpa_ops (vec-of blk14_dpa_op0 blk14_dpa_op1 blk14_dpa_op2 blk14_dpa_op3 blk14_dpa_op4 blk14_dpa_op5 blk14_dpa_op6 blk14_dpa_op7 blk14_dpa_op8))
+
+;; ----------------------------------------------------------------------------
+;; Block 14 Implementations - ONLY DPA and ARM (no DRMT)
+;; ----------------------------------------------------------------------------
+
+(implement blk14_dpa DPA (blk13) blk14_dpa_ops)
+(implement blk14_cpu ARM (blk13) blk14_cpu_ops)
+
+;; Block 14 Equivalences - only between DPA and ARM
+(rewrite blk14_cpu blk14_dpa)
+
+;; ============================================================================
+;; Block 15: Register Write to Bloom Filter
+;; Valid on: DPA, ARM (NOT on DRMT - no register support)
+;; Dependencies: blk14 (writes computed value to bloom filter)
+;; Description: Writes value 0 to bloom filter register at counter_pos
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 15 CPU (LLVM) - Register write via function call
+;; ----------------------------------------------------------------------------
+
+;; Allocate counter_val variable
+(let blk15_cpu_op0 (llvm_alloca (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))
+
+;; Create register with size 4096
+(let blk15_cpu_op1 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 4096 (Int 32))) (Int 32)))
+(let blk15_cpu_op2 (llvm_call (NamedAttr "callee" (SymbolRefAttr "register_create")) blk15_cpu_op1 (llvm_ptr)))
+
+;; Allocate and load counter_pos
+(let blk15_cpu_op3 (llvm_alloca (NamedAttr "alignment" (IntegerAttr 4 (I64))) (llvm_ptr)))
+(let blk15_cpu_op4 (llvm_load blk15_cpu_op3 (Int 32)))
+
+;; Create constant 0 to write
+(let blk15_cpu_op5 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 0 (I64))) (I64)))
+
+;; Call Register::write(register, counter_pos, 0)
+(let blk15_cpu_op6 (llvm_call_void (NamedAttr "callee" (SymbolRefAttr "Register::write")) blk15_cpu_op2 blk15_cpu_op4 blk15_cpu_op5))
+
+(let blk15_cpu_ops (vec-of blk15_cpu_op0 blk15_cpu_op1 blk15_cpu_op2 blk15_cpu_op3 blk15_cpu_op4 blk15_cpu_op5 blk15_cpu_op6))
+
+;; ----------------------------------------------------------------------------
+;; Block 15 DPA - Register write via call_method
+;; ----------------------------------------------------------------------------
+
+;; Declare variables
+(let blk15_dpa_op0 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_val")) (bf3dpa_ref (bf3dpa_bits 16))))
+(let blk15_dpa_op1 (bf3dpa_variable (NamedAttr "init" (UnitAttr)) (NamedAttr "name" (StringAttr "counter_pos")) (bf3dpa_ref (bf3dpa_bits 32))))
+
+;; Instantiate Register<16, 32> with size 4096
+(let blk15_dpa_op2 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 4096 (bf3dpa_bits 32))) (bf3dpa_bits 32)))
+(let blk15_dpa_op3 (bf3dpa_instantiate blk15_dpa_op2 
+                        (NamedAttr "callee" (SymbolRefAttr "Register")) 
+                        (NamedAttr "name" (StringAttr "bloom_filter")) 
+                        (bf3dpa_extern "Register" (bf3dpa_bits 16) (bf3dpa_bits 32))))
+
+;; Read counter_pos value
+(let blk15_dpa_op4 (bf3dpa_read blk15_dpa_op1 (bf3dpa_bits 32)))
+
+;; Create constant 0 value to write
+(let blk15_dpa_op5 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int 0 (bf3dpa_bits 32))) (bf3dpa_bits 32)))
+(let blk15_dpa_op6 (bf3dpa_cast blk15_dpa_op5 (bf3dpa_bits 16)))
+
+;; Call Register::write(bloom_filter, counter_pos, 0)
+(let blk15_dpa_op7 (bf3dpa_call_method blk15_dpa_op3 blk15_dpa_op4 blk15_dpa_op6 
+                        (NamedAttr "callee" (SymbolRefAttr "Register::write"))))
+
+(let blk15_dpa_ops (vec-of blk15_dpa_op0 blk15_dpa_op1 blk15_dpa_op2 blk15_dpa_op3 blk15_dpa_op4 blk15_dpa_op5 blk15_dpa_op6 blk15_dpa_op7))
+
+;; ----------------------------------------------------------------------------
+;; Block 15 Implementations - ONLY DPA and ARM (no DRMT)
+;; ----------------------------------------------------------------------------
+
+(implement blk15_dpa DPA (blk14) blk15_dpa_ops)
+(implement blk15_cpu ARM (blk14) blk15_cpu_ops)
+
+;; Block 15 Equivalences - only between DPA and ARM
+(rewrite blk15_cpu blk15_dpa)
+
+;; ============================================================================
+;; Block 22: Metadata Update (INT node marking and switch ID assignment)
 ;; Valid on: DRMT, DPA, ARM
+;; Dependencies: blk15
+;; Description: Sets INT node bit and assigns switch_id to metadata
 ;; ============================================================================
 
-(let blk10_drmt_op0 (p4hir_variable "Type"))
-(let blk10_drmt_op1 (bf3drmt_assign "Type"))
-(let blk10_drmt_ops (vec-of blk10_drmt_op0 blk10_drmt_op1))
+;; ----------------------------------------------------------------------------
+;; Block 22 CPU (LLVM) - Metadata field updates via load/store
+;; ----------------------------------------------------------------------------
 
-(let blk10_dpa_op0 (p4hir_variable "Type"))
-(let blk10_dpa_op1 (bf3dpa_assign "Type"))
-(let blk10_dpa_ops (vec-of blk10_dpa_op0 blk10_dpa_op1))
+;; Load metadata.int_node field
+(let blk22_cpu_op0 (Value 1 (llvm_ptr)))
+(let blk22_cpu_op1 (llvm_load blk22_cpu_op0 (llvm_struct "metadata" (Int 3) (Int 32) (Int 1))))
+(let blk22_cpu_op2 (llvm_getelementptr blk22_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 0) (I32))) (llvm_ptr)))
+(let blk22_cpu_op3 (llvm_load blk22_cpu_op2 (Int 3)))
 
-(let blk10_arm_op0 (p4hir_variable "Type"))
-(let blk10_arm_op1 (arm_assign "Type"))
-(let blk10_arm_ops (vec-of blk10_arm_op0 blk10_arm_op1))
+;; Create constant -4 (0b100 in 3-bit signed - sets high bit)
+(let blk22_cpu_op4 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr -4 (Int 3))) (Int 3)))
 
-(implement blk10_drmt DRMT (blk7 blk9) blk10_drmt_ops)
-(implement blk10_dpa DPA (blk7 blk9) blk10_dpa_ops)
-(implement blk10_arm ARM (blk7 blk9) blk10_arm_ops)
+;; OR operation to set INT bit
+(let blk22_cpu_op5 (llvm_or blk22_cpu_op3 blk22_cpu_op4 (Int 3)))
 
-;; ============================================================================
-;; Rewrite Rules
-;; ============================================================================
+;; Store back to metadata.int_node
+(let blk22_cpu_op6 (llvm_store blk22_cpu_op5 blk22_cpu_op2))
 
-;; Block 2
-(rewrite blk2_drmt blk2_dpa)
-(rewrite blk2_dpa blk2_arm)
+;; Store switch_id (Value 2) to metadata.switch_id
+(let blk22_cpu_op7 (llvm_getelementptr blk22_cpu_op0 (NamedAttr "inbounds" (UnitAttr)) (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of 0 1) (I32))) (llvm_ptr)))
+(let blk22_cpu_op8 (llvm_store (Value 2 (Int 32)) blk22_cpu_op7))
 
-;; Block 3
-(rewrite blk3_drmt blk3_dpa)
-(rewrite blk3_dpa blk3_arm)
+(let blk22_cpu_ops (vec-of blk22_cpu_op0 blk22_cpu_op1 blk22_cpu_op2 blk22_cpu_op3 blk22_cpu_op4 blk22_cpu_op5 blk22_cpu_op6 blk22_cpu_op7 blk22_cpu_op8))
 
-;; Block 6
-(rewrite blk6_drmt blk6_dpa)
-(rewrite blk6_dpa blk6_arm)
+;; ----------------------------------------------------------------------------
+;; Block 22 DPA - Metadata field updates via binop and assign
+;; ----------------------------------------------------------------------------
 
-;; Block 7 (no DRMT)
-(rewrite blk7_dpa blk7_arm)
+;; Common metadata reference
+(let blk22_dpa_op0 (Value 1 (bf3dpa_ref (bf3dpa_struct 
+    (NamedAttr "name" (StringAttr "metadata")) 
+    (NamedAttr "int_node" (TypeAttr (bf3dpa_bits 3))) 
+    (NamedAttr "switch_id" (TypeAttr (bf3dpa_bits 32))) 
+    (NamedAttr "reserved1" (TypeAttr (bf3dpa_bits 1)))))))
 
-;; Block 8
-(rewrite blk8_drmt blk8_dpa)
-(rewrite blk8_dpa blk8_arm)
+;; Extract int_node field reference
+(let blk22_dpa_op1 (bf3dpa_struct_extract_ref blk22_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3dpa_ref (bf3dpa_bits 3))))
 
-;; Block 9
-(rewrite blk9_drmt blk9_dpa)
-(rewrite blk9_dpa blk9_arm)
+;; Read current int_node value
+(let blk22_dpa_op2 (bf3dpa_read blk22_dpa_op1 (bf3dpa_bits 3)))
 
-;; Block 10
-(rewrite blk10_drmt blk10_dpa)
-(rewrite blk10_dpa blk10_arm)
+;; Create constant -4 (set INT bit)
+(let blk22_dpa_op3 (bf3dpa_constant (NamedAttr "value" (bf3dpa_int -4 (bf3dpa_bits 3))) (bf3dpa_bits 3)))
+
+;; OR operation (kind 8 = bitwise OR)
+(let blk22_dpa_op4 (bf3dpa_binop blk22_dpa_op2 blk22_dpa_op3 (NamedAttr "kind" (IntegerAttr 8 (I32))) (bf3dpa_bits 3)))
+
+;; Assign back to int_node
+(let blk22_dpa_op5 (bf3dpa_assign blk22_dpa_op4 blk22_dpa_op1))
+
+;; Extract switch_id field reference
+(let blk22_dpa_op6 (bf3dpa_struct_extract_ref blk22_dpa_op0 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3dpa_ref (bf3dpa_bits 32))))
+
+;; Assign switch_id value (Value 2)
+(let blk22_dpa_op7 (bf3dpa_assign (Value 2 (bf3dpa_bits 32)) blk22_dpa_op6))
+
+(let blk22_dpa_ops (vec-of blk22_dpa_op0 blk22_dpa_op1 blk22_dpa_op2 blk22_dpa_op3 blk22_dpa_op4 blk22_dpa_op5 blk22_dpa_op6 blk22_dpa_op7))
+
+;; ----------------------------------------------------------------------------
+;; Block 22 DRMT - Metadata field updates using slice/concat (no bitwise OR)
+;; ----------------------------------------------------------------------------
+
+;; Common metadata reference
+(let blk22_drmt_op0 (Value 1 (bf3drmt_ref (bf3drmt_struct 
+    (NamedAttr "name" (StringAttr "metadata")) 
+    (NamedAttr "int_node" (TypeAttr (bf3drmt_bits 3))) 
+    (NamedAttr "switch_id" (TypeAttr (bf3drmt_bits 32))) 
+    (NamedAttr "reserved1" (TypeAttr (bf3drmt_bits 1)))))))
+
+;; Extract int_node field reference
+(let blk22_drmt_op1 (bf3drmt_struct_extract_ref blk22_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 0 (I32))) (bf3drmt_ref (bf3drmt_bits 3))))
+
+;; Read current int_node value
+(let blk22_drmt_op2 (bf3drmt_read blk22_drmt_op1 (bf3drmt_bits 3)))
+
+;; Slice lower 2 bits [1:0]
+(let blk22_drmt_op3 (bf3drmt_slice blk22_drmt_op2 (NamedAttr "highBit" (IntegerAttr 1 (I32))) (NamedAttr "lowBit" (IntegerAttr 0 (I32))) (bf3drmt_bits 2)))
+
+;; Create constant 1 (set high bit)
+(let blk22_drmt_op4 (bf3drmt_constant (NamedAttr "value" (bf3drmt_int 1 (bf3drmt_bits 1))) (bf3drmt_bits 1)))
+
+;; Concatenate: 1 || lower_2_bits (sets bit 2 to 1)
+(let blk22_drmt_op5 (bf3drmt_concat blk22_drmt_op4 blk22_drmt_op3 (bf3drmt_bits 3)))
+
+;; Assign back to int_node
+(let blk22_drmt_op6 (bf3drmt_assign blk22_drmt_op5 blk22_drmt_op1))
+
+;; Extract switch_id field reference
+(let blk22_drmt_op7 (bf3drmt_struct_extract_ref blk22_drmt_op0 (NamedAttr "fieldIndex" (IntegerAttr 1 (I32))) (bf3drmt_ref (bf3drmt_bits 32))))
+
+;; Assign switch_id value (Value 2)
+(let blk22_drmt_op8 (bf3drmt_assign (Value 2 (bf3drmt_bits 32)) blk22_drmt_op7))
+
+(let blk22_drmt_ops (vec-of blk22_drmt_op0 blk22_drmt_op1 blk22_drmt_op2 blk22_drmt_op3 blk22_drmt_op4 blk22_drmt_op5 blk22_drmt_op6 blk22_drmt_op7 blk22_drmt_op8))
+
+;; ----------------------------------------------------------------------------
+;; Block 22 Implementations - depends on blk15
+;; ----------------------------------------------------------------------------
+
+(implement blk22_drmt DRMT (blk15) blk22_drmt_ops)
+(implement blk22_dpa DPA (blk15) blk22_dpa_ops)
+(implement blk22_cpu ARM (blk15) blk22_dpa_ops)
+
+;; Block 22 Equivalences
+(rewrite blk22_cpu blk22_drmt)
+(rewrite blk22_cpu blk22_dpa)

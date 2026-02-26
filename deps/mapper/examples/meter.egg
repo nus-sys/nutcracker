@@ -1,0 +1,657 @@
+;; ============================================================================
+;; Hardware Configuration
+;; ============================================================================
+
+(hardware DRMT :cores 1 :sigma 0.0)
+(hardware DPA :cores 8 :sigma 0.5)
+(hardware ARM :cores 16 :sigma 1.0)
+
+;; ============================================================================
+;; Communication Links (BlueField-3 Topology)
+;; ============================================================================
+
+(link DRMT ARM 1.0 1.0)
+
+;; ============================================================================
+;; Operation Definitions (with costs and types)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; BF3 DRMT Dialect Operations (Hardware Dataplane - SRAM/TCAM)
+;; ----------------------------------------------------------------------------
+
+(function bf3drmt_variable (Type) Type :cost 1 :type stateless)
+(function bf3drmt_read (Type) Type :cost 1 :type stateless)
+(function bf3drmt_assign (Type) Type :cost 1 :type stateful :sigma 0.1)
+(function bf3drmt_struct_extract_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_constant (Type) Type :cost 1 :type stateless)
+(function bf3drmt_cast (Type) Type :cost 1 :type stateless)
+(function bf3drmt_match_key (Type Type Type Type) Type :cost 2 :type stateless)
+(function bf3drmt_bool () Type :cost 1 :type stateless)
+(function bf3drmt_valid_bit () Type :cost 1 :type stateless)
+(function bf3drmt_bits (i64) Type :cost 1 :type stateless)
+(function bf3drmt_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_struct (AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3drmt_header (AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3drmt_validity_bit (String Type) Attr :cost 1 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; BF3 DPA Dialect Operations (NPU - Programmable Dataplane)
+;; ----------------------------------------------------------------------------
+
+(function bf3dpa_variable (Type) Type :cost 8 :type stateless)
+(function bf3dpa_read (Type) Type :cost 8 :type stateless)
+(function bf3dpa_assign (Type) Type :cost 15 :type stateful :sigma 1.0)
+(function bf3dpa_struct_extract_ref (Type) Type :cost 10 :type stateless)
+(function bf3dpa_constant (Type) Type :cost 5 :type stateless)
+(function bf3dpa_cast (Type) Type :cost 6 :type stateless)
+(function bf3dpa_cmp (Type Type Type Type) Type :cost 12 :type stateless)
+(function bf3dpa_if (Type Type) Type :cost 20 :type stateless)
+(function bf3dpa_yield () Type :cost 2 :type stateless)
+(function bf3dpa_bool () Type :cost 1 :type stateless)
+(function bf3dpa_valid_bit () Type :cost 1 :type stateless)
+(function bf3dpa_bits (i64) Type :cost 1 :type stateless)
+(function bf3dpa_ref (Type) Type :cost 1 :type stateless)
+(function bf3dpa_struct (AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3dpa_header (AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3dpa_validity_bit (String Type) Attr :cost 1 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; LLVM Dialect Operations (CPU/ARM)
+;; ----------------------------------------------------------------------------
+
+(function llvm_ptr () Type :cost 2 :type stateless)
+(function llvm_mlir_constant (AttrPair Type) Op :cost 1 :type stateless)
+(function llvm_load (Op Type) Op :cost 3 :type stateless)
+(function llvm_getelementptr (Op AttrPair AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_icmp (Op Op AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_cond_br (Op AttrPair AttrPair) Op :cost 5 :type stateless)
+
+;; ============================================================================
+;; Block 10: Read IPv4 Protocol Field
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: None (first block)
+;; Description: Reads ipv4.protocol field (offset [1][7]) for routing decision
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 10 DRMT - Read protocol field
+;; Pattern: read(ipv4.protocol)
+;; Cost: 1 (struct_extract_ref) + 1 (read) = 2
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk10_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the protocol field value
+(let blk10_drmt_op1
+    (bf3drmt_read blk10_drmt_op0 (I8)))
+
+(let blk10_drmt_ops (vec-of blk10_drmt_op0 blk10_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 10 DPA - Read protocol field
+;; Pattern: read(ipv4.protocol)
+;; Cost: 10 (struct_extract_ref) + 8 (read) = 18
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk10_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the protocol field value
+(let blk10_dpa_op1
+    (bf3dpa_read blk10_dpa_op0 (I8)))
+
+(let blk10_dpa_ops (vec-of blk10_dpa_op0 blk10_dpa_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 10 ARM (LLVM) - Load protocol field
+;; Pattern: load ipv4.protocol
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) = 6
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk10_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1) - not used but declared
+(let blk10_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk10_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to ipv4.protocol at [0, 1, 7]
+(let blk10_cpu_op3 
+    (llvm_getelementptr blk10_cpu_op0 blk10_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (llvm_ptr)))
+
+;; Load protocol field value
+(let blk10_cpu_op4 
+    (llvm_load blk10_cpu_op3 (I8)))
+
+;; Value 5 marker (for downstream use)
+(let blk10_cpu_op5 (Value 5 (None)))
+
+(let blk10_cpu_ops (vec-of blk10_cpu_op0 blk10_cpu_op1 blk10_cpu_op2 blk10_cpu_op3 blk10_cpu_op4 blk10_cpu_op5))
+
+;; ============================================================================
+;; Block 10 Deployment Declarations
+;; ============================================================================
+
+(implement blk10_drmt DRMT () blk10_drmt_ops)
+(implement blk10_dpa DPA () blk10_dpa_ops)
+(implement blk10_cpu ARM () blk10_cpu_ops)
+
+;; Block 10 Equivalences
+(rewrite blk10_cpu blk10_drmt)
+(rewrite blk10_cpu blk10_dpa)
+
+;; ============================================================================
+;; Block 11: Meter Execution
+;; Valid on: DRMT, ARM (NOT DPA - no metering support)
+;; Dependencies: block10 (protocol field read)
+;; Description: Executes meter on packet (rate limiting/policing)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 11 DRMT - Meter call_method
+;; Pattern: meter.execute(0)
+;; Cost: 1 (constant) + 5 (call_method) = 6
+;; ----------------------------------------------------------------------------
+
+;; Create constant 0 (meter index)
+(let blk11_drmt_op0
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I32)))
+        (I32)))
+
+;; Call meter execute method
+(let blk11_drmt_op1
+    (bf3drmt_call_method 
+        blk11_drmt_op0
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I32)))
+
+(let blk11_drmt_ops (vec-of blk11_drmt_op0 blk11_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 11 ARM (LLVM) - Call meter_execute function
+;; Pattern: meter_execute(0)
+;; Cost: 1 (constant) + 5 (call) = 6
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk11_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk11_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 (meter index)
+(let blk11_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I32)))
+        (I32)))
+
+;; Call meter_execute function
+(let blk11_cpu_op3 
+    (llvm_call blk11_cpu_op2
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "callee" (SymbolRefAttr "meter_execute"))
+        (I32)))
+
+;; Value 4 marker (meter result stored)
+(let blk11_cpu_op4 (Value 4 (None)))
+
+(let blk11_cpu_ops (vec-of blk11_cpu_op0 blk11_cpu_op1 blk11_cpu_op2 blk11_cpu_op3 blk11_cpu_op4))
+
+;; ============================================================================
+;; Block 11 Deployment Declarations
+;; ============================================================================
+
+(implement blk11_drmt DRMT (blk10) blk11_drmt_ops)
+(implement blk11_cpu ARM (blk10) blk11_cpu_ops)
+
+;; Block 11 Equivalences
+(rewrite blk11_cpu blk11_drmt)
+
+;; ============================================================================
+;; Block 3: Read TCP/UDP Destination Port
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block11 (meter execution complete)
+;; Description: Reads destination port at offset [2][1] (TCP or UDP dstPort)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 3 DRMT - Read destination port field
+;; Pattern: read(packet.tcp_or_udp.dstPort)
+;; Cost: 1 (struct_extract_ref) + 1 (read) = 2
+;; ----------------------------------------------------------------------------
+
+;; Get reference to dstPort field at [2][1]
+(let blk3_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the destination port field value
+(let blk3_drmt_op1
+    (bf3drmt_read blk3_drmt_op0 (I16)))
+
+(let blk3_drmt_ops (vec-of blk3_drmt_op0 blk3_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 3 DPA - Read destination port field
+;; Pattern: read(packet.tcp_or_udp.dstPort)
+;; Cost: 10 (struct_extract_ref) + 8 (read) = 18
+;; ----------------------------------------------------------------------------
+
+;; Get reference to dstPort field at [2][1]
+(let blk3_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the destination port field value
+(let blk3_dpa_op1
+    (bf3dpa_read blk3_dpa_op0 (I16)))
+
+(let blk3_dpa_ops (vec-of blk3_dpa_op0 blk3_dpa_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 3 ARM (LLVM) - Load destination port field
+;; Pattern: load packet.tcp_or_udp.dstPort
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) = 6
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk3_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1) - not used but declared
+(let blk3_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk3_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to dstPort at [0, 2, 1] (struct index 2 = tcp/udp, field 1 = dstPort)
+(let blk3_cpu_op3 
+    (llvm_getelementptr blk3_cpu_op0 blk3_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (llvm_ptr)))
+
+;; Load destination port field value
+(let blk3_cpu_op4 
+    (llvm_load blk3_cpu_op3 (I16)))
+
+;; Value 5 marker (destination port stored)
+(let blk3_cpu_op5 (Value 5 (None)))
+
+(let blk3_cpu_ops (vec-of blk3_cpu_op0 blk3_cpu_op1 blk3_cpu_op2 blk3_cpu_op3 blk3_cpu_op4 blk3_cpu_op5))
+
+;; ============================================================================
+;; Block 3 Deployment Declarations
+;; ============================================================================
+
+(implement blk3_drmt DRMT (blk11) blk3_drmt_ops)
+(implement blk3_dpa DPA (blk11) blk3_dpa_ops)
+(implement blk3_cpu ARM (blk11) blk3_cpu_ops)
+
+;; Block 3 Equivalences
+(rewrite blk3_cpu blk3_drmt)
+(rewrite blk3_cpu blk3_dpa)
+
+;; ============================================================================
+;; Block 15: Meter Execution (Instance 1)
+;; Valid on: DRMT, ARM (NOT DPA - no metering support)
+;; Dependencies: block10 (protocol field read)
+;; Description: Executes meter instance 1 (different from block11's meter 0)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 15 DRMT - Meter call_method with index 1
+;; Pattern: meter.execute(1)
+;; Cost: 1 (constant) + 5 (call_method) = 6
+;; ----------------------------------------------------------------------------
+
+;; Create constant 1 (meter index 1)
+(let blk15_drmt_op0
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 1 (I32)))
+        (I32)))
+
+;; Call meter execute method
+(let blk15_drmt_op1
+    (bf3drmt_call_method 
+        blk15_drmt_op0
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I32)))
+
+(let blk15_drmt_ops (vec-of blk15_drmt_op0 blk15_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 15 DPA - NOT SUPPORTED
+;; DPA does not have metering capability
+;; This block cannot be deployed to DPA
+;; ----------------------------------------------------------------------------
+
+;; No DPA implementation - metering not supported
+
+;; ----------------------------------------------------------------------------
+;; Block 15 ARM (LLVM) - Call meter_execute function with index 1
+;; Pattern: meter_execute(1)
+;; Cost: 1 (constant) + 5 (call) = 6
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk15_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk15_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 1 (meter index 1)
+(let blk15_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 1 (I32)))
+        (I32)))
+
+;; Call meter_execute function
+(let blk15_cpu_op3 
+    (llvm_call blk15_cpu_op2
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "TailCallKind" (StringAttr "none"))
+        (NamedAttr "callee" (SymbolRefAttr "meter_execute"))
+        (I32)))
+
+;; Value 4 marker (meter result stored)
+(let blk15_cpu_op4 (Value 4 (None)))
+
+(let blk15_cpu_ops (vec-of blk15_cpu_op0 blk15_cpu_op1 blk15_cpu_op2 blk15_cpu_op3 blk15_cpu_op4))
+
+;; ============================================================================
+;; Block 15 Deployment Declarations
+;; ============================================================================
+
+(implement blk15_drmt DRMT (blk10) blk15_drmt_ops)
+;; NO DPA IMPLEMENTATION - metering not supported on DPA
+(implement blk15_cpu ARM (blk10) blk15_cpu_ops)
+
+;; Block 15 Equivalences
+(rewrite blk15_cpu blk15_drmt)
+;; NO DPA rewrite - cannot deploy to DPA
+
+;; ============================================================================
+;; Block 7: Read UDP Destination Port
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block15 (meter 1 execution complete)
+;; Description: Reads UDP destination port at offset [3][1]
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 7 DRMT - Read UDP destination port field
+;; Pattern: read(packet.udp.dstPort)
+;; Cost: 1 (struct_extract_ref) + 1 (read) = 2
+;; ----------------------------------------------------------------------------
+
+;; Get reference to UDP dstPort field at [3][1]
+(let blk7_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 3 1) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the UDP destination port field value
+(let blk7_drmt_op1
+    (bf3drmt_read blk7_drmt_op0 (I16)))
+
+(let blk7_drmt_ops (vec-of blk7_drmt_op0 blk7_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 7 DPA - Read UDP destination port field
+;; Pattern: read(packet.udp.dstPort)
+;; Cost: 10 (struct_extract_ref) + 8 (read) = 18
+;; ----------------------------------------------------------------------------
+
+;; Get reference to UDP dstPort field at [3][1]
+(let blk7_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 3 1) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the UDP destination port field value
+(let blk7_dpa_op1
+    (bf3dpa_read blk7_dpa_op0 (I16)))
+
+(let blk7_dpa_ops (vec-of blk7_dpa_op0 blk7_dpa_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 7 ARM (LLVM) - Load UDP destination port field
+;; Pattern: load packet.udp.dstPort
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) = 6
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk7_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1) - not used but declared
+(let blk7_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk7_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to UDP dstPort at [0, 3, 1] (struct index 3 = udp, field 1 = dstPort)
+(let blk7_cpu_op3 
+    (llvm_getelementptr blk7_cpu_op0 blk7_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 3 1) (I32)))
+        (llvm_ptr)))
+
+;; Load UDP destination port field value
+(let blk7_cpu_op4 
+    (llvm_load blk7_cpu_op3 (I16)))
+
+;; Value 5 marker (UDP destination port stored)
+(let blk7_cpu_op5 (Value 5 (None)))
+
+(let blk7_cpu_ops (vec-of blk7_cpu_op0 blk7_cpu_op1 blk7_cpu_op2 blk7_cpu_op3 blk7_cpu_op4 blk7_cpu_op5))
+
+;; ============================================================================
+;; Block 7 Deployment Declarations
+;; ============================================================================
+
+(implement blk7_drmt DRMT (blk15) blk7_drmt_ops)
+(implement blk7_dpa DPA (blk15) blk7_dpa_ops)
+(implement blk7_cpu ARM (blk15) blk7_cpu_ops)
+
+;; Block 7 Equivalences
+(rewrite blk7_cpu blk7_drmt)
+(rewrite blk7_cpu blk7_dpa)
+
+;; ============================================================================
+;; Block 17: Meter Execution (Instance 0, UDP path)
+;; Valid on: DRMT, ARM (NOT DPA - no metering support)
+;; Dependencies: block7 (UDP destination port read)
+;; Description: Executes meter instance 0 on UDP path
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 17 DRMT - Meter call_method with index 0
+;; Pattern: meter.execute(0)
+;; Cost: 1 (constant) + 5 (call_method) = 6
+;; Note: DRMT representation appears to be missing the constant operand
+;; ----------------------------------------------------------------------------
+
+;; Create constant 0 (meter index 0)
+(let blk17_drmt_op0
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I32)))
+        (I32)))
+
+;; Call meter execute method
+(let blk17_drmt_op1
+    (bf3drmt_call_method 
+        blk17_drmt_op0
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I32)))
+
+(let blk17_drmt_ops (vec-of blk17_drmt_op0 blk17_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 17 DPA - NOT SUPPORTED
+;; DPA does not have metering capability
+;; This block cannot be deployed to DPA
+;; ----------------------------------------------------------------------------
+
+;; No DPA implementation - metering not supported
+
+;; ----------------------------------------------------------------------------
+;; Block 17 ARM (LLVM) - Call meter_execute function with index 0
+;; Pattern: meter_execute(0)
+;; Cost: 1 (constant) + 5 (call) = 6
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk17_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk17_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 (meter index 0)
+(let blk17_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I32)))
+        (I32)))
+
+;; Call meter_execute function
+(let blk17_cpu_op3 
+    (llvm_call blk17_cpu_op2
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "callee" (SymbolRefAttr "meter_execute"))
+        (I32)))
+
+;; Value 4 marker (meter result stored)
+(let blk17_cpu_op4 (Value 4 (None)))
+
+(let blk17_cpu_ops (vec-of blk17_cpu_op0 blk17_cpu_op1 blk17_cpu_op2 blk17_cpu_op3 blk17_cpu_op4))
+
+;; ============================================================================
+;; Block 17 Deployment Declarations
+;; ============================================================================
+
+(implement blk17_drmt DRMT (blk7) blk17_drmt_ops)
+;; NO DPA IMPLEMENTATION - metering not supported on DPA
+(implement blk17_cpu ARM (blk7) blk17_cpu_ops)
+
+;; Block 17 Equivalences
+(rewrite blk17_cpu blk17_drmt)
+
+;; ============================================================================
+;; Block 13: Per-Entry Counter
+;; Valid on: DRMT, ARM (possibly DPA with extern support)
+;; Dependencies: block3 (TCP/UDP destination port read)
+;; Description: Increments per-entry counter (likely indexed by port)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 13 DRMT - Counter call_method
+;; Pattern: counter.count()
+;; Cost: 5 (call_method)
+;; Note: DRMT representation appears to be missing operands
+;; ----------------------------------------------------------------------------
+
+;; Call counter method (per-entry counting)
+(let blk13_drmt_op0
+    (bf3drmt_call_method 
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I32)))
+
+(let blk13_drmt_ops (vec-of blk13_drmt_op0))
+
+;; ----------------------------------------------------------------------------
+;; Block 13 DPA - Conditional support (if extern counter available)
+;; Pattern: extern counter.count()
+;; Cost: 50 (call_method for extern)
+;; Note: May not be supported depending on DPA extern configuration
+;; ----------------------------------------------------------------------------
+
+;; Call counter method via extern
+(let blk13_dpa_op0
+    (bf3dpa_call_method 
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))))
+
+(let blk13_dpa_ops (vec-of blk13_dpa_op0))
+
+;; ----------------------------------------------------------------------------
+;; Block 13 ARM (LLVM) - Call per_entry_counter function
+;; Pattern: per_entry_counter()
+;; Cost: 5 (call with tail call optimization)
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk13_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk13_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Call per_entry_counter function (tail call)
+(let blk13_cpu_op2 
+    (llvm_call_1
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "TailCallKind" (StringAttr "tail"))
+        (NamedAttr "callee" (SymbolRefAttr "per_entry_counter"))
+        (I32)))
+
+;; Value 3 marker (counter result stored)
+(let blk13_cpu_op3 (Value 3 (None)))
+
+(let blk13_cpu_ops (vec-of blk13_cpu_op0 blk13_cpu_op1 blk13_cpu_op2 blk13_cpu_op3))
+
+;; ============================================================================
+;; Block 13 Deployment Declarations
+;; ============================================================================
+
+(implement blk13_drmt DRMT (blk3) blk13_drmt_ops)
+(implement blk13_cpu ARM (blk3) blk13_cpu_ops)
+
+;; Block 13 Equivalences
+(rewrite blk13_cpu blk13_drmt)

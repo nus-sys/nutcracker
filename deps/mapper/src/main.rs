@@ -218,9 +218,9 @@ fn setup_cost_model(
             let hw = dataflow::Hardware::new(hw_name.clone());
             
             let (latency_factor, throughput, energy_factor) = match hw_name.as_str() {
-                "CPU" | "ARM_CPU" | "x86_CPU" => (1.5, 2.0, 2.0),
-                "DRMT" | "SmartNIC" => (1.0, 5.0, 1.0),
-                "DPA" | "FPGA" => (0.5, 10.0, 0.5),
+                "CPU" | "ARM" | "x86_CPU" => (1.5, 2.0, 5.0),
+                "DRMT" => (1.0, 5.0, 0.1),
+                "DPA" => (0.5, 10.0, 0.5),
                 _ => (1.0, 1.0, 1.0),
             };
 

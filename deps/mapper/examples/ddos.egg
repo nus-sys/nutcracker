@@ -1,0 +1,889 @@
+;; ============================================================================
+;; Hardware Configuration
+;; ============================================================================
+
+(hardware DRMT :cores 1 :sigma 0.0)
+(hardware DPA :cores 8 :sigma 0.5)
+(hardware ARM :cores 16 :sigma 1.0)
+
+;; ============================================================================
+;; Communication Links (BlueField-3 Topology)
+;; ============================================================================
+
+(link DRMT ARM 1.0 1.0)
+
+
+;; ============================================================================
+;; Operation Definitions (with costs and types)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; BF3 DRMT Dialect Operations (Hardware Dataplane - SRAM/TCAM)
+;; ----------------------------------------------------------------------------
+
+(function bf3drmt_variable (Type) Type :cost 1 :type stateless)
+(function bf3drmt_read (Type) Type :cost 1 :type stateless)
+(function bf3drmt_assign (Type) Type :cost 1 :type stateful :sigma 0.1)
+(function bf3drmt_struct_extract_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_constant (Type) Type :cost 1 :type stateless)
+(function bf3drmt_cast (Type) Type :cost 1 :type stateless)
+(function bf3drmt_match_key (Type Type Type Type) Type :cost 2 :type stateless)
+(function bf3drmt_bool () Type :cost 1 :type stateless)
+(function bf3drmt_valid_bit () Type :cost 1 :type stateless)
+(function bf3drmt_bits (i64) Type :cost 1 :type stateless)
+(function bf3drmt_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_struct (AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3drmt_header (AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3drmt_validity_bit (String Type) Attr :cost 1 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; BF3 DPA Dialect Operations (NPU - Programmable Dataplane)
+;; ----------------------------------------------------------------------------
+
+(function bf3dpa_variable (Type) Type :cost 8 :type stateless)
+(function bf3dpa_read (Type) Type :cost 8 :type stateless)
+(function bf3dpa_assign (Type) Type :cost 15 :type stateful :sigma 1.0)
+(function bf3dpa_struct_extract_ref (Type) Type :cost 10 :type stateless)
+(function bf3dpa_constant (Type) Type :cost 5 :type stateless)
+(function bf3dpa_cast (Type) Type :cost 6 :type stateless)
+(function bf3dpa_cmp (Type Type Type Type) Type :cost 12 :type stateless)
+(function bf3dpa_if (Type Type) Type :cost 20 :type stateless)
+(function bf3dpa_yield () Type :cost 2 :type stateless)
+(function bf3dpa_bool () Type :cost 1 :type stateless)
+(function bf3dpa_valid_bit () Type :cost 1 :type stateless)
+(function bf3dpa_bits (i64) Type :cost 1 :type stateless)
+(function bf3dpa_ref (Type) Type :cost 1 :type stateless)
+(function bf3dpa_struct (AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3dpa_header (AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3dpa_validity_bit (String Type) Attr :cost 1 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; LLVM Dialect Operations (CPU/ARM)
+;; ----------------------------------------------------------------------------
+
+(function llvm_ptr () Type :cost 2 :type stateless)
+(function llvm_mlir_constant (AttrPair Type) Op :cost 1 :type stateless)
+(function llvm_load (Op Type) Op :cost 3 :type stateless)
+(function llvm_getelementptr (Op AttrPair AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_icmp (Op Op AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_cond_br (Op AttrPair AttrPair) Op :cost 5 :type stateless)
+
+;; ============================================================================
+;; Block 0: IPv4 Protocol Check (TCP)
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: None (first block)
+;; Description: Checks if ipv4.protocol == 6 (TCP protocol)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 0 DRMT - Match key comparison
+;; Pattern: match_key(ipv4.protocol, 6, exact)
+;; Cost: 1 (struct_extract_ref) + 1 (read) + 1 (constant) + 2 (match_key) = 5
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk0_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the protocol field value
+(let blk0_drmt_op1
+    (bf3drmt_read blk0_drmt_op0 (I8)))
+
+;; Create constant 6 (TCP protocol number)
+(let blk0_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 6 (I8)))
+        (I8)))
+
+;; Match key: exact match for TCP protocol
+(let blk0_drmt_op3
+    (bf3drmt_match_key 
+        blk0_drmt_op1
+        blk0_drmt_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk0_drmt_ops (vec-of blk0_drmt_op0 blk0_drmt_op1 blk0_drmt_op2 blk0_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 0 DPA - Comparison operation
+;; Pattern: cmp(ipv4.protocol, 6, eq)
+;; Cost: 10 (struct_extract_ref) + 8 (read) + 5 (constant) + 12 (cmp) = 35
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk0_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the protocol field value
+(let blk0_dpa_op1
+    (bf3dpa_read blk0_dpa_op0 (I8)))
+
+;; Create constant 6 (TCP protocol number)
+(let blk0_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 6 (I8)))
+        (I8)))
+
+;; Compare: protocol == 6
+(let blk0_dpa_op3
+    (bf3dpa_cmp 
+        blk0_dpa_op1
+        blk0_dpa_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk0_dpa_ops (vec-of blk0_dpa_op0 blk0_dpa_op1 blk0_dpa_op2 blk0_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 0 ARM (LLVM) - Load and compare protocol field
+;; Pattern: load ipv4.protocol; icmp eq, 6
+;; Cost: 1 (constant 0) + 1 (constant 6) + 2 (gep) + 3 (load) + 2 (icmp) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk0_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1) - not used but declared
+(let blk0_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk0_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; Create constant 6 (TCP protocol number)
+(let blk0_cpu_op3 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 6 (I8)))
+        (I8)))
+
+;; GEP to ipv4.protocol at [0, 1, 7]
+(let blk0_cpu_op4 
+    (llvm_getelementptr blk0_cpu_op0 blk0_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (llvm_ptr) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (llvm_ptr)))
+
+;; Load protocol field value
+(let blk0_cpu_op5 
+    (llvm_load blk0_cpu_op4 (I8)))
+
+;; Compare: protocol == 6
+(let blk0_cpu_op6 
+    (llvm_icmp blk0_cpu_op5 blk0_cpu_op3
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+;; Value 7 marker (comparison result stored)
+(let blk0_cpu_op7 (Value 7 (None)))
+
+(let blk0_cpu_ops (vec-of blk0_cpu_op0 blk0_cpu_op1 blk0_cpu_op2 blk0_cpu_op3 blk0_cpu_op4 blk0_cpu_op5 blk0_cpu_op6 blk0_cpu_op7))
+
+;; ============================================================================
+;; Block 0 Deployment Declarations
+;; ============================================================================
+
+(implement blk0_drmt DRMT () blk0_drmt_ops)
+(implement blk0_dpa DPA () blk0_dpa_ops)
+(implement blk0_cpu ARM () blk0_cpu_ops)
+
+;; Block 0 Equivalences
+(rewrite blk0_cpu blk0_drmt)
+(rewrite blk0_cpu blk0_dpa)
+
+;; ============================================================================
+;; Block 7: TCP Sequence Number Read and Write
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block0 (TCP protocol verified)
+;; Description: Reads TCP seq number, then writes a symbolic value (Value 6)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 7 DRMT - Read then assign TCP sequence number
+;; Pattern: read(tcp.seq); tcp.seq = Value(6)
+;; Cost: 1 (constant) + 1 (extract_ref) + 1 (read) + 1 (extract_ref) + 2 (assign) = 6
+;; ----------------------------------------------------------------------------
+
+;; Create constant 1073741823 (0x3FFFFFFF - max positive 30-bit value)
+(let blk7_drmt_op0
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 1073741823 (I32)))
+        (I32)))
+
+;; Get reference to tcp.seq field at [2][2]
+(let blk7_drmt_op1
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 2) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the current sequence number
+(let blk7_drmt_op2
+    (bf3drmt_read blk7_drmt_op1 (I32)))
+
+;; Get reference again for assignment
+(let blk7_drmt_op3
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 2) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Assign Value 6 to sequence number (symbolic value from computation)
+(let blk7_drmt_op4
+    (bf3drmt_assign blk7_drmt_op3 (Value 6 (I32))))
+
+(let blk7_drmt_ops (vec-of blk7_drmt_op0 blk7_drmt_op1 blk7_drmt_op2 blk7_drmt_op3 blk7_drmt_op4))
+
+;; ----------------------------------------------------------------------------
+;; Block 7 DPA - Read then assign TCP sequence number
+;; Pattern: read(tcp.seq); tcp.seq = Value(6)
+;; Cost: 5 (constant) + 10 (extract_ref) + 8 (read) + 10 (extract_ref) + 15 (assign) = 48
+;; ----------------------------------------------------------------------------
+
+;; Create constant 1073741823 (0x3FFFFFFF)
+(let blk7_dpa_op0
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 1073741823 (I32)))
+        (I32)))
+
+;; Get reference to tcp.seq field at [2][2]
+(let blk7_dpa_op1
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 2) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the current sequence number
+(let blk7_dpa_op2
+    (bf3dpa_read blk7_dpa_op1 (I32)))
+
+;; Get reference again for assignment
+(let blk7_dpa_op3
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 2) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Assign Value 6 to sequence number (Note: DPA assigns source to destination)
+(let blk7_dpa_op4
+    (bf3dpa_assign (Value 6 (I32)) blk7_dpa_op3))
+
+(let blk7_dpa_ops (vec-of blk7_dpa_op0 blk7_dpa_op1 blk7_dpa_op2 blk7_dpa_op3 blk7_dpa_op4))
+
+;; ----------------------------------------------------------------------------
+;; Block 7 ARM (LLVM) - Load and store TCP sequence number
+;; Pattern: load tcp.seq; store Value(6), tcp.seq
+;; Cost: 1 (constant 0) + 1 (constant 1073741823) + 2 (gep) + 3 (load) + 2 (store) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk7_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1) - not used but declared
+(let blk7_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk7_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; Create constant 1073741823 (0x3FFFFFFF)
+(let blk7_cpu_op3 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 1073741823 (I32)))
+        (I32)))
+
+;; GEP to tcp.seq at [0, 2, 2] (struct index 2 = tcp, field 2 = seq)
+(let blk7_cpu_op4 
+    (llvm_getelementptr blk7_cpu_op0 blk7_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (llvm_ptr) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 2) (I32)))
+        (llvm_ptr)))
+
+;; Load current sequence number
+(let blk7_cpu_op5 
+    (llvm_load blk7_cpu_op4 (I32)))
+
+;; Value 6 - result from previous computation (symbolic)
+(let blk7_cpu_op6 (Value 6 (I32)))
+
+;; Store Value 6 to sequence number field
+(let blk7_cpu_op7 
+    (llvm_store blk7_cpu_op6 blk7_cpu_op4))
+
+;; Value 8 marker (operation complete)
+(let blk7_cpu_op8 (Value 8 (None)))
+
+(let blk7_cpu_ops (vec-of blk7_cpu_op3 blk7_cpu_op4 blk7_cpu_op5 blk7_cpu_op7))
+
+;; ============================================================================
+;; Block 7 Deployment Declarations
+;; ============================================================================
+
+(implement blk7_drmt DRMT (blk0) blk7_drmt_ops)
+(implement blk7_dpa DPA (blk0) blk7_dpa_ops)
+(implement blk7_cpu ARM (blk0) blk7_cpu_ops)
+
+;; Block 7 Equivalences
+(rewrite blk7_cpu blk7_drmt)
+(rewrite blk7_cpu blk7_dpa)
+
+;; ============================================================================
+;; Block 8: Meter Execution (After TCP Sequence Rewrite)
+;; Valid on: DRMT, ARM (NOT DPA - no metering support)
+;; Dependencies: block7 (TCP sequence number rewritten)
+;; Description: Executes meter instance 0 after TCP processing
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 8 DRMT - Meter call_method with index 0
+;; Pattern: meter.execute(0)
+;; Cost: 1 (constant) + 5 (call_method) = 6
+;; ----------------------------------------------------------------------------
+
+;; Create constant 0 (meter index 0)
+(let blk8_drmt_op0
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I32)))
+        (I32)))
+
+;; Call meter execute method
+(let blk8_drmt_op1
+    (bf3drmt_call_method 
+        blk8_drmt_op0
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I32)))
+
+(let blk8_drmt_ops (vec-of blk8_drmt_op0 blk8_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 8 DPA - NOT SUPPORTED
+;; DPA does not have metering capability
+;; This block cannot be deployed to DPA
+;; ----------------------------------------------------------------------------
+
+;; No DPA implementation - metering not supported
+
+;; ----------------------------------------------------------------------------
+;; Block 8 ARM (LLVM) - Call meter_execute function with index 0
+;; Pattern: meter_execute(0)
+;; Cost: 1 (constant) + 5 (call) = 6
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk8_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk8_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 (meter index 0)
+(let blk8_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I32)))
+        (I32)))
+
+;; Call meter_execute function
+(let blk8_cpu_op3 
+    (llvm_call blk8_cpu_op2
+        (NamedAttr "CConv" (StringAttr "ccc"))
+        (NamedAttr "TailCallKind" (StringAttr "ccc"))
+        (NamedAttr "callee" (SymbolRefAttr "meter_execute"))
+        (I32)))
+
+;; Value 4 marker (meter result stored)
+(let blk8_cpu_op4 (Value 4 (None)))
+
+(let blk8_cpu_ops (vec-of blk8_cpu_op2 blk8_cpu_op3))
+
+;; ============================================================================
+;; Block 8 Deployment Declarations
+;; ============================================================================
+
+(implement blk8_drmt DRMT (blk7) blk8_drmt_ops)
+(implement blk8_cpu ARM (blk7) blk8_cpu_ops)
+
+;; Block 8 Equivalences
+(rewrite blk8_cpu blk8_drmt)
+
+;; ============================================================================
+;; Block 2: Metadata Write
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block8 (meter execution complete)
+;; Description: Writes constant 1 to metadata (Value 1 = metadata pointer)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 2 DRMT - Assign constant to metadata
+;; Pattern: metadata = 1
+;; Cost: 1 (constant) + 2 (assign) = 3
+;; ----------------------------------------------------------------------------
+
+;; Get metadata reference (Value 1)
+(let blk2_drmt_op0 (Value 1 (bf3drmt_ref (bf3drmt_bool))))
+
+;; Create constant 1
+(let blk2_drmt_op1
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 1 (I32)))
+        (I32)))
+
+;; Assign constant 1 to metadata
+(let blk2_drmt_op2
+    (bf3drmt_assign blk2_drmt_op0 blk2_drmt_op1))
+
+(let blk2_drmt_ops (vec-of blk2_drmt_op0 blk2_drmt_op1 blk2_drmt_op2))
+
+;; ----------------------------------------------------------------------------
+;; Block 2 DPA - Assign constant to metadata
+;; Pattern: metadata = 1
+;; Cost: 5 (constant) + 15 (assign) = 20
+;; Note: DPA assigns source to destination (operand order differs from DRMT)
+;; ----------------------------------------------------------------------------
+
+;; Create constant 1
+(let blk2_dpa_op0
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 1 (I32)))
+        (I32)))
+
+;; Get metadata reference (Value 1)
+(let blk2_dpa_op1 (Value 1 (bf3dpa_ref (bf3dpa_bool))))
+
+;; Assign constant 1 to metadata (source, destination)
+(let blk2_dpa_op2
+    (bf3dpa_assign blk2_dpa_op0 blk2_dpa_op1))
+
+(let blk2_dpa_ops (vec-of blk2_dpa_op0 blk2_dpa_op1 blk2_dpa_op2))
+
+;; ----------------------------------------------------------------------------
+;; Block 2 ARM (LLVM) - Store constant to metadata pointer
+;; Pattern: store 1, metadata
+;; Cost: 1 (constant) + 2 (store) = 3
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk2_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk2_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 1
+(let blk2_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 1 (I32)))
+        (I32)))
+
+;; Store constant 1 to metadata
+(let blk2_cpu_op3 
+    (llvm_store blk2_cpu_op2 blk2_cpu_op1))
+
+;; Value 4 marker (operation complete)
+(let blk2_cpu_op4 (Value 4 (None)))
+
+(let blk2_cpu_ops (vec-of blk2_cpu_op0 blk2_cpu_op1 blk2_cpu_op2 blk2_cpu_op3 blk2_cpu_op4))
+
+;; ============================================================================
+;; Block 2 Deployment Declarations
+;; ============================================================================
+
+(implement blk2_drmt DRMT (blk8) blk2_drmt_ops)
+(implement blk2_dpa DPA (blk8) blk2_dpa_ops)
+(implement blk2_cpu ARM (blk8) blk2_cpu_ops)
+
+;; Block 2 Equivalences
+(rewrite blk2_cpu blk2_drmt)
+(rewrite blk2_cpu blk2_dpa)
+
+;; ============================================================================
+;; Block 3: IPv4 Protocol Field Re-Read (Join Point)
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block2 AND block9 (convergence of two paths)
+;; Description: Reads ipv4.protocol field again at join point
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 3 DRMT - Read protocol field
+;; Pattern: read(ipv4.protocol)
+;; Cost: 1 (struct_extract_ref) + 1 (read) = 2
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk3_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the protocol field value
+(let blk3_drmt_op1
+    (bf3drmt_read blk3_drmt_op0 (I8)))
+
+(let blk3_drmt_ops (vec-of blk3_drmt_op0 blk3_drmt_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 3 DPA - Read protocol field
+;; Pattern: read(ipv4.protocol)
+;; Cost: 10 (struct_extract_ref) + 8 (read) = 18
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk3_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the protocol field value
+(let blk3_dpa_op1
+    (bf3dpa_read blk3_dpa_op0 (I8)))
+
+(let blk3_dpa_ops (vec-of blk3_dpa_op0 blk3_dpa_op1))
+
+;; ----------------------------------------------------------------------------
+;; Block 3 ARM (LLVM) - Load protocol field
+;; Pattern: load ipv4.protocol
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) = 6
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk3_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1) - not used but declared
+(let blk3_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk3_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to ipv4.protocol at [0, 1, 7]
+(let blk3_cpu_op3 
+    (llvm_getelementptr blk3_cpu_op0 blk3_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (llvm_ptr) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (llvm_ptr)))
+
+;; Load protocol field value
+(let blk3_cpu_op4 
+    (llvm_load blk3_cpu_op3 (I8)))
+
+;; Value 5 marker (protocol value stored)
+(let blk3_cpu_op5 (Value 5 (None)))
+
+(let blk3_cpu_ops (vec-of blk3_cpu_op0 blk3_cpu_op1 blk3_cpu_op2 blk3_cpu_op3 blk3_cpu_op4 blk3_cpu_op5))
+
+;; ============================================================================
+;; Block 3 Deployment Declarations
+;; ============================================================================
+
+(implement blk3_drmt DRMT (blk2 blk9) blk3_drmt_ops)
+(implement blk3_dpa DPA (blk2 blk9) blk3_dpa_ops)
+(implement blk3_cpu ARM (blk2 blk9) blk3_cpu_ops)
+
+;; Block 3 Equivalences
+(rewrite blk3_cpu blk3_drmt)
+(rewrite blk3_cpu blk3_dpa)
+
+;; ============================================================================
+;; Block 4: IPv4 Protocol Check (UDP) at Join Point
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block0 AND block3 (complex join point)
+;; Description: Checks if ipv4.protocol == 17 (UDP protocol)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 4 DRMT - Match key comparison for UDP
+;; Pattern: match_key(ipv4.protocol, 17, exact)
+;; Cost: 1 (struct_extract_ref) + 1 (read) + 1 (constant) + 2 (match_key) = 5
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk4_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the protocol field value
+(let blk4_drmt_op1
+    (bf3drmt_read blk4_drmt_op0 (I8)))
+
+;; Create constant 17 (UDP protocol number)
+(let blk4_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 17 (I8)))
+        (I8)))
+
+;; Match key: exact match for UDP protocol
+(let blk4_drmt_op3
+    (bf3drmt_match_key 
+        blk4_drmt_op1
+        blk4_drmt_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk4_drmt_ops (vec-of blk4_drmt_op0 blk4_drmt_op1 blk4_drmt_op2 blk4_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 4 DPA - Comparison operation for UDP
+;; Pattern: cmp(ipv4.protocol, 17, eq)
+;; Cost: 10 (struct_extract_ref) + 8 (read) + 5 (constant) + 12 (cmp) = 35
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk4_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the protocol field value
+(let blk4_dpa_op1
+    (bf3dpa_read blk4_dpa_op0 (I8)))
+
+;; Create constant 17 (UDP protocol number)
+(let blk4_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 17 (I8)))
+        (I8)))
+
+;; Compare: protocol == 17
+(let blk4_dpa_op3
+    (bf3dpa_cmp 
+        blk4_dpa_op1
+        blk4_dpa_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk4_dpa_ops (vec-of blk4_dpa_op0 blk4_dpa_op1 blk4_dpa_op2 blk4_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 4 ARM (LLVM) - Load and compare protocol field for UDP
+;; Pattern: load ipv4.protocol; icmp eq, 17
+;; Cost: 1 (constant 0) + 1 (constant 17) + 2 (gep) + 3 (load) + 2 (icmp) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk4_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk4_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk4_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to ipv4.protocol at [0, 1, 7]
+(let blk4_cpu_op3 
+    (llvm_getelementptr blk4_cpu_op0 blk4_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (llvm_ptr) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (llvm_ptr)))
+
+;; Load protocol field value
+(let blk4_cpu_op4 
+    (llvm_load blk4_cpu_op3 (I8)))
+
+;; Create constant 17 (UDP protocol number)
+(let blk4_cpu_op5 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 17 (I8)))
+        (I8)))
+
+;; Compare: protocol == 17
+(let blk4_cpu_op6 
+    (llvm_icmp blk4_cpu_op4 blk4_cpu_op5
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+;; Value 7 marker (comparison result stored)
+(let blk4_cpu_op7 (Value 7 (None)))
+
+(let blk4_cpu_ops (vec-of blk4_cpu_op1 blk4_cpu_op2 blk4_cpu_op3 blk4_cpu_op4 blk4_cpu_op5 blk4_cpu_op6 blk4_cpu_op7))
+
+;; ============================================================================
+;; Block 4 Deployment Declarations
+;; ============================================================================
+
+(implement blk4_drmt DRMT (blk0 blk3) blk4_drmt_ops)
+(implement blk4_dpa DPA (blk0 blk3) blk4_dpa_ops)
+(implement blk4_cpu ARM (blk0 blk3) blk4_cpu_ops)
+
+;; Block 4 Equivalences
+(rewrite blk4_cpu blk4_drmt)
+(rewrite blk4_cpu blk4_dpa)
+
+;; ============================================================================
+;; Block 5: Regex Execution on UDP Payload
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block4 (UDP protocol verified)
+;; Description: Executes regex pattern matching on packet payload
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 5 DRMT - Regex call_method
+;; Pattern: regex_exec(payload_ptr, 128)
+;; Cost: 1 (extract_ref) + 1 (read) + 1 (constant) + 5 (call_method) = 8
+;; ----------------------------------------------------------------------------
+
+;; Get reference to payload pointer at [4]
+(let blk5_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of -2147483648 4) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the payload pointer (llvm_ptr field at index 4)
+(let blk5_drmt_op1
+    (bf3drmt_read blk5_drmt_op0 (bf3drmt_ref (bf3drmt_bool))))
+
+;; Create constant 128 (regex pattern size or max match length)
+(let blk5_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 128 (I32)))
+        (I32)))
+
+;; Call regex_exec method
+(let blk5_drmt_op3
+    (bf3drmt_call_method 
+        blk5_drmt_op1
+        blk5_drmt_op2
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I1)))
+
+(let blk5_drmt_ops (vec-of blk5_drmt_op0 blk5_drmt_op1 blk5_drmt_op2 blk5_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 5 DPA - Regex call_method
+;; Pattern: regex_exec(payload_ptr, 128)
+;; Cost: 10 (extract_ref) + 8 (read) + 5 (constant) + 50 (call_method extern) = 73
+;; ----------------------------------------------------------------------------
+
+;; Get reference to payload pointer at [4]
+(let blk5_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of -2147483648 4) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the payload pointer
+(let blk5_dpa_op1
+    (bf3dpa_read blk5_dpa_op0 (bf3dpa_ref (bf3dpa_bool))))
+
+;; Create constant 128
+(let blk5_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 128 (I32)))
+        (I32)))
+
+;; Call regex_exec method
+(let blk5_dpa_op3
+    (bf3dpa_call_method 
+        blk5_dpa_op1
+        blk5_dpa_op2
+        (NamedAttr "CConv" (OpaqueAttr "#llvm.cconv<ccc>" "llvm.cconv"))
+        (I1)))
+
+(let blk5_dpa_ops (vec-of blk5_dpa_op0 blk5_dpa_op1 blk5_dpa_op2 blk5_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 5 ARM (LLVM) - Call regex_exec function
+;; Pattern: regex_exec(payload_ptr, 128)
+;; Cost: 1 (constant 0) + 1 (constant 128) + 2 (gep) + 3 (load) + 5 (call) = 12
+;; ----------------------------------------------------------------------------
+
+;; Packet pointer (Value 0)
+(let blk5_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Metadata pointer (Value 1)
+(let blk5_cpu_op1 (Value 1 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk5_cpu_op2 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; Create constant 128 (pattern size/max match length)
+(let blk5_cpu_op3 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 128 (I32)))
+        (I32)))
+
+;; GEP to payload pointer at [0, 4] (after ethernet, ipv4, tcp, udp)
+(let blk5_cpu_op4 
+    (llvm_getelementptr blk5_cpu_op0 blk5_cpu_op2
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.udp" (I16) (I16) (I16) (I16) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))
+            (llvm_ptr) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of -2147483648 4) (I32)))
+        (llvm_ptr)))
+
+;; Load payload pointer
+(let blk5_cpu_op5 
+    (llvm_load blk5_cpu_op4 (llvm_ptr)))
+
+;; Call regex_exec(payload_ptr, 128) - returns bool (match/no match)
+(let blk5_cpu_op6 
+    (llvm_call_1 blk5_cpu_op5 blk5_cpu_op3
+        (NamedAttr "CConv" (StringAttr "#llvm.cconv<ccc>"))
+        (NamedAttr "TailCallKind" (StringAttr "#llvm.tailcallkind<none>"))
+        (NamedAttr "callee" (SymbolRefAttr "regex_exec"))
+        (I1)))
+
+;; Value 7 marker (regex result stored)
+(let blk5_cpu_op7 (Value 7 (None)))
+
+(let blk5_cpu_ops (vec-of blk5_cpu_op1 blk5_cpu_op2 blk5_cpu_op3 blk5_cpu_op4 blk5_cpu_op5 blk5_cpu_op6 blk5_cpu_op7))
+
+;; ============================================================================
+;; Block 5 Deployment Declarations
+;; ============================================================================
+
+(implement blk5_drmt DRMT (blk4) blk5_drmt_ops)
+(implement blk5_dpa DPA (blk4) blk5_dpa_ops)
+(implement blk5_cpu ARM (blk4) blk5_cpu_ops)
+
+;; Block 5 Equivalences
+(rewrite blk5_cpu blk5_drmt)
+(rewrite blk5_cpu blk5_dpa)

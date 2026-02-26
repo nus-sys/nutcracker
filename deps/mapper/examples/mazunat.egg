@@ -1,0 +1,881 @@
+;; ============================================================================
+;; Hardware Configuration
+;; ============================================================================
+
+(hardware DRMT :cores 1 :sigma 0.0)
+(hardware DPA :cores 8 :sigma 0.5)
+(hardware ARM :cores 16 :sigma 1.0)
+
+;; ============================================================================
+;; Communication Links (BlueField-3 Topology)
+;; ============================================================================
+
+(link DRMT ARM 1.0 1.0)
+
+
+;; ============================================================================
+;; Operation Definitions (with costs and types)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; BF3 DRMT Dialect Operations (Hardware Dataplane - SRAM/TCAM)
+;; ----------------------------------------------------------------------------
+
+(function bf3drmt_variable (Type) Type :cost 1 :type stateless)
+(function bf3drmt_read (Type) Type :cost 1 :type stateless)
+(function bf3drmt_assign (Type) Type :cost 1 :type stateful :sigma 0.1)
+(function bf3drmt_struct_extract_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_constant (Type) Type :cost 1 :type stateless)
+(function bf3drmt_cast (Type) Type :cost 1 :type stateless)
+(function bf3drmt_match_key (Type Type Type Type) Type :cost 2 :type stateless)
+(function bf3drmt_bool () Type :cost 1 :type stateless)
+(function bf3drmt_valid_bit () Type :cost 1 :type stateless)
+(function bf3drmt_bits (i64) Type :cost 1 :type stateless)
+(function bf3drmt_ref (Type) Type :cost 1 :type stateless)
+(function bf3drmt_struct (AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3drmt_header (AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3drmt_validity_bit (String Type) Attr :cost 1 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; BF3 DPA Dialect Operations (NPU - Programmable Dataplane)
+;; ----------------------------------------------------------------------------
+
+(function bf3dpa_variable (Type) Type :cost 8 :type stateless)
+(function bf3dpa_read (Type) Type :cost 8 :type stateless)
+(function bf3dpa_assign (Type) Type :cost 15 :type stateful :sigma 1.0)
+(function bf3dpa_struct_extract_ref (Type) Type :cost 10 :type stateless)
+(function bf3dpa_constant (Type) Type :cost 5 :type stateless)
+(function bf3dpa_cast (Type) Type :cost 6 :type stateless)
+(function bf3dpa_cmp (Type Type Type Type) Type :cost 12 :type stateless)
+(function bf3dpa_if (Type Type) Type :cost 20 :type stateless)
+(function bf3dpa_yield () Type :cost 2 :type stateless)
+(function bf3dpa_bool () Type :cost 1 :type stateless)
+(function bf3dpa_valid_bit () Type :cost 1 :type stateless)
+(function bf3dpa_bits (i64) Type :cost 1 :type stateless)
+(function bf3dpa_ref (Type) Type :cost 1 :type stateless)
+(function bf3dpa_struct (AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3dpa_header (AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair AttrPair) Type :cost 1 :type stateless)
+(function bf3dpa_validity_bit (String Type) Attr :cost 1 :type stateless)
+
+;; ----------------------------------------------------------------------------
+;; LLVM Dialect Operations (CPU/ARM)
+;; ----------------------------------------------------------------------------
+
+(function llvm_ptr () Type :cost 2 :type stateless)
+(function llvm_mlir_constant (AttrPair Type) Op :cost 1 :type stateless)
+(function llvm_load (Op Type) Op :cost 3 :type stateless)
+(function llvm_getelementptr (Op AttrPair AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_icmp (Op Op AttrPair Type) Op :cost 2 :type stateless)
+(function llvm_cond_br (Op AttrPair AttrPair) Op :cost 5 :type stateless)
+
+;; ============================================================================
+;; Block 0: Packet Field Comparison
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: None (first block)
+;; Description: Compares packet field at offset [1][10] with constant 16885952
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 0 DRMT - Match key comparison
+;; Pattern: match_key(packet.field, 16885952, exact)
+;; Cost: 1 (struct_extract_ref) + 1 (read) + 1 (constant) + 2 (match_key) = 5
+;; ----------------------------------------------------------------------------
+
+;; Get reference to packet field at [1][10]
+(let blk0_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 10) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the field value
+(let blk0_drmt_op1
+    (bf3drmt_read blk0_drmt_op0 (I32)))
+
+;; Create constant 16885952 (0x01020000 in hex)
+(let blk0_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 16885952 (I32)))
+        (I32)))
+
+;; Match key: exact match comparison
+(let blk0_drmt_op3
+    (bf3drmt_match_key 
+        blk0_drmt_op1
+        blk0_drmt_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk0_drmt_ops (vec-of blk0_drmt_op0 blk0_drmt_op1 blk0_drmt_op2 blk0_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 0 DPA - Comparison operation
+;; Pattern: cmp(packet.field, 16885952, eq)
+;; Cost: 10 (struct_extract_ref) + 8 (read) + 5 (constant) + 12 (cmp) = 35
+;; ----------------------------------------------------------------------------
+
+;; Get reference to packet field at [1][10]
+(let blk0_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 10) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the field value
+(let blk0_dpa_op1
+    (bf3dpa_read blk0_dpa_op0 (I32)))
+
+;; Create constant 16885952 (0x01020000 in hex)
+(let blk0_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 16885952 (I32)))
+        (I32)))
+
+;; Compare: field == 16885952 (predicate 0 = eq)
+(let blk0_dpa_op3
+    (bf3dpa_cmp 
+        blk0_dpa_op1
+        blk0_dpa_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk0_dpa_ops (vec-of blk0_dpa_op0 blk0_dpa_op1 blk0_dpa_op2 blk0_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 0 ARM (LLVM) - Load and compare
+;; Pattern: load packet.field; icmp eq, 16885952
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) + 1 (constant) + 2 (icmp) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk0_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk0_cpu_op1 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to packet field at [0, 1, 10]
+(let blk0_cpu_op2 
+    (llvm_getelementptr blk0_cpu_op0 blk0_cpu_op1
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 10) (I32)))
+        (llvm_ptr)))
+
+;; Load field value
+(let blk0_cpu_op3 
+    (llvm_load blk0_cpu_op2 (I32)))
+
+;; Create constant 16885952 for comparison
+(let blk0_cpu_op4 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 16885952 (I32)))
+        (I32)))
+
+;; Compare: field == 16885952 (predicate 0 = eq)
+(let blk0_cpu_op5 
+    (llvm_icmp blk0_cpu_op3 blk0_cpu_op4
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk0_cpu_ops (vec-of blk0_cpu_op0 blk0_cpu_op1 blk0_cpu_op2 blk0_cpu_op3 blk0_cpu_op4 blk0_cpu_op5))
+
+;; ============================================================================
+;; Block 0 Deployment Declarations
+;; ============================================================================
+
+(implement blk0_drmt DRMT () blk0_drmt_ops)
+(implement blk0_dpa DPA () blk0_dpa_ops)
+(implement blk0_cpu ARM () blk0_cpu_ops)
+
+;; Block 0 Equivalences
+(rewrite blk0_cpu blk0_drmt)
+(rewrite blk0_cpu blk0_dpa)
+
+
+;; ============================================================================
+;; Block 1: IPv4 Protocol Check (TCP)
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block0 (IP address check passed)
+;; Description: Checks if ipv4.protocol == 6 (TCP protocol)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 1 DRMT - Match key comparison
+;; Pattern: match_key(ipv4.protocol, 6, exact)
+;; Cost: 1 (struct_extract_ref) + 1 (read) + 1 (constant) + 2 (match_key) = 5
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk1_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the protocol field value
+(let blk1_drmt_op1
+    (bf3drmt_read blk1_drmt_op0 (I8)))
+
+;; Create constant 6 (TCP protocol number)
+(let blk1_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 6 (I8)))
+        (I8)))
+
+;; Match key: exact match for TCP protocol
+(let blk1_drmt_op3
+    (bf3drmt_match_key 
+        blk1_drmt_op1
+        blk1_drmt_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk1_drmt_ops (vec-of blk1_drmt_op0 blk1_drmt_op1 blk1_drmt_op2 blk1_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 1 DPA - Comparison operation
+;; Pattern: cmp(ipv4.protocol, 6, eq)
+;; Cost: 10 (struct_extract_ref) + 8 (read) + 5 (constant) + 12 (cmp) = 35
+;; ----------------------------------------------------------------------------
+
+;; Get reference to ipv4.protocol field at [1][7]
+(let blk1_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the protocol field value
+(let blk1_dpa_op1
+    (bf3dpa_read blk1_dpa_op0 (I8)))
+
+;; Create constant 6 (TCP protocol number)
+(let blk1_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 6 (I8)))
+        (I8)))
+
+;; Compare: protocol == 6
+(let blk1_dpa_op3
+    (bf3dpa_cmp 
+        blk1_dpa_op1
+        blk1_dpa_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk1_dpa_ops (vec-of blk1_dpa_op0 blk1_dpa_op1 blk1_dpa_op2 blk1_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 1 ARM (LLVM) - Load and compare protocol field
+;; Pattern: load ipv4.protocol; icmp eq, 6
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) + 1 (constant) + 2 (icmp) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk1_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk1_cpu_op1 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to ipv4.protocol at [0, 1, 7]
+(let blk1_cpu_op2 
+    (llvm_getelementptr blk1_cpu_op0 blk1_cpu_op1
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 7) (I32)))
+        (llvm_ptr)))
+
+;; Load protocol field value
+(let blk1_cpu_op3 
+    (llvm_load blk1_cpu_op2 (I8)))
+
+;; Create constant 6 (TCP protocol number)
+(let blk1_cpu_op4 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 6 (I8)))
+        (I8)))
+
+;; Compare: protocol == 6
+(let blk1_cpu_op5 
+    (llvm_icmp blk1_cpu_op3 blk1_cpu_op4
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk1_cpu_ops (vec-of blk1_cpu_op0 blk1_cpu_op1 blk1_cpu_op2 blk1_cpu_op3 blk1_cpu_op4 blk1_cpu_op5))
+
+;; ============================================================================
+;; Block 1 Deployment Declarations
+;; ============================================================================
+
+(implement blk1_drmt DRMT (blk0) blk1_drmt_ops)
+(implement blk1_dpa DPA (blk0) blk1_dpa_ops)
+(implement blk1_cpu ARM (blk0) blk1_cpu_ops)
+
+;; Block 1 Equivalences
+(rewrite blk1_cpu blk1_drmt)
+(rewrite blk1_cpu blk1_dpa)
+
+;; ============================================================================
+;; Block 2: TCP Destination Port Check
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block1 (TCP protocol verified)
+;; Description: Checks if tcp.dstPort == -17663 (0xBB01 = port 47873 in big-endian)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 2 DRMT - Match key comparison
+;; Pattern: match_key(tcp.dstPort, -17663, exact)
+;; Cost: 1 (struct_extract_ref) + 1 (read) + 1 (constant) + 2 (match_key) = 5
+;; ----------------------------------------------------------------------------
+
+;; Get reference to tcp.dstPort field at [2][1]
+(let blk2_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the destination port field value
+(let blk2_drmt_op1
+    (bf3drmt_read blk2_drmt_op0 (I16)))
+
+;; Create constant -17663 (0xBB01, port 47873 big-endian)
+(let blk2_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr -17663 (I16)))
+        (I16)))
+
+;; Match key: exact match for destination port
+(let blk2_drmt_op3
+    (bf3drmt_match_key 
+        blk2_drmt_op1
+        blk2_drmt_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk2_drmt_ops (vec-of blk2_drmt_op0 blk2_drmt_op1 blk2_drmt_op2 blk2_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 2 DPA - Comparison operation
+;; Pattern: cmp(tcp.dstPort, -17663, eq)
+;; Cost: 10 (struct_extract_ref) + 8 (read) + 5 (constant) + 12 (cmp) = 35
+;; ----------------------------------------------------------------------------
+
+;; Get reference to tcp.dstPort field at [2][1]
+(let blk2_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the destination port field value
+(let blk2_dpa_op1
+    (bf3dpa_read blk2_dpa_op0 (I16)))
+
+;; Create constant -17663 (0xBB01, port 47873 big-endian)
+(let blk2_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr -17663 (I16)))
+        (I16)))
+
+;; Compare: dstPort == -17663
+(let blk2_dpa_op3
+    (bf3dpa_cmp 
+        blk2_dpa_op1
+        blk2_dpa_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk2_dpa_ops (vec-of blk2_dpa_op0 blk2_dpa_op1 blk2_dpa_op2 blk2_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 2 ARM (LLVM) - Load and compare destination port
+;; Pattern: load tcp.dstPort; icmp eq, -17663
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) + 1 (constant) + 2 (icmp) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk2_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk2_cpu_op1 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to tcp.dstPort at [0, 2, 1]
+(let blk2_cpu_op2 
+    (llvm_getelementptr blk2_cpu_op0 blk2_cpu_op1
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (llvm_ptr)))
+
+;; Load destination port field value
+(let blk2_cpu_op3 
+    (llvm_load blk2_cpu_op2 (I16)))
+
+;; Create constant -17663 (0xBB01, port 47873 big-endian)
+(let blk2_cpu_op4 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr -17663 (I16)))
+        (I16)))
+
+;; Compare: dstPort == -17663
+(let blk2_cpu_op5 
+    (llvm_icmp blk2_cpu_op3 blk2_cpu_op4
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk2_cpu_ops (vec-of blk2_cpu_op0 blk2_cpu_op1 blk2_cpu_op2 blk2_cpu_op3 blk2_cpu_op4 blk2_cpu_op5))
+
+;; ============================================================================
+;; Block 2 Deployment Declarations
+;; ============================================================================
+
+(implement blk2_drmt DRMT (blk1) blk2_drmt_ops)
+(implement blk2_dpa DPA (blk1) blk2_dpa_ops)
+(implement blk2_cpu ARM (blk1) blk2_cpu_ops)
+
+;; Block 2 Equivalences
+(rewrite blk2_cpu blk2_drmt)
+(rewrite blk2_cpu blk2_dpa)
+
+;; ============================================================================
+;; Block 3: TCP Destination Port Check (Alternative)
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block2 (previous port check)
+;; Description: Checks if tcp.dstPort == 20480 (0x5000 = port 80 in big-endian = HTTP)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 3 DRMT - Match key comparison
+;; Pattern: match_key(tcp.dstPort, 20480, exact)
+;; Cost: 1 (struct_extract_ref) + 1 (read) + 1 (constant) + 2 (match_key) = 5
+;; ----------------------------------------------------------------------------
+
+;; Get reference to tcp.dstPort field at [2][1]
+(let blk3_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Read the destination port field value
+(let blk3_drmt_op1
+    (bf3drmt_read blk3_drmt_op0 (I16)))
+
+;; Create constant 20480 (0x5000, port 80 big-endian = HTTP)
+(let blk3_drmt_op2
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 20480 (I16)))
+        (I16)))
+
+;; Match key: exact match for destination port
+(let blk3_drmt_op3
+    (bf3drmt_match_key 
+        blk3_drmt_op1
+        blk3_drmt_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk3_drmt_ops (vec-of blk3_drmt_op0 blk3_drmt_op1 blk3_drmt_op2 blk3_drmt_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 3 DPA - Comparison operation
+;; Pattern: cmp(tcp.dstPort, 20480, eq)
+;; Cost: 10 (struct_extract_ref) + 8 (read) + 5 (constant) + 12 (cmp) = 35
+;; ----------------------------------------------------------------------------
+
+;; Get reference to tcp.dstPort field at [2][1]
+(let blk3_dpa_op0
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Read the destination port field value
+(let blk3_dpa_op1
+    (bf3dpa_read blk3_dpa_op0 (I16)))
+
+;; Create constant 20480 (0x5000, port 80 big-endian = HTTP)
+(let blk3_dpa_op2
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 20480 (I16)))
+        (I16)))
+
+;; Compare: dstPort == 20480
+(let blk3_dpa_op3
+    (bf3dpa_cmp 
+        blk3_dpa_op1
+        blk3_dpa_op2
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk3_dpa_ops (vec-of blk3_dpa_op0 blk3_dpa_op1 blk3_dpa_op2 blk3_dpa_op3))
+
+;; ----------------------------------------------------------------------------
+;; Block 3 ARM (LLVM) - Load and compare destination port
+;; Pattern: load tcp.dstPort; icmp eq, 20480
+;; Cost: 1 (constant 0) + 2 (gep) + 3 (load) + 1 (constant) + 2 (icmp) = 9
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk3_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk3_cpu_op1 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to tcp.dstPort at [0, 2, 1]
+(let blk3_cpu_op2 
+    (llvm_getelementptr blk3_cpu_op0 blk3_cpu_op1
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 2 1) (I32)))
+        (llvm_ptr)))
+
+;; Load destination port field value
+(let blk3_cpu_op3 
+    (llvm_load blk3_cpu_op2 (I16)))
+
+;; Create constant 20480 (0x5000, port 80 big-endian = HTTP)
+(let blk3_cpu_op4 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 20480 (I16)))
+        (I16)))
+
+;; Compare: dstPort == 20480
+(let blk3_cpu_op5 
+    (llvm_icmp blk3_cpu_op3 blk3_cpu_op4
+        (NamedAttr "predicate" (IntegerAttr 0 (I64)))
+        (I1)))
+
+(let blk3_cpu_ops (vec-of blk3_cpu_op0 blk3_cpu_op1 blk3_cpu_op2 blk3_cpu_op3 blk3_cpu_op4 blk3_cpu_op5))
+
+;; ============================================================================
+;; Block 3 Deployment Declarations
+;; ============================================================================
+
+(implement blk3_drmt DRMT (blk2) blk3_drmt_ops)
+(implement blk3_dpa DPA (blk2) blk3_dpa_ops)
+(implement blk3_cpu ARM (blk2) blk3_cpu_ops)
+
+;; Block 3 Equivalences
+(rewrite blk3_cpu blk3_drmt)
+(rewrite blk3_cpu blk3_dpa)
+
+;; ============================================================================
+;; Block 4: Packet Field Modification (Join Point)
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block2 AND block3 (both port checks complete)
+;; Description: Sets packet field [1][10] to 167772170 (0x0A000000 = IP 10.0.0.10)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 4 DRMT - Assign constant to field
+;; Pattern: packet.field[1][10] = 167772170
+;; Cost: 1 (struct_extract_ref) + 1 (constant) + 2 (assign) = 4
+;; ----------------------------------------------------------------------------
+
+;; Get reference to packet field at [1][10]
+(let blk4_drmt_op0
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 10) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+;; Create constant 167772170 (0x0A000000 = IP address 10.0.0.10 in some byte order)
+(let blk4_drmt_op1
+    (bf3drmt_constant 
+        (NamedAttr "value" (IntegerAttr 167772170 (I32)))
+        (I32)))
+
+;; Assign constant to field
+(let blk4_drmt_op2
+    (bf3drmt_assign blk4_drmt_op0 blk4_drmt_op1))
+
+(let blk4_drmt_ops (vec-of blk4_drmt_op0 blk4_drmt_op1 blk4_drmt_op2))
+
+;; ----------------------------------------------------------------------------
+;; Block 4 DPA - Assign constant to field
+;; Pattern: packet.field[1][10] = 167772170
+;; Cost: 10 (struct_extract_ref) + 5 (constant) + 15 (assign) = 30
+;; ----------------------------------------------------------------------------
+
+;; Create constant 167772170 (0x0A000000 = IP address 10.0.0.10)
+(let blk4_dpa_op0
+    (bf3dpa_constant 
+        (NamedAttr "value" (IntegerAttr 167772170 (I32)))
+        (I32)))
+
+;; Get reference to packet field at [1][10]
+(let blk4_dpa_op1
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 10) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+
+;; Assign constant to field
+(let blk4_dpa_op2
+    (bf3dpa_assign blk4_dpa_op0 blk4_dpa_op1))
+
+(let blk4_dpa_ops (vec-of blk4_dpa_op0 blk4_dpa_op1 blk4_dpa_op2))
+
+;; ----------------------------------------------------------------------------
+;; Block 4 ARM (LLVM) - Store constant to field
+;; Pattern: store 167772170, &packet.field[1][10]
+;; Cost: 1 (constant 0) + 2 (gep) + 1 (constant value) + 2 (store) = 6
+;; ----------------------------------------------------------------------------
+
+;; Get packet pointer (Value 0)
+(let blk4_cpu_op0 (Value 0 (llvm_ptr)))
+
+;; Create constant 0 for GEP base
+(let blk4_cpu_op1 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 0 (I64)))
+        (I64)))
+
+;; GEP to packet field at [0, 1, 10]
+(let blk4_cpu_op2 
+    (llvm_getelementptr blk4_cpu_op0 blk4_cpu_op1
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.packet" 
+            (llvm_struct "struct.ethernet" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))
+            (llvm_struct "struct.ipv4" (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16) (I32) (I32) (I32) (I32))
+            (llvm_struct "struct.tcp" (I16) (I16) (I32) (I32) (I8) (I8) (I16) (I16) (I16) (I32) (I32) (I32) (I32))
+            (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32) (I32))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 3 (vec-of -2147483648 1 10) (I32)))
+        (llvm_ptr)))
+
+;; Create constant 167772170 (0x0A000000 = IP address 10.0.0.10)
+(let blk4_cpu_op3 
+    (llvm_mlir_constant 
+        (NamedAttr "value" (IntegerAttr 167772170 (I32)))
+        (I32)))
+
+;; Store constant to field
+(let blk4_cpu_op4 
+    (llvm_store blk4_cpu_op3 blk4_cpu_op2))
+
+(let blk4_cpu_ops (vec-of blk4_cpu_op0 blk4_cpu_op1 blk4_cpu_op2 blk4_cpu_op3 blk4_cpu_op4))
+
+;; ============================================================================
+;; Block 4 Deployment Declarations
+;; ============================================================================
+
+(implement blk4_drmt DRMT (blk2 blk3) blk4_drmt_ops)
+(implement blk4_dpa DPA (blk2 blk3) blk4_dpa_ops)
+(implement blk4_cpu ARM (blk2 blk3) blk4_cpu_ops)
+
+;; Block 4 Equivalences
+(rewrite blk4_cpu blk4_drmt)
+(rewrite blk4_cpu blk4_dpa)
+
+;; ============================================================================
+;; Block 5: Ethernet Header Rewrite
+;; Valid on: DRMT, DPA, ARM
+;; Dependencies: block0, block1, block3, block4 (complex join point)
+;; Description: Rewrites MAC addresses and sets EtherType to 0x0008 (IPv4)
+;; ============================================================================
+
+;; ----------------------------------------------------------------------------
+;; Block 5 DRMT - Multiple field assignments
+;; Pattern: Set MAC addresses and EtherType
+;; Cost: 12×(1 constant + 2 assign) + 1 constant + 1 extract_ref + 2 assign = 40
+;; ----------------------------------------------------------------------------
+
+;; Destination MAC bytes (Values 8-13): 3C:FD:FE:9E:5D:01
+(let blk5_drmt_op0 (bf3drmt_constant (NamedAttr "value" (IntegerAttr 60 (I8))) (I8)))
+(let blk5_drmt_op1 (bf3drmt_constant (NamedAttr "value" (IntegerAttr -3 (I8))) (I8)))
+(let blk5_drmt_op2 (bf3drmt_constant (NamedAttr "value" (IntegerAttr -2 (I8))) (I8)))
+(let blk5_drmt_op3 (bf3drmt_constant (NamedAttr "value" (IntegerAttr -98 (I8))) (I8)))
+(let blk5_drmt_op4 (bf3drmt_constant (NamedAttr "value" (IntegerAttr 93 (I8))) (I8)))
+(let blk5_drmt_op5 (bf3drmt_constant (NamedAttr "value" (IntegerAttr 1 (I8))) (I8)))
+
+;; Assign destination MAC bytes
+(let blk5_drmt_op6 (bf3drmt_assign (Value 8 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op0))
+(let blk5_drmt_op7 (bf3drmt_assign (Value 9 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op1))
+(let blk5_drmt_op8 (bf3drmt_assign (Value 10 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op2))
+(let blk5_drmt_op9 (bf3drmt_assign (Value 11 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op3))
+(let blk5_drmt_op10 (bf3drmt_assign (Value 12 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op4))
+(let blk5_drmt_op11 (bf3drmt_assign (Value 13 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op5))
+
+;; Source MAC bytes (Values 22-27): 3C:FD:FE:9E:7D:21
+(let blk5_drmt_op12 (bf3drmt_constant (NamedAttr "value" (IntegerAttr 125 (I8))) (I8)))
+(let blk5_drmt_op13 (bf3drmt_constant (NamedAttr "value" (IntegerAttr 33 (I8))) (I8)))
+
+;; Assign source MAC bytes
+(let blk5_drmt_op14 (bf3drmt_assign (Value 22 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op0))
+(let blk5_drmt_op15 (bf3drmt_assign (Value 23 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op1))
+(let blk5_drmt_op16 (bf3drmt_assign (Value 24 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op2))
+(let blk5_drmt_op17 (bf3drmt_assign (Value 25 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op3))
+(let blk5_drmt_op18 (bf3drmt_assign (Value 26 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op12))
+(let blk5_drmt_op19 (bf3drmt_assign (Value 27 (bf3drmt_ref (bf3drmt_bool))) blk5_drmt_op13))
+
+;; EtherType field
+(let blk5_drmt_op20
+    (bf3drmt_struct_extract_ref 
+        (Value 0 (bf3drmt_ref (bf3drmt_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of -2147483648 12) (I32)))
+        (bf3drmt_ref (bf3drmt_bool))))
+
+(let blk5_drmt_op21 (bf3drmt_constant (NamedAttr "value" (IntegerAttr 8 (I16))) (I16)))
+(let blk5_drmt_op22 (bf3drmt_assign blk5_drmt_op20 blk5_drmt_op21))
+
+(let blk5_drmt_ops (vec-of blk5_drmt_op0 blk5_drmt_op1 blk5_drmt_op2 blk5_drmt_op3 blk5_drmt_op4 blk5_drmt_op5 
+                            blk5_drmt_op6 blk5_drmt_op7 blk5_drmt_op8 blk5_drmt_op9 blk5_drmt_op10 blk5_drmt_op11
+                            blk5_drmt_op12 blk5_drmt_op13 blk5_drmt_op14 blk5_drmt_op15 blk5_drmt_op16 blk5_drmt_op17
+                            blk5_drmt_op18 blk5_drmt_op19 blk5_drmt_op20 blk5_drmt_op21 blk5_drmt_op22))
+
+;; ----------------------------------------------------------------------------
+;; Block 5 DPA - Multiple field assignments
+;; Cost: 12×(5 constant + 15 assign) + 5 + 10 + 15 = 270
+;; ----------------------------------------------------------------------------
+
+;; Destination MAC constants
+(let blk5_dpa_op0 (bf3dpa_constant (NamedAttr "value" (IntegerAttr 60 (I8))) (I8)))
+(let blk5_dpa_op1 (bf3dpa_constant (NamedAttr "value" (IntegerAttr -3 (I8))) (I8)))
+(let blk5_dpa_op2 (bf3dpa_constant (NamedAttr "value" (IntegerAttr -2 (I8))) (I8)))
+(let blk5_dpa_op3 (bf3dpa_constant (NamedAttr "value" (IntegerAttr -98 (I8))) (I8)))
+(let blk5_dpa_op4 (bf3dpa_constant (NamedAttr "value" (IntegerAttr 93 (I8))) (I8)))
+(let blk5_dpa_op5 (bf3dpa_constant (NamedAttr "value" (IntegerAttr 1 (I8))) (I8)))
+
+;; Assign destination MAC
+(let blk5_dpa_op6 (bf3dpa_assign blk5_dpa_op0 (Value 8 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op7 (bf3dpa_assign blk5_dpa_op1 (Value 9 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op8 (bf3dpa_assign blk5_dpa_op2 (Value 10 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op9 (bf3dpa_assign blk5_dpa_op3 (Value 11 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op10 (bf3dpa_assign blk5_dpa_op4 (Value 12 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op11 (bf3dpa_assign blk5_dpa_op5 (Value 13 (bf3dpa_ref (bf3dpa_bool)))))
+
+;; Source MAC constants
+(let blk5_dpa_op12 (bf3dpa_constant (NamedAttr "value" (IntegerAttr 125 (I8))) (I8)))
+(let blk5_dpa_op13 (bf3dpa_constant (NamedAttr "value" (IntegerAttr 33 (I8))) (I8)))
+
+;; Assign source MAC
+(let blk5_dpa_op14 (bf3dpa_assign blk5_dpa_op0 (Value 22 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op15 (bf3dpa_assign blk5_dpa_op1 (Value 23 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op16 (bf3dpa_assign blk5_dpa_op2 (Value 24 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op17 (bf3dpa_assign blk5_dpa_op3 (Value 25 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op18 (bf3dpa_assign blk5_dpa_op12 (Value 26 (bf3dpa_ref (bf3dpa_bool)))))
+(let blk5_dpa_op19 (bf3dpa_assign blk5_dpa_op13 (Value 27 (bf3dpa_ref (bf3dpa_bool)))))
+
+;; EtherType
+(let blk5_dpa_op20 (bf3dpa_constant (NamedAttr "value" (IntegerAttr 8 (I16))) (I16)))
+(let blk5_dpa_op21
+    (bf3dpa_struct_extract_ref 
+        (Value 0 (bf3dpa_ref (bf3dpa_bool)))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of -2147483648 12) (I32)))
+        (bf3dpa_ref (bf3dpa_bool))))
+(let blk5_dpa_op22 (bf3dpa_assign blk5_dpa_op20 blk5_dpa_op21))
+
+(let blk5_dpa_ops (vec-of blk5_dpa_op0 blk5_dpa_op1 blk5_dpa_op2 blk5_dpa_op3 blk5_dpa_op4 blk5_dpa_op5 
+                          blk5_dpa_op6 blk5_dpa_op7 blk5_dpa_op8 blk5_dpa_op9 blk5_dpa_op10 blk5_dpa_op11
+                          blk5_dpa_op12 blk5_dpa_op13 blk5_dpa_op14 blk5_dpa_op15 blk5_dpa_op16 blk5_dpa_op17
+                          blk5_dpa_op18 blk5_dpa_op19 blk5_dpa_op20 blk5_dpa_op21 blk5_dpa_op22))
+
+;; ----------------------------------------------------------------------------
+;; Block 5 ARM (LLVM) - Store constants to MAC and EtherType fields
+;; Cost: 6×(1 const) + 12×(2 store) + 1 const + 2 gep + 1 const + 2 store = 39
+;; ----------------------------------------------------------------------------
+
+;; Base pointer and constants
+(let blk5_cpu_op0 (Value 0 (llvm_ptr)))
+(let blk5_cpu_op1 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 0 (I64))) (I64)))
+
+;; MAC address constants
+(let blk5_cpu_op2 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 60 (I8))) (I8)))
+(let blk5_cpu_op3 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr -3 (I8))) (I8)))
+(let blk5_cpu_op4 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr -2 (I8))) (I8)))
+(let blk5_cpu_op5 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr -98 (I8))) (I8)))
+(let blk5_cpu_op6 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 93 (I8))) (I8)))
+(let blk5_cpu_op7 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 1 (I8))) (I8)))
+
+;; Store destination MAC (Values 8-13)
+(let blk5_cpu_op8 (Value 8 (llvm_ptr)))
+(let blk5_cpu_op9 (Value 9 (llvm_ptr)))
+(let blk5_cpu_op10 (Value 10 (llvm_ptr)))
+(let blk5_cpu_op11 (Value 11 (llvm_ptr)))
+(let blk5_cpu_op12 (Value 12 (llvm_ptr)))
+(let blk5_cpu_op13 (Value 13 (llvm_ptr)))
+
+(let blk5_cpu_op14 (llvm_store blk5_cpu_op2 blk5_cpu_op8))
+(let blk5_cpu_op15 (llvm_store blk5_cpu_op3 blk5_cpu_op9))
+(let blk5_cpu_op16 (llvm_store blk5_cpu_op4 blk5_cpu_op10))
+(let blk5_cpu_op17 (llvm_store blk5_cpu_op5 blk5_cpu_op11))
+(let blk5_cpu_op18 (llvm_store blk5_cpu_op6 blk5_cpu_op12))
+(let blk5_cpu_op19 (llvm_store blk5_cpu_op7 blk5_cpu_op13))
+
+;; Source MAC constants
+(let blk5_cpu_op20 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 125 (I8))) (I8)))
+(let blk5_cpu_op21 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 33 (I8))) (I8)))
+
+;; Store source MAC (Values 22-27)
+(let blk5_cpu_op22 (Value 22 (llvm_ptr)))
+(let blk5_cpu_op23 (Value 23 (llvm_ptr)))
+(let blk5_cpu_op24 (Value 24 (llvm_ptr)))
+(let blk5_cpu_op25 (Value 25 (llvm_ptr)))
+(let blk5_cpu_op26 (Value 26 (llvm_ptr)))
+(let blk5_cpu_op27 (Value 27 (llvm_ptr)))
+
+(let blk5_cpu_op28 (llvm_store blk5_cpu_op2 blk5_cpu_op22))
+(let blk5_cpu_op29 (llvm_store blk5_cpu_op3 blk5_cpu_op23))
+(let blk5_cpu_op30 (llvm_store blk5_cpu_op4 blk5_cpu_op24))
+(let blk5_cpu_op31 (llvm_store blk5_cpu_op5 blk5_cpu_op25))
+(let blk5_cpu_op32 (llvm_store blk5_cpu_op20 blk5_cpu_op26))
+(let blk5_cpu_op33 (llvm_store blk5_cpu_op21 blk5_cpu_op27))
+
+;; EtherType field
+(let blk5_cpu_op34
+    (llvm_getelementptr blk5_cpu_op0 blk5_cpu_op1
+        (NamedAttr "elem_type" (TypeAttr (llvm_struct "struct.ethernet"
+            (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I8) (I16))))
+        (NamedAttr "inbounds" (UnitAttr))
+        (NamedAttr "rawConstantIndices" (DenseIntArrayAttr 2 (vec-of -2147483648 12) (I32)))
+        (llvm_ptr)))
+
+(let blk5_cpu_op35 (llvm_mlir_constant (NamedAttr "value" (IntegerAttr 8 (I16))) (I16)))
+(let blk5_cpu_op36 (llvm_store blk5_cpu_op35 blk5_cpu_op34))
+
+(let blk5_cpu_ops (vec-of blk5_cpu_op2 blk5_cpu_op3 blk5_cpu_op4 blk5_cpu_op5 blk5_cpu_op6 blk5_cpu_op7
+                          blk5_cpu_op14 blk5_cpu_op15 blk5_cpu_op16 blk5_cpu_op17 blk5_cpu_op18 blk5_cpu_op19
+                          blk5_cpu_op20 blk5_cpu_op21 blk5_cpu_op28 blk5_cpu_op29 blk5_cpu_op30 blk5_cpu_op31
+                          blk5_cpu_op32 blk5_cpu_op33 blk5_cpu_op35 blk5_cpu_op36))
+
+;; ============================================================================
+;; Block 5 Deployment Declarations
+;; ============================================================================
+
+(implement blk5_drmt DRMT (blk0 blk1 blk3 blk4) blk5_drmt_ops)
+(implement blk5_dpa DPA (blk0 blk1 blk3 blk4) blk5_dpa_ops)
+(implement blk5_cpu ARM (blk0 blk1 blk3 blk4) blk5_cpu_ops)
+
+;; Block 5 Equivalences
+(rewrite blk5_cpu blk5_drmt)
+(rewrite blk5_cpu blk5_dpa)
