@@ -2,6 +2,7 @@
 ;; Hardware Configuration
 ;; ============================================================================
 
+(hardware RX :cores 1 :sigma 0.0)
 (hardware DRMT :cores 1 :sigma 0.0)
 (hardware DPA :cores 190 :sigma 0.5)
 (hardware ARM :cores 16 :sigma 1.0)
@@ -10,6 +11,12 @@
 ;; Communication Links (BlueField-3 Topology)
 ;; ============================================================================
 
+;; Input paths from RX
+(link RX DRMT 0.0 1.0)
+(link RX ARM 0.0 1.0)
+(link RX DPA 20.0 0.5)
+
+;; Inter-hardware links
 (link DRMT ARM 1.0 1.0)
 
 ;; ============================================================================

@@ -307,31 +307,21 @@ impl BlockParser {
                         if !args.is_empty() {
                             let func_name = args[0].expect_atom()?;
                             let cost = self.extract_cost_from_function(args)?;
-                            let op_type = self.extract_op_type_from_function(args)?;
-                            let sigma = self.extract_sigma_from_function(args)?;
-                            
-                            self.op_costs.insert(func_name.clone(), cost);
-                            self.op_types.insert(func_name.clone(), op_type);
-                            self.op_sigmas.insert(func_name, sigma);
+                            self.op_costs.insert(func_name, cost);
                         }
                     }
                     "hardware" => {
-                        // (hardware CPU :cores 16 :sigma 1.0)
+                        // (hardware CPU)
+                        // (hardware RX) - now RX is just another hardware type
                         if !args.is_empty() {
                             let hw_name = args[0].expect_atom()?;
-                            topology.add_hardware(hw_name.clone());
-                            
-                            // Extract cores and sigma
-                            let cores = self.extract_keyword_int(args, ":cores")?.unwrap_or(1);
-                            let sigma = self.extract_keyword_float(args, ":sigma")?.unwrap_or(0.0);
-                            
-                            self.hw_configs.insert(
-                                hw_name,
-                                crate::cost_model::HardwareConfig::new(cores as usize, sigma),
-                            );
+                            topology.add_hardware(hw_name);
                         }
                     }
                     "link" => {
+                        // (link RX DRMT 0.0 1.0) - works just like any other link!
+                        // (link RX DPA 20.0 0.5)
+                        // (link CPU GPU 10.0 1.0)
                         if args.len() >= 3 {
                             let from = args[0].expect_atom()?;
                             let to = args[1].expect_atom()?;
@@ -339,7 +329,7 @@ impl BlockParser {
                             let bandwidth = if args.len() >= 4 {
                                 self.extract_float(&args[3])?
                             } else {
-                                1.0
+                                1.0 // Default bandwidth
                             };
                             topology.add_link(from, to, latency, bandwidth);
                         }
