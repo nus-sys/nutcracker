@@ -9,10 +9,10 @@ add_public_tablegen_target(VDRMT_IncGen)
 add_dependencies(mlir-headers VDRMT_IncGen)
 
 # Generate extra headers for custom enum and attrs.
-# mlir_tablegen(P4HIR_Attrs.h.inc -gen-attrdef-decls -attrdefs-dialect=p4hir)
-# mlir_tablegen(P4HIR_Attrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=p4hir)
-# add_public_tablegen_target(P4MLIR_P4HIR_AttrIncGen)
-# add_dependencies(mlir-headers P4MLIR_P4HIR_AttrIncGen)
+mlir_tablegen(vDRMTAttrs.h.inc -gen-attrdef-decls -attrdefs-dialect=vdrmt)
+mlir_tablegen(vDRMTAttrs.cpp.inc -gen-attrdef-defs -attrdefs-dialect=vdrmt)
+add_public_tablegen_target(VDRMT_AttrIncGen)
+add_dependencies(mlir-headers VDRMT_AttrIncGen)
 
 mlir_tablegen(vDRMTOpsEnums.h.inc -gen-enum-decls)
 mlir_tablegen(vDRMTOpsEnums.cpp.inc -gen-enum-defs)
