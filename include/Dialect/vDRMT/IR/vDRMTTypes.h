@@ -11,6 +11,7 @@
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/Interfaces/MemorySlotInterfaces.h"
 #include "Dialect/vDRMT/IR/vDRMTOpsEnums.h"
+#include "Dialect/vDRMT/IR/vDRMTTypeInterfaces.h"
 
 #define GET_TYPEDEF_CLASSES
 #include "Dialect/vDRMT/IR/vDRMTTypes.h.inc"

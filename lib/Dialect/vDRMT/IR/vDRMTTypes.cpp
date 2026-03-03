@@ -28,10 +28,27 @@ static void printFuncType(mlir::AsmPrinter &p, mlir::ArrayRef<mlir::Type> params
 #define GET_TYPEDEF_CLASSES
 #include "Dialect/vDRMT/IR/vDRMTTypes.cpp.inc"
 
+Type vDRMTDialect::parseType(mlir::DialectAsmParser &parser) const {
+    SMLoc typeLoc = parser.getCurrentLocation();
+    StringRef mnemonic;
+    Type genType;
+
+    // Try to parse as a tablegen'd type.
+    OptionalParseResult parseResult = generatedTypeParser(parser, &mnemonic, genType);
+    if (parseResult.has_value()) return genType;
+
+    // No additional custom types to parse
+    parser.emitError(typeLoc) << "unknown DOCAFlow type: " << mnemonic;
+    return Type();
+}
+
 void vDRMTDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &os) const {
     return;
 }
 
+//===----------------------------------------------------------------------===//
+// FuncType
+//===----------------------------------------------------------------------===//
 static mlir::ParseResult parseFuncType(mlir::AsmParser &p, llvm::SmallVector<mlir::Type> &params) {
     mlir::Type placeholder;
     return parseFuncType(p, params, placeholder);
@@ -102,6 +119,141 @@ llvm::ArrayRef<mlir::Type> FuncType::getReturnTypes() const {
 FuncType FuncType::clone(TypeRange inputs, TypeRange results) const {
     assert(results.size() == 1 && "expected exactly one result type");
     return get(llvm::to_vector(inputs), results[0]);
+}
+
+//===----------------------------------------------------------------------===//
+// StructLikeType
+//===----------------------------------------------------------------------===//
+
+namespace mlir::bluefield3::drmt {
+bool operator==(const FieldInfo &a, const FieldInfo &b) {
+    return a.name == b.name && a.type == b.type;
+}
+llvm::hash_code hash_value(const FieldInfo &fi) { return llvm::hash_combine(fi.name, fi.type); }
+}
+
+static ParseResult parseFields(AsmParser &p, std::string &name,
+                               SmallVectorImpl<FieldInfo> &parameters,
+                               mlir::DictionaryAttr &annotations) {
+    llvm::StringSet<> nameSet;
+    mlir::NamedAttrList annList;
+    bool hasDuplicateName = false;
+    bool parsedName = false;
+    auto parseResult =
+        p.parseCommaSeparatedList(mlir::AsmParser::Delimiter::LessGreater, [&]() -> ParseResult {
+            // First, try to parse name
+            if (!parsedName) {
+                if (p.parseKeywordOrString(&name) || p.parseOptionalAttrDict(annList))
+                    return failure();
+                parsedName = true;
+                annotations = annList.getDictionary(p.getContext());
+                return success();
+            }
+
+            // Parse fields
+            std::string fieldName;
+            Type fieldType;
+            mlir::NamedAttrList fieldAnnotations;
+
+            auto fieldLoc = p.getCurrentLocation();
+            if (p.parseKeywordOrString(&fieldName) || p.parseColon() || p.parseType(fieldType) ||
+                p.parseOptionalAttrDict(fieldAnnotations))
+                return failure();
+
+            if (!nameSet.insert(fieldName).second) {
+                p.emitError(fieldLoc, "duplicate field name \'" + name + "\'");
+                // Continue parsing to print all duplicates, but make sure to error
+                // eventually
+                hasDuplicateName = true;
+            }
+
+            parameters.emplace_back(StringAttr::get(p.getContext(), fieldName), fieldType,
+                                    fieldAnnotations.getDictionary(p.getContext()));
+            return success();
+        });
+
+    if (hasDuplicateName) return failure();
+    return parseResult;
+}
+
+/// Print out a list of named fields surrounded by <>.
+static void printFields(AsmPrinter &p, StringRef name, ArrayRef<FieldInfo> fields,
+                        mlir::DictionaryAttr annotations) {
+    p << '<';
+    p.printString(name);
+    if (annotations && !annotations.empty()) {
+        p << ' ';
+        p.printAttributeWithoutType(annotations);
+    }
+    if (!fields.empty()) p << ", ";
+    llvm::interleaveComma(fields, p, [&](const FieldInfo &field) {
+        p.printKeywordOrString(field.name.getValue());
+        p << ": " << field.type;
+        if (field.annotations && !field.annotations.empty()) {
+            p << " ";
+            p.printAttributeWithoutType(field.annotations);
+        }
+    });
+    p << ">";
+}
+
+//===----------------------------------------------------------------------===//
+// StructType
+//===----------------------------------------------------------------------===//
+Type StructType::parse(AsmParser &p) {
+    llvm::SmallVector<FieldInfo, 4> parameters;
+    std::string name;
+    mlir::DictionaryAttr annotations;
+    if (parseFields(p, name, parameters, annotations)) return {};
+    return get(p.getContext(), name, parameters, annotations);
+}
+
+void StructType::print(AsmPrinter &p) const {
+    printFields(p, getName(), getElements(), getAnnotations());
+}
+
+LogicalResult StructType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                  StringRef name,
+                                  ArrayRef<FieldInfo> elements,
+                                  DictionaryAttr annotations) {
+    // Basic verification - ensure no duplicate field names
+    llvm::StringSet<> fieldNames;
+    for (const auto &field : elements) {
+        if (!fieldNames.insert(field.name.getValue()).second) {
+            return emitError() << "duplicate field name '" << field.name.getValue() << "'";
+        }
+    }
+    return success();
+}
+
+//===----------------------------------------------------------------------===//
+// HeaderType
+//===----------------------------------------------------------------------===//
+Type HeaderType::parse(AsmParser &p) {
+    llvm::SmallVector<FieldInfo, 4> parameters;
+    std::string name;
+    mlir::DictionaryAttr annotations;
+    if (parseFields(p, name, parameters, annotations)) return {};
+    // Use the standard get() which uses the default builder from the base class
+    return get(p.getContext(), name, parameters, annotations);
+}
+
+void HeaderType::print(AsmPrinter &p) const {
+    printFields(p, getName(), getElements(), getAnnotations());
+}
+
+LogicalResult HeaderType::verify(function_ref<InFlightDiagnostic()> emitError,
+                                  StringRef name,
+                                  ArrayRef<FieldInfo> elements,
+                                  DictionaryAttr annotations) {
+    // Basic verification - ensure no duplicate field names
+    llvm::StringSet<> fieldNames;
+    for (const auto &field : elements) {
+        if (!fieldNames.insert(field.name.getValue()).second) {
+            return emitError() << "duplicate field name '" << field.name.getValue() << "'";
+        }
+    }
+    return success();
 }
 
 void vDRMTDialect::registerTypes() {
