@@ -19,10 +19,10 @@ mlir_tablegen(vDRMTOpsEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(VDRMT_EnumIncGen)
 add_dependencies(mlir-headers VDRMT_EnumIncGen)
 
-# set(LLVM_TARGET_DEFINITIONS P4HIR_TypeInterfaces.td)
-# mlir_tablegen(P4HIR_TypeInterfaces.h.inc -gen-type-interface-decls)
-# mlir_tablegen(P4HIR_TypeInterfaces.cpp.inc -gen-type-interface-defs)
+set(LLVM_TARGET_DEFINITIONS vDRMTTypeInterfaces.td)
+mlir_tablegen(vDRMTTypeInterfaces.h.inc -gen-type-interface-decls)
+mlir_tablegen(vDRMTTypeInterfaces.cpp.inc -gen-type-interface-defs)
 
-# add_public_tablegen_target(P4MLIR_P4HIR_TypeInterfacesIncGen)
-# add_dependencies(mlir-headers P4MLIR_P4HIR_TypeInterfacesIncGen)
+add_public_tablegen_target(VDRMT_TypeInterfacesIncGen)
+add_dependencies(mlir-headers VDRMT_TypeInterfacesIncGen)
 

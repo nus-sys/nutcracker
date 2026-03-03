@@ -17,6 +17,7 @@ def vDRMT_Dialect : Dialect {
     let cppNamespace = "::mlir::vdrmt";
 
     let extraClassDeclaration = [{
+        mlir::Type parseType(mlir::DialectAsmParser &parser) const override;
         void printType(mlir::Type type, mlir::DialectAsmPrinter &printer) const override;
         void registerTypes();
     }];
