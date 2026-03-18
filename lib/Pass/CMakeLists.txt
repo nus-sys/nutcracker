@@ -1,0 +1,3 @@
+add_subdirectory(P4HIRPartition)
+add_subdirectory(P4HIRToVDRMT)
+add_subdirectory(P4HIRToVDPP)

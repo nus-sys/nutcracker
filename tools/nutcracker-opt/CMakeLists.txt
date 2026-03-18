@@ -6,6 +6,9 @@ set(LIBS
         MLIRTransforms
         MLIROptLib
         ${LIB_P4HIR}
+        MLIRP4HIRPartitionPass
+        MLIRP4HIRToVDRMTPass
+        MLIRP4HIRToVDPPPass
         #MLIRP4HIRToDPUPass
         #MLIRP4HIRToDRMTPass
         )

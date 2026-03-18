@@ -29,7 +29,27 @@ static void printFuncType(mlir::AsmPrinter &p, mlir::ArrayRef<mlir::Type> params
 #include "Dialect/vDPP/IR/vDPPTypes.cpp.inc"
 
 void vDPPDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &os) const {
-    return;
+    // Let the auto-generated code handle printing
+    if (succeeded(generatedTypePrinter(type, os)))
+        return;
+    
+    // Fallback for unhandled types
+    os << "<unknown vDPP type>";
+}
+
+mlir::Type vDPPDialect::parseType(mlir::DialectAsmParser &parser) const {
+    // Let the auto-generated code handle parsing
+    StringRef mnemonic;
+    Type type;
+    if (failed(parser.parseKeyword(&mnemonic)))
+        return {};
+    
+    auto parseResult = generatedTypeParser(parser, &mnemonic, type);
+    if (parseResult.has_value() && succeeded(parseResult.value()))
+        return type;
+    
+    parser.emitError(parser.getNameLoc(), "unknown vDPP type: ") << mnemonic;
+    return {};
 }
 
 static mlir::ParseResult parseFuncType(mlir::AsmParser &p, llvm::SmallVector<mlir::Type> &params) {
@@ -47,7 +67,7 @@ static mlir::ParseResult parseFuncType(mlir::AsmParser &p, llvm::SmallVector<mli
         mlir::Type type;
         if (p.parseType(type)) return mlir::failure();
         if (mlir::isa<VoidType>(type))
-            // An explicit !p4hir.void means also no return type.
+            // An explicit !vdpp.void means also no return type.
             optionalReturnType = {};
         else
             // Otherwise use the actual type.
@@ -77,12 +97,16 @@ static void printFuncType(mlir::AsmPrinter &p, mlir::ArrayRef<mlir::Type> params
     p << ')';
 }
 
+//===----------------------------------------------------------------------===//
+// FuncType
+//===----------------------------------------------------------------------===//
+
 // Whether the function returns void
 bool FuncType::isVoid() const {
     auto rt = static_cast<detail::FuncTypeStorage *>(getImpl())->optionalReturnType;
     assert(!rt || !mlir::isa<VoidType>(rt) &&
                       "The return type for a function returning void should be empty "
-                      "instead of a real !p4hir.void");
+                      "instead of a real !vdpp.void");
     return !rt;
 }
 
@@ -103,6 +127,83 @@ FuncType FuncType::clone(TypeRange inputs, TypeRange results) const {
     assert(results.size() == 1 && "expected exactly one result type");
     return get(llvm::to_vector(inputs), results[0]);
 }
+
+//===----------------------------------------------------------------------===//
+// StructType
+//===----------------------------------------------------------------------===//
+
+mlir::Type StructType::parse(mlir::AsmParser &parser) {
+    // Parse: <"name", (type1, type2, ...)> or <(type1, type2, ...)>
+    // Can also have "packed" keyword
+    
+    if (parser.parseLess())
+        return {};
+    
+    std::string nameStr;
+    mlir::StringAttr name;
+    bool isPacked = false;
+    
+    // Check for "packed" keyword
+    if (succeeded(parser.parseOptionalKeyword("packed"))) {
+        isPacked = true;
+    }
+    
+    // Check for named struct
+    if (succeeded(parser.parseOptionalString(&nameStr))) {
+        name = mlir::StringAttr::get(parser.getContext(), nameStr);
+        if (parser.parseComma())
+            return {};
+    }
+    
+    // Parse field types
+    llvm::SmallVector<mlir::Type> body;
+    if (parser.parseLParen())
+        return {};
+    
+    if (failed(parser.parseOptionalRParen())) {
+        // Parse comma-separated list of types
+        do {
+            mlir::Type fieldType;
+            if (parser.parseType(fieldType))
+                return {};
+            body.push_back(fieldType);
+        } while (succeeded(parser.parseOptionalComma()));
+        
+        if (parser.parseRParen())
+            return {};
+    }
+    
+    if (parser.parseGreater())
+        return {};
+    
+    // Use the builder with explicit context
+    if (name) {
+        return StructType::get(parser.getContext(), name.getValue(), body, isPacked);
+    } else {
+        return StructType::get(parser.getContext(), body, isPacked);
+    }
+}
+
+void StructType::print(mlir::AsmPrinter &printer) const {
+    printer << "<";
+    
+    if (getIsPacked())
+        printer << "packed ";
+    
+    if (isIdentified()) {
+        printer << "\"" << getNameStr() << "\", ";
+    }
+    
+    printer << "(";
+    llvm::interleaveComma(getBody(), printer, [&](mlir::Type type) {
+        printer.printType(type);
+    });
+    printer << ")>";
+}
+
+//===----------------------------------------------------------------------===//
+// Register types
+//===----------------------------------------------------------------------===//
 
 void vDPPDialect::registerTypes() {
     addTypes<

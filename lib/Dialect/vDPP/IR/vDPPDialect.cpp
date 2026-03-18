@@ -19,6 +19,6 @@ void mlir::vdpp::vDPPDialect::initialize() {
 #define GET_OP_LIST
 #include "Dialect/vDPP/IR/vDPPOps.cpp.inc"
         >();
-    // registerTypes();
+    registerTypes();
     // registerAttributes();
 }

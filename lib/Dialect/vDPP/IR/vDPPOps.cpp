@@ -55,11 +55,43 @@ LogicalResult vdpp::ConstantOp::verify() {
 OpFoldResult vdpp::ConstantOp::fold(FoldAdaptor adaptor) { return getValue(); }
 
 //===----------------------------------------------------------------------===//
-// BinaryOp
+// AllocaOp
 //===----------------------------------------------------------------------===//
 
-void vdpp::BinOp::getAsmResultNames(OpAsmSetValueNameFn setNameFn) {
-    setNameFn(getResult(), stringifyEnum(getKind()));
+llvm::SmallVector<mlir::MemorySlot> vdpp::AllocaOp::getPromotableSlots() {
+    // Return the memory slot for this alloca
+    auto ptrType = mlir::cast<vdpp::PointerType>(getResult().getType());
+    return {MemorySlot{getResult(), ptrType.getElementType()}};
+}
+
+mlir::Value vdpp::AllocaOp::getDefaultValue(
+    const MemorySlot &slot, OpBuilder &builder) {
+    // Return a default value for the slot
+    return {};
+}
+
+void vdpp::AllocaOp::handleBlockArgument(
+    const MemorySlot &slot, BlockArgument argument, OpBuilder &builder) {
+    // Handle block argument for memory slot
+}
+
+std::optional<mlir::PromotableAllocationOpInterface> 
+vdpp::AllocaOp::handlePromotionComplete(
+    const MemorySlot &slot, Value defaultValue, OpBuilder &builder) {
+    if (defaultValue && defaultValue.use_empty())
+        defaultValue.getDefiningOp()->erase();
+    this->erase();
+    return {};
+}
+
+//===----------------------------------------------------------------------===//
+// CondBranchOp
+//===----------------------------------------------------------------------===//
+
+SuccessorOperands vdpp::CondBranchOp::getSuccessorOperands(unsigned index) {
+    assert(index < 2 && "invalid successor index");
+    return SuccessorOperands(index == 0 ? getTrueDestOperandsMutable() 
+                                        : getFalseDestOperandsMutable());
 }
 
 #define GET_OP_CLASSES

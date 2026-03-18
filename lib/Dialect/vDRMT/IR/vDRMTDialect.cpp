@@ -6,6 +6,7 @@
 #include "Dialect/vDRMT/IR/vDRMTDialect.h"
 #include "Dialect/vDRMT/IR/vDRMTOps.h"
 #include "Dialect/vDRMT/IR/vDRMTTypes.h"
+#include "p4mlir/Dialect/P4HIR/P4HIR_Types.h"
 
 using namespace mlir;
 
