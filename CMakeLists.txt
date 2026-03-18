@@ -18,8 +18,8 @@ set(PROJECT_BINARY_DIR ${CMAKE_BINARY_DIR})
 set(LLVM_RUNTIME_OUTPUT_INTDIR ${PROJECT_BINARY_DIR}/bin)
 set(LLVM_LIBRARY_OUTPUT_INTDIR ${PROJECT_BINARY_DIR}/lib)
 
-set(LLVM_DIR "${CMAKE_SOURCE_DIR}/third_party/llvm/build-release/lib/cmake/llvm")
-set(MLIR_DIR "${CMAKE_SOURCE_DIR}/third_party/llvm/build-release/lib/cmake/mlir")
+set(LLVM_DIR "${CMAKE_SOURCE_DIR}/third_party/llvm/build/lib/cmake/llvm")
+set(MLIR_DIR "${CMAKE_SOURCE_DIR}/third_party/llvm/build/lib/cmake/mlir")
 
 # Find MLIR and LLVM
 find_package(MLIR REQUIRED CONFIG)

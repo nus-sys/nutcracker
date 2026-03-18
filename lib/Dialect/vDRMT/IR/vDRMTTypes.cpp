@@ -43,7 +43,11 @@ Type vDRMTDialect::parseType(mlir::DialectAsmParser &parser) const {
 }
 
 void vDRMTDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &os) const {
-    return;
+    // Try to print as a tablegen'd type.
+    if (generatedTypePrinter(type, os).succeeded()) return;
+
+    // No additional custom type printing needed
+    llvm::report_fatal_error("printer is missing a handler for this type");
 }
 
 //===----------------------------------------------------------------------===//
