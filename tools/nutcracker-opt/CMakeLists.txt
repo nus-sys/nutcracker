@@ -6,9 +6,15 @@ set(LIBS
         MLIRTransforms
         MLIROptLib
         ${LIB_P4HIR}
+        MLIRvDRMTDialect
+        MLIRbf3drmtDialect
+        MLIRbf3dpaDialect
         MLIRP4HIRPartitionPass
         MLIRP4HIRToVDRMTPass
         MLIRP4HIRToVDPPPass
+        MLIRVDRMTToBF3DRMTPass
+        MLIRVDPPToBF3DPAPass
+        MLIREmitHandlerCodePass
         #MLIRP4HIRToDPUPass
         #MLIRP4HIRToDRMTPass
         )
@@ -18,4 +24,3 @@ llvm_update_compile_flags(nutcracker-opt)
 target_link_libraries(nutcracker-opt PRIVATE ${LIBS})
 
 mlir_check_all_link_libraries(nutcracker-opt)
-

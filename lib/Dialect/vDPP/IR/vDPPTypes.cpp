@@ -38,17 +38,13 @@ void vDPPDialect::printType(mlir::Type type, mlir::DialectAsmPrinter &os) const 
 }
 
 mlir::Type vDPPDialect::parseType(mlir::DialectAsmParser &parser) const {
-    // Let the auto-generated code handle parsing
-    StringRef mnemonic;
-    Type type;
-    if (failed(parser.parseKeyword(&mnemonic)))
-        return {};
-    
+    mlir::SMLoc typeLoc = parser.getCurrentLocation();
+    llvm::StringRef mnemonic;
+    mlir::Type type;
     auto parseResult = generatedTypeParser(parser, &mnemonic, type);
-    if (parseResult.has_value() && succeeded(parseResult.value()))
+    if (parseResult.has_value())
         return type;
-    
-    parser.emitError(parser.getNameLoc(), "unknown vDPP type: ") << mnemonic;
+    parser.emitError(typeLoc, "unknown vDPP type: ") << mnemonic;
     return {};
 }
 

@@ -540,18 +540,7 @@ public:
       adaptor.getCondition(),
       hasElse
     );
-    
-    // NEW: Add successor attributes to the if operation itself
-    if (!exitInfo.empty() && exitInfo.size() >= 1) {
-      vdrmtIf->setAttr("then_successor", 
-        rewriter.getI32IntegerAttr(exitInfo[0].successor));
-      
-      if (hasElse && exitInfo.size() >= 2) {
-        vdrmtIf->setAttr("else_successor", 
-          rewriter.getI32IntegerAttr(exitInfo[1].successor));
-      }
-    }
-    
+
     // Clear auto-generated blocks
     vdrmtIf.getThenRegion().front().clear();
     vdrmtIf.getThenRegion().getBlocks().clear();
@@ -562,16 +551,28 @@ public:
     }
     
     // Inline P4HIR regions
-    rewriter.inlineRegionBefore(p4hirThen, 
-                                 vdrmtIf.getThenRegion(), 
+    rewriter.inlineRegionBefore(p4hirThen,
+                                 vdrmtIf.getThenRegion(),
                                  vdrmtIf.getThenRegion().end());
-    
+
     if (hasElse) {
-      rewriter.inlineRegionBefore(p4hirElse, 
-                                   vdrmtIf.getElseRegion(), 
+      rewriter.inlineRegionBefore(p4hirElse,
+                                   vdrmtIf.getElseRegion(),
                                    vdrmtIf.getElseRegion().end());
     }
-    
+
+    // Stash the per-branch successor IDs as temporary attributes on the if op.
+    // A post-conversion walk (after applyPartialConversion) will use these to
+    // replace the vdrmt.yield terminators inside each region with vdrmt.next N,
+    // then remove these attrs.
+    if (!exitInfo.empty()) {
+      vdrmtIf->setAttr("__then_successor__",
+        rewriter.getI32IntegerAttr(exitInfo[0].successor));
+      if (exitInfo.size() >= 2)
+        vdrmtIf->setAttr("__else_successor__",
+          rewriter.getI32IntegerAttr(exitInfo[1].successor));
+    }
+
     rewriter.eraseOp(op);
     return success();
   }
@@ -790,20 +791,58 @@ private:
       return failure();
     }
 
-    // NEW: Post-process to add successor to final return
-    if (!exitInfo.empty()) {
-      // Check if function ends with a return (no if)
-      if (!vdrmtFunc.getBody().empty()) {
-        Block &lastBlock = vdrmtFunc.getBody().back();
-        if (!lastBlock.empty()) {
-          Operation &lastOp = lastBlock.back();
-          if (auto returnOp = dyn_cast<func::ReturnOp>(&lastOp)) {
-            // This is a simple block with no branching
-            // Add successor annotation
-            int successor = exitInfo[0].successor;
-            returnOp->setAttr("successor", builder.getI32IntegerAttr(successor));
-          }
-        }
+    // Post-conversion fixup pass 1: for each vdrmt.if that carries
+    // __then_successor__ / __else_successor__ temp attrs, replace the
+    // vdrmt.yield at the end of each region with a vdrmt.next N so that the
+    // routing lives INSIDE the branch, not after it.
+    vdrmtFunc.walk([&](vdrmt::IfOp ifOp) {
+      auto thenAttr = ifOp->getAttrOfType<IntegerAttr>("__then_successor__");
+      if (!thenAttr) return;
+
+      // Helper: replace the terminator yield in a region with vdrmt.next N.
+      auto replaceYieldWithNext = [&](Region &region, int32_t successor) {
+        if (region.empty()) return;
+        Block &block = region.back();
+        if (block.empty()) return;
+        Operation *term = &block.back();
+        OpBuilder b(term);
+        b.create<vdrmt::NextOp>(term->getLoc(), successor);
+        // Remove the yield (or whatever terminator was there).
+        if (isa<vdrmt::YieldOp>(term))
+          term->erase();
+      };
+
+      replaceYieldWithNext(ifOp.getThenRegion(), (int32_t)thenAttr.getInt());
+
+      if (auto elseAttr = ifOp->getAttrOfType<IntegerAttr>("__else_successor__"))
+        replaceYieldWithNext(ifOp.getElseRegion(), (int32_t)elseAttr.getInt());
+
+      ifOp->removeAttr("__then_successor__");
+      ifOp->removeAttr("__else_successor__");
+    });
+
+    // Post-conversion fixup pass 2: for simple blocks (no vdrmt.if), insert
+    // an unconditional vdrmt.next N before the function's final return.
+    if (!exitInfo.empty() && !vdrmtFunc.getBody().empty()) {
+      Block &lastBlock = vdrmtFunc.getBody().back();
+
+      bool hasNext = llvm::any_of(lastBlock, [](Operation &op) {
+        return isa<vdrmt::NextOp>(&op);
+      });
+
+      // If this block contains a vdrmt.if, routing is already handled inside
+      // the if's then/else regions — do not add an extra unconditional next.
+      bool hasIf = llvm::any_of(lastBlock, [](Operation &op) {
+        return isa<vdrmt::IfOp>(&op);
+      });
+
+      if (!hasNext && !hasIf && !lastBlock.empty()) {
+        Operation *terminator = &lastBlock.back();
+        OpBuilder insertBuilder(terminator);
+        insertBuilder.create<vdrmt::NextOp>(
+          terminator->getLoc(),
+          (int32_t)exitInfo[0].successor
+        );
       }
     }
       

@@ -357,6 +357,10 @@ def CondBranchOp : vDPP_Op<"cond_br", [
             $_state.addOperands(falseOperands);
             $_state.addSuccessors(trueDest);
             $_state.addSuccessors(falseDest);
+            $_state.addAttribute("operandSegmentSizes",
+                $_builder.getDenseI32ArrayAttr({1,
+                    (int32_t)trueOperands.size(),
+                    (int32_t)falseOperands.size()}));
         }]>
     ];
 }
