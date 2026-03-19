@@ -1,0 +1,215 @@
+(include "egglog_rules/base.egg")
+
+;;;; vdrmt dialect (source — high cost) ;;;;
+;; Types
+(function vdrmt_bits (i64) Type :cost 100)
+(function vdrmt_ref (Type) Type :cost 100)
+;; Struct/header types are encoded as an opaque MLIR type string (String).
+;; This avoids fixed-arity issues for types with variable numbers of fields.
+(function vdrmt_struct (String) Type :cost 100)
+(function vdrmt_header (String) Type :cost 100)
+
+;; Attributes
+(function vdrmt_int (i64 Type) Attr :cost 100)
+(function vdrmt_binop_kind (i64) Attr :cost 100)
+(function vdrmt_cmp_kind (i64) Attr :cost 100)
+
+;; Ops
+(function vdrmt_constant (AttrPair Type) Op :cost 100)
+(function vdrmt_variable (AttrPair AttrPair Type) Op :cost 100)
+(function vdrmt_read (Op Type) Op :cost 100)
+(function vdrmt_assign (Op Op) Op :cost 100)
+(function vdrmt_struct_extract (Op AttrPair Type) Op :cost 100)
+(function vdrmt_struct_extract_ref (Op AttrPair Type) Op :cost 100)
+(function vdrmt_binop (Op Op AttrPair Type) Op :cost 100)
+(function vdrmt_shl (Op Op Type) Op :cost 100)
+(function vdrmt_shr (Op Op Type) Op :cost 100)
+(function vdrmt_cast (Op Type) Op :cost 100)
+(function vdrmt_slice (Op AttrPair AttrPair Type) Op :cost 100)
+(function vdrmt_concat (Op Op Type) Op :cost 100)
+(function vdrmt_next (AttrPair) Op :cost 100)
+(function vdrmt_return () Op :cost 100)
+
+;;;; bf3drmt dialect (target — low cost) ;;;;
+;; Types
+(function bf3drmt_bits (i64) Type :cost 1)
+(function bf3drmt_ref (Type) Type :cost 1)
+(function bf3drmt_struct (String) Type :cost 1)
+(function bf3drmt_header (String) Type :cost 1)
+
+;; Attributes
+(function bf3drmt_int (i64 Type) Attr :cost 1)
+(function bf3drmt_binop_kind (i64) Attr :cost 1)
+
+;; Ops
+(function bf3drmt_constant (AttrPair Type) Op :cost 1)
+(function bf3drmt_variable (AttrPair AttrPair Type) Op :cost 1)
+(function bf3drmt_read (Op Type) Op :cost 1)
+(function bf3drmt_assign (Op Op) Op :cost 1)
+(function bf3drmt_struct_extract_ref (Op AttrPair Type) Op :cost 1)
+(function bf3drmt_binop (Op Op AttrPair Type) Op :cost 1)
+(function bf3drmt_shl (Op Op Type) Op :cost 1)
+(function bf3drmt_shr (Op Op Type) Op :cost 1)
+(function bf3drmt_cast (Op Type) Op :cost 1)
+(function bf3drmt_slice (Op AttrPair AttrPair Type) Op :cost 1)
+(function bf3drmt_concat (Op Op Type) Op :cost 1)
+(function bf3drmt_next (AttrPair) Op :cost 1)
+
+;; OPS HERE ;;
+
+;; RULES HERE ;;
+(ruleset rules)
+
+;; ── Direct 1-to-1 type mappings ───────────────────────────────────────────
+
+(rewrite (vdrmt_bits ?w)    (bf3drmt_bits ?w)    :ruleset rules)
+(rewrite (vdrmt_ref  ?t)    (bf3drmt_ref  ?t)    :ruleset rules)
+(rewrite (vdrmt_struct ?name) (bf3drmt_struct ?name) :ruleset rules)
+(rewrite (vdrmt_header ?name) (bf3drmt_header ?name) :ruleset rules)
+
+;; ── Direct 1-to-1 op mappings ──────────────────────────────────────────────
+
+(rewrite
+    (vdrmt_int ?v ?t)
+    (bf3drmt_int ?v ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_constant ?attrs ?t)
+    (bf3drmt_constant ?attrs ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_variable ?name ?init ?t)
+    (bf3drmt_variable ?name ?init ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_cast ?val ?t)
+    (bf3drmt_cast ?val ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_shl ?lhs ?rhs ?t)
+    (bf3drmt_shl ?lhs ?rhs ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_shr ?lhs ?rhs ?t)
+    (bf3drmt_shr ?lhs ?rhs ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_slice ?inp ?hi ?lo ?t)
+    (bf3drmt_slice ?inp ?hi ?lo ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_concat ?upper ?lower ?t)
+    (bf3drmt_concat ?upper ?lower ?t)
+    :ruleset rules)
+
+(rewrite
+    (vdrmt_assign ?val ?ref)
+    (bf3drmt_assign ?val ?ref)
+    :ruleset rules)
+
+;; ── Arithmetic binop: forward supported kinds directly ────────────────────
+;;   BinOpKind values: Mod=3, Add=4, Sub=5, AddSat=6, SubSat=7
+
+(rewrite
+    (vdrmt_binop ?lhs ?rhs ?kind ?t)
+    (bf3drmt_binop ?lhs ?rhs ?kind ?t)
+    :ruleset rules)
+
+;; ── Struct access pattern: struct_extract(read(src, struct_t), field, T) ──
+;;
+;;   vdrmt pattern (by-value struct read):
+;;     %v     = vdrmt.read %src_ref : !vdrmt.ref<struct>
+;;     %field = vdrmt.struct_extract %v[field] : struct -> T
+;;
+;;   bf3drmt target:
+;;     %fref  = bf3drmt.struct_extract_ref %src_ref[field] : ref<struct> -> ref<T>
+;;     %field = bf3drmt.read %fref : ref<T> -> T
+
+;; Case 1: read result has struct type
+(rule
+    ((= ?field_val (vdrmt_struct_extract ?read_val ?field_attr ?field_t))
+     (= ?read_val  (vdrmt_read ?src_ref (vdrmt_struct ?name))))
+    ((union ?field_val
+        (bf3drmt_read
+            (bf3drmt_struct_extract_ref ?src_ref ?field_attr (bf3drmt_ref ?field_t))
+            ?field_t)))
+    :ruleset rules)
+
+;; Case 2: read result has ref-to-struct type (alternative encoding)
+(rule
+    ((= ?field_val (vdrmt_struct_extract ?read_val ?field_attr ?field_t))
+     (= ?read_val  (vdrmt_read ?src_ref (vdrmt_ref (vdrmt_struct ?name)))))
+    ((union ?field_val
+        (bf3drmt_read
+            (bf3drmt_struct_extract_ref ?src_ref ?field_attr (bf3drmt_ref ?field_t))
+            ?field_t)))
+    :ruleset rules)
+
+;; Case 3: read result has header type (second-level struct_extract)
+(rule
+    ((= ?field_val (vdrmt_struct_extract ?read_val ?field_attr ?field_t))
+     (= ?read_val  (vdrmt_read ?src_ref (vdrmt_header ?name))))
+    ((union ?field_val
+        (bf3drmt_read
+            (bf3drmt_struct_extract_ref ?src_ref ?field_attr (bf3drmt_ref ?field_t))
+            ?field_t)))
+    :ruleset rules)
+
+;; Case 4: chaining — struct_extract on top of an already-lowered bf3drmt_read.
+;;   This handles multi-level access where a prior rule has already rewritten
+;;   the inner read to bf3drmt form.
+(rule
+    ((= ?field_val (vdrmt_struct_extract ?read_val ?field_attr ?field_t))
+     (= ?read_val  (bf3drmt_read ?sub_ref ?any_type)))
+    ((union ?field_val
+        (bf3drmt_read
+            (bf3drmt_struct_extract_ref ?sub_ref ?field_attr (bf3drmt_ref ?field_t))
+            ?field_t)))
+    :ruleset rules)
+
+;; ── struct_extract_ref chain: already have a ref → forward directly ────────
+
+(rule
+    ((= ?read_op (vdrmt_read ?extract_ref ?read_t))
+     (= ?extract_ref (vdrmt_struct_extract_ref ?src ?field_attr ?ref_t)))
+    ((union ?read_op
+        (bf3drmt_read
+            (bf3drmt_struct_extract_ref ?src ?field_attr ?ref_t)
+            ?read_t)))
+    :ruleset rules)
+
+;; ── Nested struct_extract_ref: read through two levels of ref ─────────────
+
+(rule
+    ((= ?read_op (vdrmt_read ?ref2 ?read_t))
+     (= ?ref2    (vdrmt_struct_extract_ref ?ref1 ?attr2 ?reft2))
+     (= ?ref1    (vdrmt_struct_extract_ref ?src  ?attr1 ?reft1)))
+    ((union ?read_op
+        (bf3drmt_read
+            (bf3drmt_struct_extract_ref
+                (bf3drmt_struct_extract_ref ?src ?attr1 ?reft1)
+                ?attr2 ?reft2)
+            ?read_t)))
+    :ruleset rules)
+
+;; ── assign through struct_extract_ref ─────────────────────────────────────
+
+(rule
+    ((= ?assign (vdrmt_assign ?val ?ref))
+     (= ?ref    (vdrmt_struct_extract_ref ?src ?field ?reft)))
+    ((union ?assign
+        (bf3drmt_assign ?val
+            (bf3drmt_struct_extract_ref ?src ?field ?reft))))
+    :ruleset rules)
+
+;; Run equality saturation
+(run-schedule (saturate rules))
+
+;; EXTRACTS HERE ;;

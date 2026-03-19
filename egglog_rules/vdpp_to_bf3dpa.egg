@@ -1,0 +1,126 @@
+(include "egglog_rules/base.egg")
+
+;;;; vdpp dialect (source — high cost) ;;;;
+;; Types
+(function vdpp_i1 () Type :cost 100)
+(function vdpp_i8 () Type :cost 100)
+(function vdpp_i16 () Type :cost 100)
+(function vdpp_i32 () Type :cost 100)
+(function vdpp_i64 () Type :cost 100)
+(function vdpp_ptr (Type) Type :cost 100)
+;; Struct type is encoded as an opaque MLIR type string to handle variable fields.
+(function vdpp_struct (String) Type :cost 100)
+
+;; Attributes
+(function vdpp_int (i64 Type) Attr :cost 100)
+(function vdpp_icmp_pred (i64) Attr :cost 100)
+(function vdpp_fence_dir (i64) Attr :cost 100)
+(function vdpp_index (i64) Attr :cost 100)
+
+;; Ops
+(function vdpp_constant (AttrPair Type) Op :cost 100)
+(function vdpp_add (Op Op Type) Op :cost 100)
+(function vdpp_sub (Op Op Type) Op :cost 100)
+(function vdpp_mul (Op Op Type) Op :cost 100)
+(function vdpp_div (Op Op Type) Op :cost 100)
+(function vdpp_udiv (Op Op Type) Op :cost 100)
+(function vdpp_and (Op Op Type) Op :cost 100)
+(function vdpp_or (Op Op Type) Op :cost 100)
+(function vdpp_xor (Op Op Type) Op :cost 100)
+(function vdpp_shl (Op Op Type) Op :cost 100)
+(function vdpp_lshr (Op Op Type) Op :cost 100)
+(function vdpp_ashr (Op Op Type) Op :cost 100)
+(function vdpp_icmp (Op Op AttrPair Type) Op :cost 100)
+(function vdpp_load (Op AttrPair Type) Op :cost 100)
+(function vdpp_store (Op Op AttrPair) Op :cost 100)
+(function vdpp_alloca (AttrPair Type) Op :cost 100)
+(function vdpp_getelementptr (Op Op Op Type) Op :cost 100)
+(function vdpp_cast (Op Type) Op :cost 100)
+(function vdpp_return (AttrPair) Op :cost 100)
+
+;;;; bf3dpa dialect (target — low cost) ;;;;
+;; Types
+(function bf3dpa_i1 () Type :cost 1)
+(function bf3dpa_i8 () Type :cost 1)
+(function bf3dpa_i16 () Type :cost 1)
+(function bf3dpa_i32 () Type :cost 1)
+(function bf3dpa_i64 () Type :cost 1)
+(function bf3dpa_ptr (Type) Type :cost 1)
+(function bf3dpa_struct (String) Type :cost 1)
+
+;; Attributes
+(function bf3dpa_int (i64 Type) Attr :cost 1)
+(function bf3dpa_icmp_pred (i64) Attr :cost 1)
+(function bf3dpa_fence_dir (i64) Attr :cost 1)
+
+;; Ops
+(function bf3dpa_constant (AttrPair Type) Op :cost 1)
+(function bf3dpa_add (Op Op Type) Op :cost 1)
+(function bf3dpa_sub (Op Op Type) Op :cost 1)
+(function bf3dpa_mul (Op Op Type) Op :cost 1)
+(function bf3dpa_div (Op Op Type) Op :cost 1)
+(function bf3dpa_udiv (Op Op Type) Op :cost 1)
+(function bf3dpa_and (Op Op Type) Op :cost 1)
+(function bf3dpa_or (Op Op Type) Op :cost 1)
+(function bf3dpa_xor (Op Op Type) Op :cost 1)
+(function bf3dpa_shl (Op Op Type) Op :cost 1)
+(function bf3dpa_lshr (Op Op Type) Op :cost 1)
+(function bf3dpa_ashr (Op Op Type) Op :cost 1)
+(function bf3dpa_icmp (Op Op AttrPair Type) Op :cost 1)
+(function bf3dpa_load (Op AttrPair Type) Op :cost 1)
+(function bf3dpa_store (Op Op AttrPair) Op :cost 1)
+(function bf3dpa_alloca (AttrPair Type) Op :cost 1)
+(function bf3dpa_getelementptr (Op Op Op Type) Op :cost 1)
+(function bf3dpa_cast (Op Type) Op :cost 1)
+(function bf3dpa_return (AttrPair) Op :cost 1)
+;; DPA-specific intrinsics (no vdpp counterpart — added structurally)
+(function bf3dpa_thread_fence (AttrPair) Op :cost 1)
+(function bf3dpa_thread_id () Op :cost 1)
+
+;; OPS HERE ;;
+
+;; RULES HERE ;;
+(ruleset rules)
+
+;; ── Type rewrites: vdpp → bf3dpa ───────────────────────────────────────────
+
+(rewrite (vdpp_i1)         (bf3dpa_i1)         :ruleset rules)
+(rewrite (vdpp_i8)         (bf3dpa_i8)         :ruleset rules)
+(rewrite (vdpp_i16)        (bf3dpa_i16)        :ruleset rules)
+(rewrite (vdpp_i32)        (bf3dpa_i32)        :ruleset rules)
+(rewrite (vdpp_i64)        (bf3dpa_i64)        :ruleset rules)
+(rewrite (vdpp_ptr ?t)     (bf3dpa_ptr ?t)     :ruleset rules)
+(rewrite (vdpp_struct ?s)  (bf3dpa_struct ?s)  :ruleset rules)
+
+;; ── Attr rewrites ──────────────────────────────────────────────────────────
+
+(rewrite (vdpp_int ?v ?t)       (bf3dpa_int ?v ?t)       :ruleset rules)
+(rewrite (vdpp_icmp_pred ?p)    (bf3dpa_icmp_pred ?p)     :ruleset rules)
+
+;; ── Op rewrites: 1-to-1 ────────────────────────────────────────────────────
+
+(rewrite (vdpp_constant ?attrs ?t)          (bf3dpa_constant ?attrs ?t)         :ruleset rules)
+(rewrite (vdpp_add ?l ?r ?t)               (bf3dpa_add ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_sub ?l ?r ?t)               (bf3dpa_sub ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_mul ?l ?r ?t)               (bf3dpa_mul ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_div ?l ?r ?t)               (bf3dpa_div ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_udiv ?l ?r ?t)              (bf3dpa_udiv ?l ?r ?t)              :ruleset rules)
+(rewrite (vdpp_and ?l ?r ?t)               (bf3dpa_and ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_or  ?l ?r ?t)               (bf3dpa_or  ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_xor ?l ?r ?t)               (bf3dpa_xor ?l ?r ?t)               :ruleset rules)
+(rewrite (vdpp_shl  ?v ?a ?t)              (bf3dpa_shl  ?v ?a ?t)             :ruleset rules)
+(rewrite (vdpp_lshr ?v ?a ?t)              (bf3dpa_lshr ?v ?a ?t)             :ruleset rules)
+(rewrite (vdpp_ashr ?v ?a ?t)              (bf3dpa_ashr ?v ?a ?t)             :ruleset rules)
+(rewrite (vdpp_icmp ?l ?r ?pred ?t)        (bf3dpa_icmp ?l ?r ?pred ?t)       :ruleset rules)
+(rewrite (vdpp_load ?ptr ?align ?t)        (bf3dpa_load ?ptr ?align ?t)       :ruleset rules)
+(rewrite (vdpp_store ?val ?ptr ?align)     (bf3dpa_store ?val ?ptr ?align)     :ruleset rules)
+(rewrite (vdpp_alloca ?align ?t)           (bf3dpa_alloca ?align ?t)           :ruleset rules)
+(rewrite (vdpp_getelementptr ?b ?i0 ?i1 ?t) (bf3dpa_getelementptr ?b ?i0 ?i1 ?t) :ruleset rules)
+(rewrite (vdpp_cast ?v ?t)                 (bf3dpa_cast ?v ?t)                 :ruleset rules)
+(rewrite (vdpp_return ?succ)               (bf3dpa_return ?succ)               :ruleset rules)
+
+;; ── Run equality saturation ────────────────────────────────────────────────
+
+(run-schedule (saturate rules))
+
+;; EXTRACTS HERE ;;
