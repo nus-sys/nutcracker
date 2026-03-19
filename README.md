@@ -35,6 +35,13 @@ To set up the required third-party dependencies, run the following commands:
    export EGGLOG="$PWD/third_party/egglog/target/release"
    ```
 
+   > The egglog rewrite rules live in `egglog_rules/`. The `NUTCRACKER_ROOT`
+   > environment variable tells the compiler where to find them when invoked
+   > from a different directory:
+   > ```bash
+   export NUTCRACKER_ROOT="$PWD"
+   ```
+
 4. **Set environment variable:**
    ```bash
    export PATH=$LLVM:$EGGLOG:$PATH
@@ -100,3 +107,30 @@ After pre-compilation, process your MLIR files with NutCracker:
 ```bash
 ./build/bin/nutcracker-opt <input.mlir> [options]
 ```
+
+## Building the Generated Pipeline
+
+After NutCracker runs, it produces a `vdsa_output/deploy/` directory containing
+the generated pipeline sources and a `meson.build` that references the runtime
+sources by relative path.
+
+**Prerequisites:** DOCA, DPDK, FlexIO, and ibverbs libraries must be installed
+(available via the BlueField BSP / DOCA SDK).
+
+```bash
+cd vdsa_output/deploy
+meson setup _build
+ninja -C _build
+```
+
+This produces the `nc_pipeline` executable, which runs the compiled P4 pipeline
+on the BlueField-3 DPU.
+
+> **Note:** The `meson.build` references the nutcracker runtime sources at a
+> relative path computed at compile time. If you move the `deploy/` directory,
+> set `NUTCRACKER_ROOT` before running NutCracker so the path is resolved
+> correctly:
+> ```bash
+> export NUTCRACKER_ROOT=/path/to/nutcracker
+> ./build/bin/nutcracker-opt <input.mlir> [options]
+> ```

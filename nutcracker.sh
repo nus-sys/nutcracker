@@ -26,6 +26,7 @@ P4_INCLUDE_DIR="$ROOT_DIR/p4include"
 # Tools
 P4MLIR_TRANSLATE="$P4C_DIR/build/p4mlir-translate"
 NUTCRACKER_OPT="$BUILD_DIR/bin/nutcracker-opt"
+MAPPER="$ROOT_DIR/deps/mapper/target/release/mapper"
 
 # ============================================================================
 # Helper Functions
@@ -338,6 +339,111 @@ run_partition_pass() {
     echo ""
 }
 
+run_fine_grained_lowering() {
+    local mlir_file=$1
+    local output_dir=$2
+
+    print_step "Step 4a: Fine-Grained Lowering (vDRMT → bf3drmt)"
+    print_substep "Partition dir: $output_dir"
+
+    if [ ! -f "$NUTCRACKER_OPT" ]; then
+        print_error "nutcracker-opt not found."
+        exit 1
+    fi
+
+    if [ ! -d "$output_dir" ]; then
+        print_error "Partition output directory not found: $output_dir"
+        return 1
+    fi
+
+    cd "$ROOT_DIR"
+
+    # Export NUTCRACKER_ROOT so the pass can find the egglog template
+    export NUTCRACKER_ROOT="$ROOT_DIR"
+
+    print_substep "Running vDRMT → bf3drmt pass..."
+    "$NUTCRACKER_OPT" --vdrmt-to-bf3drmt "$mlir_file" 2>&1
+    local result=$?
+
+    if [ $result -ne 0 ]; then
+        print_warning "vDRMT fine-grained lowering reported errors (continuing)"
+    fi
+
+    local bf3drmt_count=$(find "$output_dir" -name "bf3drmt.mlir" 2>/dev/null | wc -l)
+
+    if [ "$bf3drmt_count" -gt 0 ]; then
+        echo -e "    ${GREEN}✅ bf3drmt:${NC} $bf3drmt_count blocks"
+        for block_dir in "$output_dir"/block*; do
+            if [ -f "$block_dir/bf3drmt.mlir" ]; then
+                echo -e "      ${GREEN}→${NC} $(basename $block_dir)/bf3drmt.mlir"
+            fi
+        done
+    else
+        echo -e "    ${YELLOW}⚠️  bf3drmt:${NC} 0 blocks"
+    fi
+
+    echo ""
+    return 0
+}
+
+run_fine_grained_lowering_vdpp() {
+    local mlir_file=$1
+    local output_dir=$2
+
+    print_step "Step 4b: Fine-Grained Lowering (vDPP → bf3dpa)"
+    print_substep "Partition dir: $output_dir"
+
+    if [ ! -f "$NUTCRACKER_OPT" ]; then
+        print_error "nutcracker-opt not found."
+        exit 1
+    fi
+
+    if [ ! -d "$output_dir" ]; then
+        print_error "Partition output directory not found: $output_dir"
+        return 1
+    fi
+
+    # Check if any vdpp.mlir blocks exist
+    local vdpp_count=$(find "$output_dir" -name "vdpp.mlir" 2>/dev/null | wc -l)
+    if [ "$vdpp_count" -eq 0 ]; then
+        print_substep "No vDPP blocks found, skipping"
+        echo ""
+        return 0
+    fi
+
+    cd "$ROOT_DIR"
+    export NUTCRACKER_ROOT="$ROOT_DIR"
+
+    print_substep "Running vDPP → bf3dpa pass..."
+    "$NUTCRACKER_OPT" --vdpp-to-bf3dpa "$mlir_file" 2>&1
+    local result=$?
+
+    if [ $result -ne 0 ]; then
+        print_warning "vDPP fine-grained lowering reported errors (continuing)"
+    fi
+
+    local bf3dpa_count=$(find "$output_dir" -name "bf3dpa.mlir" 2>/dev/null | wc -l)
+
+    if [ "$bf3dpa_count" -gt 0 ]; then
+        echo -e "    ${CYAN}✅ bf3dpa:${NC} $bf3dpa_count blocks"
+        for block_dir in "$output_dir"/block*; do
+            if [ -f "$block_dir/bf3dpa.mlir" ]; then
+                echo -e "      ${CYAN}→${NC} $(basename $block_dir)/bf3dpa.mlir"
+            fi
+        done
+    else
+        echo -e "    ${YELLOW}⚠️  bf3dpa:${NC} 0 blocks"
+    fi
+
+    [ -f "$output_dir/dpa_handler.c" ] && \
+        echo -e "    ${CYAN}✅ dpa_handler.c generated${NC}"
+    [ -f "$output_dir/arm_handler.c" ] && \
+        echo -e "    ${CYAN}✅ arm_handler.c generated${NC}"
+
+    echo ""
+    return 0
+}
+
 run_lowering_passes() {
     local mlir_file=$1
     local output_dir=$2
@@ -409,16 +515,83 @@ run_lowering_passes() {
     return 0
 }
 
+run_emit_handler_code() {
+    local mlir_file=$1
+    local output_dir=$2
+
+    print_step "Step 5.5: Emit Handler Code (mapping-aware)"
+
+    if [ ! -f "$NUTCRACKER_OPT" ]; then
+        print_error "nutcracker-opt not found."
+        return 1
+    fi
+
+    cd "$ROOT_DIR"
+    export NUTCRACKER_ROOT="$ROOT_DIR"
+
+    "$NUTCRACKER_OPT" --emit-handler-code "$mlir_file" 2>&1
+    local result=$?
+
+    if [ $result -ne 0 ]; then
+        print_warning "emit-handler-code reported errors (continuing)"
+    fi
+
+    [ -f "$output_dir/nc_types.h"    ] && echo -e "    ${CYAN}✅ nc_types.h${NC}"
+    [ -f "$output_dir/dpa_handler.c" ] && echo -e "    ${CYAN}✅ dpa_handler.c${NC}"
+    [ -f "$output_dir/arm_handler.c" ] && echo -e "    ${CYAN}✅ arm_handler.c${NC}"
+    [ -f "$output_dir/Makefile"      ] && echo -e "    ${CYAN}✅ Makefile${NC}"
+    echo ""
+    return 0
+}
+
+run_mapper() {
+    local output_dir=$1
+    local mode=${2:-balanced}   # balanced | min-latency | max-throughput | min-energy
+    local mapper_egg="$output_dir/mapper.egg"
+
+    print_step "Step 5: Deployment Mapping (mapper)"
+    print_substep "Input:  $mapper_egg"
+    print_substep "Mode:   $mode"
+
+    if [ ! -f "$MAPPER" ]; then
+        print_warning "mapper binary not found: $MAPPER"
+        print_info  "Build it with: cd deps/mapper && cargo build --release"
+        return 0
+    fi
+
+    if [ ! -f "$mapper_egg" ]; then
+        print_warning "mapper.egg not found (fine-grained lowering may have failed)"
+        return 0
+    fi
+
+    local mapper_out="$output_dir/mapping.txt"
+    "$MAPPER" "$mapper_egg" --mode "$mode" --per-objective > "$mapper_out" 2>&1
+    local result=$?
+
+    if [ $result -ne 0 ]; then
+        print_error "Mapper failed (exit $result)"
+        cat "$mapper_out" >&2
+        return 1
+    fi
+
+    # Print the mapping result inline
+    cat "$mapper_out"
+
+    print_success "Mapping written to $mapper_out"
+    echo ""
+    return 0
+}
+
 generate_visualization() {
     local dot_file=$1
     local output_pdf=$2
-    
+
     if [ ! -f "$dot_file" ]; then
         print_warning "DOT file not found: $dot_file"
         return 1
     fi
-    
-    print_step "Step 4: Generating Control Flow Visualization"
+
+    print_step "Step 6: Generating Control Flow Visualization"
     
     if command -v dot &> /dev/null; then
         dot -Tpdf "$dot_file" -o "$output_pdf" 2>/dev/null
@@ -538,8 +711,20 @@ compile_app() {
     
     # Step 3: Lower to both vDRMT and vDPP
     run_lowering_passes "$mlir_file" "$output_dir"
-    
-    # Step 4: Visualize
+
+    # Step 4a: Fine-grained lowering: vDRMT → bf3drmt  +  mapper.egg generation
+    run_fine_grained_lowering "$mlir_file" "$output_dir"
+
+    # Step 4b: Fine-grained lowering: vDPP → bf3dpa (no codegen yet)
+    run_fine_grained_lowering_vdpp "$mlir_file" "$output_dir"
+
+    # Step 5: Deployment mapping
+    run_mapper "$output_dir" "${MAPPER_MODE:-balanced}"
+
+    # Step 5.5: Emit handler C code (mapping-aware)
+    run_emit_handler_code "$mlir_file" "$output_dir"
+
+    # Step 6: Visualize
     generate_visualization "$output_dir/dependency_graph.dot" "$output_dir/graph.pdf"
     
     print_header "Compilation Summary"
@@ -556,47 +741,60 @@ compile_app() {
         local block_id=0
         local vdrmt_count=0
         local vdpp_count=0
+        local bf3drmt_count=0
         local unmapped_count=0
-        
+
         for block_dir in "$output_dir"/block*; do
             if [ -f "$block_dir/metadata.json" ]; then
                 local ops=$(jq -r '.operations' "$block_dir/metadata.json" 2>/dev/null || echo "?")
                 local has_if=$(jq -r '.hasConditionalBranch' "$block_dir/metadata.json" 2>/dev/null || echo "false")
                 local has_table=$(jq -r '.hasTableApply' "$block_dir/metadata.json" 2>/dev/null || echo "false")
-                
+
                 echo -e "  ${CYAN}📦 Block $block_id:${NC} $ops ops"
                 [ "$has_if" = "true" ] && echo -e "    ${YELLOW}🔀${NC} Conditional branch"
                 [ "$has_table" = "true" ] && echo -e "    ${YELLOW}📊${NC} Table apply"
-                
+
                 local has_vdrmt=false
                 local has_vdpp=false
-                
+
                 if [ -f "$block_dir/vdrmt.mlir" ]; then
                     echo -e "    ${GREEN}✅ vDRMT (Match-Action)${NC}"
                     echo -e "    ${GREEN}📄 vdrmt.mlir${NC}"
                     has_vdrmt=true
-                    ((vdrmt_count++))
+                    vdrmt_count=$((vdrmt_count + 1))
                 fi
-                
+
+                if [ -f "$block_dir/bf3drmt.mlir" ]; then
+                    echo -e "    ${MAGENTA}✅ bf3drmt (BF3 NIC ASIC)${NC}"
+                    echo -e "    ${MAGENTA}📄 bf3drmt.mlir${NC}"
+                    bf3drmt_count=$((bf3drmt_count + 1))
+                fi
+
                 if [ -f "$block_dir/vdpp.mlir" ]; then
                     echo -e "    ${BLUE}✅ vDPP (Programmable)${NC}"
                     echo -e "    ${BLUE}📄 vdpp.mlir${NC}"
                     has_vdpp=true
-                    ((vdpp_count++))
+                    vdpp_count=$((vdpp_count + 1))
                 fi
-                
+
+                if [ -f "$block_dir/bf3dpa.mlir" ]; then
+                    echo -e "    ${CYAN}✅ bf3dpa (DPA/ARM)${NC}"
+                    echo -e "    ${CYAN}📄 bf3dpa.mlir${NC}"
+                fi
+
                 if [ "$has_vdrmt" = false ] && [ "$has_vdpp" = false ]; then
                     echo -e "    ${RED}❌ Not lowered to any target${NC}"
-                    ((unmapped_count++))
+                    unmapped_count=$((unmapped_count + 1))
                 fi
-                
+
                 echo ""
-                ((block_id++))
+                block_id=$((block_id + 1))
             fi
         done
-        
+
         echo -e "${BOLD}Lowering Summary:${NC}"
         echo -e "  ${GREEN}vDRMT blocks:${NC}    $vdrmt_count"
+        echo -e "  ${MAGENTA}bf3drmt blocks:${NC}  $bf3drmt_count"
         echo -e "  ${BLUE}vDPP blocks:${NC}     $vdpp_count"
         echo -e "  ${RED}Unmapped:${NC}        $unmapped_count"
         echo -e "  ${CYAN}Total blocks:${NC}    $block_id"
@@ -605,16 +803,23 @@ compile_app() {
         print_section "Generated Files"
         echo -e "${BLUE}📁${NC} $output_dir/"
         echo -e "  ${MAGENTA}📄${NC} dependency_graph.dot"
-        [ -f "$output_dir/graph.pdf" ] && echo -e "  ${MAGENTA}📄${NC} graph.pdf"
-        [ -f "$output_dir/graph.png" ] && echo -e "  ${MAGENTA}📄${NC} graph.png"
-        
+        [ -f "$output_dir/graph.pdf" ]   && echo -e "  ${MAGENTA}📄${NC} graph.pdf"
+        [ -f "$output_dir/graph.png" ]   && echo -e "  ${MAGENTA}📄${NC} graph.png"
+        [ -f "$output_dir/mapper.egg" ]           && echo -e "  ${CYAN}📄${NC} mapper.egg"
+        [ -f "$output_dir/mapping.txt" ]          && echo -e "  ${CYAN}📄${NC} mapping.txt"
+        [ -f "$output_dir/doca_flow_pipeline.c" ] && echo -e "  ${CYAN}📄${NC} doca_flow_pipeline.c"
+        [ -f "$output_dir/dpa_handler.c" ]       && echo -e "  ${CYAN}📄${NC} dpa_handler.c"
+        [ -f "$output_dir/arm_handler.c" ]       && echo -e "  ${CYAN}📄${NC} arm_handler.c"
+
         for block_dir in "$output_dir"/block*; do
             if [ -d "$block_dir" ]; then
                 local block_name=$(basename "$block_dir")
                 echo -e "  ${BLUE}📁${NC} $block_name/"
                 echo -e "    ${MAGENTA}📄${NC} p4hir.mlir"
-                [ -f "$block_dir/vdrmt.mlir" ] && echo -e "    ${GREEN}📄${NC} vdrmt.mlir"
-                [ -f "$block_dir/vdpp.mlir" ] && echo -e "    ${BLUE}📄${NC} vdpp.mlir"
+                [ -f "$block_dir/vdrmt.mlir" ]    && echo -e "    ${GREEN}📄${NC} vdrmt.mlir"
+                [ -f "$block_dir/bf3drmt.mlir" ]  && echo -e "    ${MAGENTA}📄${NC} bf3drmt.mlir"
+                [ -f "$block_dir/vdpp.mlir" ]     && echo -e "    ${BLUE}📄${NC} vdpp.mlir"
+                [ -f "$block_dir/bf3dpa.mlir" ]   && echo -e "    ${CYAN}📄${NC} bf3dpa.mlir"
                 echo -e "    ${MAGENTA}📄${NC} metadata.json"
             fi
         done
@@ -702,43 +907,66 @@ ${BOLD}COMMANDS:${NC}
     ${GREEN}❓ help${NC}               Show this help message
 
 ${BOLD}COMPILATION PIPELINE:${NC}
-    1. P4 → P4HIR MLIR           (p4mlir-translate) [precompile]
-    2. P4HIR → Basic Blocks      (p4hir-partition)  [compile]
-    3. P4HIR → vDRMT + vDPP      (both passes)      [compile]
-       - Each block tries both lowering passes
-       - vDRMT for simple match-action blocks
-       - vDPP for complex programmable blocks
-    4. Control Flow Graph        (graphviz)         [compile]
+    1. P4 → P4HIR MLIR              (p4mlir-translate)    [precompile]
+    2. P4HIR → Basic Blocks         (p4hir-partition)     [compile]
+    3. Coarse-grained lowering       (p4hir-to-vdrmt/vdpp) [compile]
+       - vDRMT: match-action blocks mapped to NIC ASIC pipeline
+       - vDPP:  programmable blocks mapped to DPA / ARM
+    4a. Fine-grained lowering (DRMT)  (vdrmt-to-bf3drmt)   [compile]
+       - DialEgg equality saturation rewrites vDRMT → bf3drmt ops
+       - Emits mapper.egg for the deployment optimizer
+    4b. Fine-grained lowering (DPA)  (vdpp-to-bf3dpa)     [compile]
+       - DialEgg equality saturation rewrites vDPP → bf3dpa ops
+       - Appends DPA blocks to mapper.egg
+       - Emits dpa_handler.c (FlexIO restricted C) + arm_handler.c
+    5. Deployment mapping            (mapper)             [compile]
+       - Multi-objective optimizer assigns blocks to hardware
+       - Optimizes for latency / throughput / energy
+       - Modes: balanced (default), min-latency, max-throughput, min-energy
+    6. Control Flow Graph            (graphviz)           [compile]
+
+${BOLD}OPTIONS:${NC}
+    MAPPER_MODE=<mode>  Set mapper optimization mode (default: balanced)
+                        Values: balanced | min-latency | max-throughput | min-energy
+                        Example: MAPPER_MODE=max-throughput $0 compile syn_flood
 
 ${BOLD}EXAMPLES:${NC}
-    $0 build                       # Build everything
-    $0 precompile-all              # P4 → MLIR for all apps
-    $0 compile simple_forwarding   # MLIR → vDRMT/vDPP
-    $0 run simple_forwarding       # Build + full compile
+    $0 build                                    # Build everything
+    $0 precompile-all                           # P4 → MLIR for all apps
+    $0 compile syn_flood                        # Full pipeline (balanced)
+    MAPPER_MODE=min-latency $0 compile syn_flood  # Optimize for latency
+    $0 run syn_flood                            # Build + full compile
 
 ${BOLD}WORKFLOW:${NC}
     # One-time setup
     $0 build
     $0 precompile-all
-    
+
     # Fast iteration
-    $0 compile simple_forwarding   # Uses cached MLIR
+    $0 compile syn_flood          # Uses cached MLIR
     # Edit pass, rebuild
     $0 build-nutcracker
-    $0 compile simple_forwarding   # Instant!
+    $0 compile syn_flood          # Instant!
 
 ${BOLD}OUTPUT STRUCTURE:${NC}
     apps/<app>/
     ├── <app>.p4              # Source
     └── <app>.mlir            # Precompiled (cached)
-    
+
     vdsa_output/
+    ├── mapper.egg            # Mapper input (all blocks, egglog form)
+    ├── mapping.txt           # Mapper output (optimal hw assignment)
+    ├── dependency_graph.dot  # Control-flow graph
+    ├── dpa_handler.c         # DPA event handler C (FlexIO restricted)
+    ├── arm_handler.c         # ARM handler C (standard C99)
     ├── block0/
-    │   ├── p4hir.mlir        # Partitioned
-    │   ├── vdrmt.mlir        # vDRMT lowered (if applicable)
-    │   ├── vdpp.mlir         # vDPP lowered (if applicable)
+    │   ├── p4hir.mlir        # Partitioned P4HIR
+    │   ├── vdrmt.mlir        # Coarse: vDRMT (match-action)
+    │   ├── bf3drmt.mlir      # Fine:   bf3drmt (NIC ASIC ops)
+    │   ├── vdpp.mlir         # Coarse: vDPP (programmable)
+    │   ├── bf3dpa.mlir       # Fine:   bf3dpa (DPA/ARM ops)
     │   └── metadata.json
-    └── dependency_graph.dot
+    └── block1/ ...
 
 EOF
 }
