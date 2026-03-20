@@ -15,6 +15,8 @@ set(LIBS
         MLIRVDRMTToBF3DRMTPass
         MLIRVDPPToBF3DPAPass
         MLIREmitHandlerCodePass
+        MLIRLLVMIRToVDPPPass
+        MLIRTargetLLVMIRImport
         #MLIRP4HIRToDPUPass
         #MLIRP4HIRToDRMTPass
         )

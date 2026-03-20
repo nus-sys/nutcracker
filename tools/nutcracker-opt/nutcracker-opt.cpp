@@ -13,6 +13,7 @@
 #include "Pass/VDRMTToBF3DRMTPass.h"
 #include "Pass/VDPPToBF3DPAPass.h"
 #include "Pass/EmitHandlerCodePass.h"
+#include "Pass/LLVMIRToVDPPPass.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -30,6 +31,7 @@ int main(int argc, char **argv) {
   mlir::registerVDRMTToBF3DRMTPass();
   mlir::registerVDPPToBF3DPAPass();
   mlir::registerEmitHandlerCodePass();
+  mlir::registerLLVMIRToVDPPPass();
 
   return mlir::asMainReturnCode(
         mlir::MlirOptMain(argc, argv, "NutCracker Compiler", registry)
