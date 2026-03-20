@@ -1,6 +1,6 @@
 // ============================================================================
 // File: lib/Pass/VDPPToBF3DPA/VDPPToBF3DPAPass.cpp
-// vDPP → bf3dpa Fine-Grained Lowering Pass (DialEgg-based)
+// vDPP → bf3dpa / arm.ll Fine-Grained Lowering Pass (DialEgg-based)
 //
 // Workflow:
 //   Phase 1 — op-level conversion via DialEgg:
@@ -9,12 +9,9 @@
 //     Control-flow ops (br, cond_br, return) are kept as opaque.
 //
 //   Phase 2 — write bf3dpa.mlir per block directory.
+//             write arm.ll per block directory (vDPP → LLVM IR for ARM).
 //
 //   Phase 3 — append DPA block entries to mapper.egg.
-//
-//   Phase 4 — emit dpa_handler.c (FlexIO restricted C for DPA event handlers).
-//
-//   Phase 5 — emit arm_handler.c (standard C for ARM cores).
 // ============================================================================
 
 #include <fstream>
@@ -33,6 +30,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include "Pass/VDPPToBF3DPAPass.h"
+#include "Pass/VDPPToLLVMPass.h"
 #include "Pass/Egglog.h"
 #include "Pass/Utils.h"
 #include "Dialect/vDPP/IR/vDPPDialect.h"
@@ -301,6 +299,41 @@ static LogicalResult runDialEggOnFunction(
             }
         }
     }
+
+    // Convert remaining vdpp control-flow ops to bf3dpa equivalents.
+    // These were skipped by egglog (can't reason about CF) but must be
+    // lowered before bf3dpa.mlir is valid.
+    mlir::OpBuilder builder(ctx);
+    for (mlir::Block &block : funcOp.getFunctionBody().getBlocks()) {
+        for (auto it = block.begin(); it != block.end(); ) {
+            mlir::Operation &op = *it++;
+
+            if (auto retOp = mlir::dyn_cast<vdpp::ReturnOp>(op)) {
+                builder.setInsertionPoint(&op);
+                if (auto succ = retOp.getSuccessor())
+                    builder.create<bf3dpa::ReturnOp>(retOp.getLoc(),
+                                                     (int32_t)*succ);
+                else
+                    builder.create<bf3dpa::ReturnOp>(retOp.getLoc());
+                retOp.erase();
+
+            } else if (auto brOp = mlir::dyn_cast<vdpp::BranchOp>(op)) {
+                builder.setInsertionPoint(&op);
+                builder.create<bf3dpa::BranchOp>(
+                    brOp.getLoc(), brOp.getDest(), brOp.getDestOperands());
+                brOp.erase();
+
+            } else if (auto condBr = mlir::dyn_cast<vdpp::CondBranchOp>(op)) {
+                builder.setInsertionPoint(&op);
+                builder.create<bf3dpa::CondBranchOp>(
+                    condBr.getLoc(), condBr.getCondition(),
+                    condBr.getTrueDest(), condBr.getFalseDest(),
+                    condBr.getTrueDestOperands(),
+                    condBr.getFalseDestOperands());
+                condBr.erase();
+            }
+        }
+    }
     return success();
 }
 
@@ -424,8 +457,27 @@ public:
                 llvm::errs() << "  ✗ Failed: " << dirName << "/bf3dpa.mlir\n";
                 return failure();
             }
-            successCount++;
             llvm::outs() << "  ✓ Generated " << dirName << "/bf3dpa.mlir\n";
+
+            // Also lower the original vDPP block to LLVM IR for the ARM target.
+            // Both bf3dpa.mlir and arm.ll represent the same block on different
+            // hardware — the mapper uses both to find the optimal assignment.
+            std::string armLLFile = path + "/arm.ll";
+            {
+                std::error_code EC;
+                llvm::raw_fd_ostream armOut(armLLFile, EC);
+                if (EC) {
+                    llvm::errs() << "  ✗ Cannot open " << armLLFile << "\n";
+                    return failure();
+                }
+                if (failed(emitVDPPAsLLVMIR(blockId, vdppFile, armOut))) {
+                    llvm::errs() << "  ✗ Failed: " << dirName << "/arm.ll\n";
+                    return failure();
+                }
+            }
+            llvm::outs() << "  ✓ Generated " << dirName << "/arm.ll\n";
+
+            successCount++;
         }
 
         llvm::outs() << "\n  Summary:\n"
