@@ -381,7 +381,7 @@ def IfOp : vDRMT_Op<"if", [
 
 def YieldOp : vDRMT_Op<"yield", [
     Pure,
-    ReturnLike, 
+    ReturnLike,
     Terminator,
     ParentOneOf<["IfOp", "TableActionOp"]>
 ]> {
@@ -421,9 +421,54 @@ def YieldOp : vDRMT_Op<"yield", [
 
     let arguments = (ins Variadic<AnyType>:$args);
     let assemblyFormat = "($args^ `:` type($args))? attr-dict";
-    
+
     let builders = [
         OpBuilder<(ins), [{ /* nothing to do */ }]>,
+    ];
+}
+
+def NextOp : vDRMT_Op<"next", [Pure]> {
+    let summary = "Chain to the next vDSA block; replaces successor attrs on return/if";
+    let description = [{
+        Unconditional: `vdrmt.next 1`         — always proceed to block 1.
+        Conditional:   `vdrmt.next %cond, 1, 2` — proceed to 1 if %cond is true,
+                                                   2 otherwise.
+
+        `vdrmt.next` is a routing annotation, NOT an MLIR-level block terminator.
+        It appears immediately before `vdrmt.return` (or `func.return`) in the
+        function body, and as the last op in `vdrmt.if` then/else regions
+        (which carry `NoTerminator`). The actual MLIR terminator of the function
+        block is always `vdrmt.return` / `func.return`.
+
+        This design avoids the two-terminator problem that would arise if
+        `vdrmt.next` also carried the `Terminator` trait alongside `func.return`.
+    }];
+
+    let arguments = (ins
+        Optional<I1>:$condition,
+        I32Attr:$then_successor,
+        OptionalAttr<I32Attr>:$else_successor
+    );
+
+    let assemblyFormat = [{
+        ($condition^ `,`)? $then_successor (`,` $else_successor^)? attr-dict
+    }];
+
+    let hasVerifier = 1;
+
+    let builders = [
+        // Unconditional form
+        OpBuilder<(ins "int32_t":$successor), [{
+            build($_builder, $_state, /*condition=*/mlir::Value{},
+                  $_builder.getI32IntegerAttr(successor), nullptr);
+        }]>,
+        // Conditional form
+        OpBuilder<(ins "mlir::Value":$condition,
+                       "int32_t":$thenSuccessor, "int32_t":$elseSuccessor), [{
+            build($_builder, $_state, condition,
+                  $_builder.getI32IntegerAttr(thenSuccessor),
+                  $_builder.getI32IntegerAttr(elseSuccessor));
+        }]>
     ];
 }
 
@@ -465,30 +510,26 @@ def TableActionOp : vDRMT_Op<"table_action",
 }
 
 def ReturnOp : vDRMT_Op<"return", [Pure, Terminator, ReturnLike]> {
-    let summary = "Return from function";
+    let summary = "Return from function (use vdrmt.next to specify block successor)";
     let description = [{
-        Returns from a function with optional successor hint.
-        
+        Returns from a function, optionally yielding values.
+        Block successor routing is expressed via a preceding `vdrmt.next` op,
+        not via attributes on return.
+
         Example:
         ```mlir
-        vdrmt.return {successor = 1 : i32}
+        vdrmt.next 1
+        vdrmt.return
         ```
     }];
-    
-    let arguments = (ins 
-        Variadic<AnyType>:$operands,
-        OptionalAttr<I32Attr>:$successor
-    );
-    
+
+    let arguments = (ins Variadic<AnyType>:$operands);
+
     let assemblyFormat = "($operands^ `:` type($operands))? attr-dict";
-    
+
     let builders = [
         OpBuilder<(ins), [{
-            build($_builder, $_state, std::nullopt, nullptr);
-        }]>,
-        OpBuilder<(ins "int32_t":$successorId), [{
-            build($_builder, $_state, std::nullopt, 
-                  $_builder.getI32IntegerAttr(successorId));
+            build($_builder, $_state, std::nullopt);
         }]>
     ];
 }

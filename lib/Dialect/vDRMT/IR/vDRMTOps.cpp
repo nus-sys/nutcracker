@@ -137,15 +137,19 @@ static LogicalResult ensureRegionTerm(OpAsmParser &parser, Region &region, SMLoc
     return success();
 }
 
-// True if the region's terminator should be omitted.
+// True if the region's terminator should be omitted when printing.
+// With NoTerminator regions (vdrmt.if), blocks may legally have no terminator-
+// trait op — e.g. when vdrmt.next (a Pure op) is the last op.  In that case
+// there is nothing to omit, so return false.
 static bool omitRegionTerm(mlir::Region &r) {
-    const auto singleNonEmptyBlock = r.hasOneBlock() && !r.back().empty();
-    const auto yieldsNothing = [&r]() {
-        auto y = dyn_cast<vdrmt::YieldOp>(r.back().getTerminator());
-        // YieldOp has no operands, so just check if it exists
-        return y != nullptr;
-    };
-    return singleNonEmptyBlock && yieldsNothing();
+    if (!r.hasOneBlock() || r.back().empty())
+        return false;
+    // Only omit if the block actually has a terminator-trait op and that op
+    // is a bare YieldOp (no operands).
+    if (!r.back().mightHaveTerminator())
+        return false;
+    auto y = dyn_cast<vdrmt::YieldOp>(r.back().getTerminator());
+    return y != nullptr;
 }
 
 //===----------------------------------------------------------------------===//
@@ -506,6 +510,22 @@ void vdrmt::IfOp::build(OpBuilder &builder, OperationState &result,
         builder.createBlock(elseRegion);
         elseBuilder(builder, result.location);
     }
+}
+
+//===----------------------------------------------------------------------===//
+// NextOp
+//===----------------------------------------------------------------------===//
+
+mlir::LogicalResult vdrmt::NextOp::verify() {
+    bool hasCondition = static_cast<bool>(getCondition());
+    bool hasElse = getElseSuccessor().has_value();
+    if (hasCondition && !hasElse)
+        return emitOpError(
+            "conditional next requires 'else_successor' to be set");
+    if (!hasCondition && hasElse)
+        return emitOpError(
+            "unconditional next must not have 'else_successor'");
+    return mlir::success();
 }
 
 #define GET_OP_CLASSES
