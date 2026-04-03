@@ -106,8 +106,9 @@ struct BlockMetadata {
   bool hasTableApply;
   bool hasMemoryAccess;
   bool canMapToVDRMT;
+  bool isTerminal = false;
   std::vector<std::string> accessedMemoryObjects;
-  
+
   static BlockMetadata loadFromJSON(StringRef jsonFile) {
     BlockMetadata meta;
     meta.blockId = -1;
@@ -129,6 +130,7 @@ struct BlockMetadata {
     if (auto table = obj->getBoolean("hasTableApply")) meta.hasTableApply = *table;
     if (auto mem = obj->getBoolean("hasMemoryAccess")) meta.hasMemoryAccess = *mem;
     if (auto canMap = obj->getBoolean("canMapToVDRMT")) meta.canMapToVDRMT = *canMap;
+    if (auto term = obj->getBoolean("isTerminal")) meta.isTerminal = *term;
     
     if (auto memObjs = obj->getArray("accessedMemoryObjects")) {
       for (auto &elem : *memObjs) {
@@ -1136,7 +1138,9 @@ public:
           llvm::errs() << "    ✗ Failed to load metadata for " << dirName << "\n";
           continue;
         }
-        
+
+        if (meta.isTerminal) continue;
+
         std::string p4hirFile = path + "/p4hir.mlir";
         std::string vdppFile = path + "/vdpp.mlir";
         

@@ -1,5 +1,6 @@
 add_mlir_library(MLIRBf3drmtToDocaFlowCodegen
   DocaFlowCodegen.cpp
+  DocaFlowTemplate.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/include/Pass

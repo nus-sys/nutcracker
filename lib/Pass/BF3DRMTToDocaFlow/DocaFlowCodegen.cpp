@@ -13,11 +13,17 @@
 //   bf3drmt.pipe_action @_hit  → fwd.next_pipe = g_pipes[N]
 //   bf3drmt.pipe_action @_miss → fwd_miss.next_pipe = g_pipes[N]
 //   bf3drmt.next -1            → fwd.type = DOCA_FLOW_FWD_PORT (egress)
+//   bf3drmt.copy_field         → DOCA_FLOW_ACTION_COPY action_desc
+//   bf3drmt.add_to_field       → DOCA_FLOW_ACTION_ADD action_desc
 //   bf3drmt.assign (FieldCopy) → DOCA_FLOW_ACTION_COPY action_desc
 //   bf3drmt.assign (Constant)  → actions.meta.u32[N] set per entry
+//
+// All DOCA API strings are loaded from a template file (doca-<ver>.toml) via
+// DocaFlowTemplate, so this file contains no hardcoded DOCA API literals.
 // ============================================================================
 
 #include "Pass/BF3DRMTToDocaFlowPass.h"
+#include "Pass/DocaFlowTemplate.h"
 
 #include <algorithm>
 #include <cctype>
@@ -96,7 +102,7 @@ static RefPath resolveRefChain(mlir::Value val) {
     }
 }
 
-// ── DOCA field lookup ────────────────────────────────────────────────────────
+// ── DOCA field lookup (template-backed) ──────────────────────────────────────
 
 struct DocaFieldInfo {
     std::string matchMember; ///< e.g. "outer.ip4.next_proto"
@@ -105,39 +111,17 @@ struct DocaFieldInfo {
     unsigned    widthBits;
 };
 
-static DocaFieldInfo lookupDocaField(const std::string &hdrType,
+/// Lookup DOCA field info from the loaded template.
+/// Falls back to a visible placeholder comment if the field is unknown.
+static DocaFieldInfo lookupDocaField(const DocaFlowTemplate &tmpl,
+                                     const std::string &hdrType,
                                      const std::string &fieldName) {
-    using K = std::pair<std::string, std::string>;
-    static const std::map<K, DocaFieldInfo> kTable = {
-        {{"ipv4_t","protocol"}, {"outer.ip4.next_proto", "outer.ipv4.next_proto",
-          "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    "
-          "match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;", 8}},
-        {{"ipv4_t","src_addr"}, {"outer.ip4.src_ip", "outer.ipv4.src_ip",
-          "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    "
-          "match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;", 32}},
-        {{"ipv4_t","dst_addr"}, {"outer.ip4.dst_ip", "outer.ipv4.dst_ip",
-          "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    "
-          "match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;", 32}},
-        {{"ipv4_t","ttl"},      {"outer.ip4.ttl", "outer.ipv4.ttl",
-          "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    "
-          "match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;", 8}},
-        {{"tcp_t","src_port"},  {"outer.tcp.l4_port.src_port", "outer.tcp.src_port",
-          "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;\n    "
-          "match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;", 16}},
-        {{"tcp_t","dst_port"},  {"outer.tcp.l4_port.dst_port", "outer.tcp.dst_port",
-          "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;\n    "
-          "match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;", 16}},
-        {{"udp_t","src_port"},  {"outer.udp.l4_port.src_port", "outer.udp.src_port",
-          "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;\n    "
-          "match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;", 16}},
-        {{"udp_t","dst_port"},  {"outer.udp.l4_port.dst_port", "outer.udp.dst_port",
-          "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;\n    "
-          "match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;", 16}},
-    };
-    auto it = kTable.find({hdrType, fieldName});
-    if (it != kTable.end()) return it->second;
-    return {"/* unknown:" + hdrType + "." + fieldName + " */",
-            "/* unknown:" + hdrType + "." + fieldName + " */", "", 32};
+    const DocaFlowTemplate::MatchFieldInfo *mfi =
+        tmpl.lookupMatchField(hdrType, fieldName);
+    if (mfi)
+        return {mfi->matchMember, mfi->fieldString, mfi->extraSetup, mfi->widthBits};
+    std::string unknown = "/* unknown:" + hdrType + "." + fieldName + " */";
+    return {unknown, unknown, "", 32};
 }
 
 static std::string maskForWidth(unsigned bits) {
@@ -229,8 +213,9 @@ static ActionValue resolveActionValue(mlir::Value val) {
 // ── Field string helpers ──────────────────────────────────────────────────────
 
 /// For metadata destinations: always "meta.data"; slot encoded via bit_offset.
-/// For header fields: looked up in the DOCA field table.
-static std::string refPathToDocaFieldStr(const RefPath &rp) {
+/// For header fields: looked up via the template.
+static std::string refPathToDocaFieldStr(const DocaFlowTemplate &tmpl,
+                                         const RefPath &rp) {
     if (!rp.valid() || rp.steps.empty()) return "/* unresolved */";
     if (rp.argIdx == 1)
         return "meta.data";
@@ -238,7 +223,7 @@ static std::string refPathToDocaFieldStr(const RefPath &rp) {
         std::string hdrType;
         if (auto hTy = mlir::dyn_cast<bf3drmt::HeaderType>(rp.steps[0].objectType))
             hdrType = hTy.getName().str();
-        return lookupDocaField(hdrType, rp.steps[1].fieldName).fieldString;
+        return lookupDocaField(tmpl, hdrType, rp.steps[1].fieldName).fieldString;
     }
     return "/* unresolved */";
 }
@@ -246,6 +231,7 @@ static std::string refPathToDocaFieldStr(const RefPath &rp) {
 // ── Code generation ───────────────────────────────────────────────────────────
 
 mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
+                               const DocaFlowTemplate &tmpl,
                                const std::map<int, int> &blockHwMap,
                                const std::map<int, int> &armQueueMap,
                                llvm::raw_ostream &out) {
@@ -426,33 +412,31 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             << " * Default rates: CIR=1Mpps, CBS=10000, EBS=10000 -- tune per use-case. */\n"
             << "static doca_error_t nc_init_shared_resources(struct doca_flow_port *port)\n"
             << "{\n"
-            << "    struct doca_flow_shared_resource_cfg cfg;\n"
+            << "    " << tmpl.render("shared_resource.meter.cfg_locals") << "\n"
             << "    doca_error_t result;\n\n";
         for (auto &md : allMeterDecls) {
             std::string upper = md.name;
             for (char &c : upper) c = (char)std::toupper((unsigned char)c);
             std::string szMacro = "NC_METER_" + upper + "_SIZE";
+            std::string limitType = tmpl.lookupEnum("meter_limit",
+                md.meterType == 0 ? "packets" : "bytes");
             out << "    /* Meter: " << md.name << " (" << szMacro << " slots, "
                 << (md.meterType == 0 ? "packets" : "bytes") << ") */\n"
                 << "    {\n"
                 << "        uint32_t ids[" << szMacro << "];\n"
                 << "        memset(&cfg, 0, sizeof(cfg));\n"
-                << "        cfg.domain = DOCA_FLOW_PIPE_DOMAIN_DEFAULT;\n"
-                << "        cfg.meter_cfg.limit_type = "
-                << (md.meterType == 0 ? "DOCA_FLOW_METER_LIMIT_TYPE_PACKETS"
-                                      : "DOCA_FLOW_METER_LIMIT_TYPE_BYTES") << ";\n"
-                << "        cfg.meter_cfg.cir = 1000000ULL;\n"
-                << "        cfg.meter_cfg.cbs = 10000;\n"
-                << "        cfg.meter_cfg.ebs = 10000;\n"
                 << "        for (uint32_t i = 0; i < " << szMacro << "; i++) {\n"
-                << "            result = doca_flow_shared_resource_cfg("
-                   "DOCA_FLOW_SHARED_RESOURCE_METER, i, &cfg);\n"
-                << "            if (result != DOCA_SUCCESS) return result;\n"
+                << "            " << tmpl.render("shared_resource.meter.cfg_set", {
+                    {"i",           "i"},
+                    {"limit_type",  limitType},
+                    {"cir",         "1000000ULL"},
+                    {"cbs",         "10000"},
+                }) << "\n"
                 << "            ids[i] = i;\n"
                 << "        }\n"
-                << "        result = doca_flow_shared_resources_bind("
-                   "DOCA_FLOW_SHARED_RESOURCE_METER, ids, " << szMacro << ", port);\n"
-                << "        if (result != DOCA_SUCCESS) return result;\n"
+                << "        " << tmpl.render("shared_resource.meter.bind", {
+                    {"n_meters", szMacro},
+                }) << "\n"
                 << "    }\n\n";
         }
         out << "    return DOCA_SUCCESS;\n}\n\n";
@@ -464,17 +448,18 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         bf3drmt::PipeOp pipeOp = pr.pipeOp;
         std::string pipeName = "NC_BLOCK" + std::to_string(id);
 
-        std::string pipeTypeStr = "DOCA_FLOW_PIPE_BASIC";
+        std::string pipeTypeKey = "basic";
         switch (pipeOp.getPipeType()) {
-            case bf3drmt::BF3DRMTPipeType::Acl:     pipeTypeStr = "DOCA_FLOW_PIPE_ACL";     break;
-            case bf3drmt::BF3DRMTPipeType::Control: pipeTypeStr = "DOCA_FLOW_PIPE_CONTROL"; break;
-            case bf3drmt::BF3DRMTPipeType::Hash:    pipeTypeStr = "DOCA_FLOW_PIPE_HASH";    break;
-            case bf3drmt::BF3DRMTPipeType::Lpm:     pipeTypeStr = "DOCA_FLOW_PIPE_LPM";     break;
+            case bf3drmt::BF3DRMTPipeType::Acl:     pipeTypeKey = "acl";     break;
+            case bf3drmt::BF3DRMTPipeType::Control: pipeTypeKey = "control"; break;
+            case bf3drmt::BF3DRMTPipeType::Hash:    pipeTypeKey = "hash";    break;
+            case bf3drmt::BF3DRMTPipeType::Lpm:     pipeTypeKey = "lpm";     break;
             default: break;
         }
+        std::string pipeTypeStr = tmpl.lookupEnum("pipe_type", pipeTypeKey);
 
         struct MatchField  { DocaFieldInfo doca; unsigned widthBits; };
-        struct AssignSlot  { RefPath dst; ActionValue value; };
+        struct AssignSlot  { RefPath dst; ActionValue value; bool isAddToField = false; };
         struct RegAccess {
             std::string instance;
             bool        isWrite;
@@ -513,7 +498,9 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                         if (auto hTy = mlir::dyn_cast<bf3drmt::HeaderType>(
                                 rp.steps[0].objectType))
                             hdrType = hTy.getName().str();
-                        auto doca = lookupDocaField(hdrType, rp.steps[1].fieldName);
+                        // Skip P4 validity flags — they are not real packet fields.
+                        if (rp.steps[1].fieldName == "__valid") return;
+                        auto doca = lookupDocaField(tmpl, hdrType, rp.steps[1].fieldName);
                         if (!doca.extraSetup.empty() &&
                             extraMatchSetup.find(doca.extraSetup) == std::string::npos)
                             extraMatchSetup += doca.extraSetup + "\n    ";
@@ -534,7 +521,9 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                         if (auto hTy = mlir::dyn_cast<bf3drmt::HeaderType>(
                                 rp.steps[0].objectType))
                             hdrType = hTy.getName().str();
-                        auto doca = lookupDocaField(hdrType, rp.steps[1].fieldName);
+                        // Skip P4 validity flags — they are not real packet fields.
+                        if (rp.steps[1].fieldName == "__valid") return;
+                        auto doca = lookupDocaField(tmpl, hdrType, rp.steps[1].fieldName);
                         if (!doca.extraSetup.empty() &&
                             extraMatchSetup.find(doca.extraSetup) == std::string::npos)
                             extraMatchSetup += doca.extraSetup + "\n    ";
@@ -552,7 +541,16 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                         ar.nextBlock = (int)nextOp.getSuccessor();
                     else if (auto assignOp = mlir::dyn_cast<bf3drmt::AssignOp>(&aop))
                         ar.assigns.push_back({resolveRefChain(assignOp.getRef()),
-                                              resolveActionValue(assignOp.getValue())});
+                                              resolveActionValue(assignOp.getValue()), false});
+                    else if (auto addOp = mlir::dyn_cast<bf3drmt::AddToFieldOp>(&aop)) {
+                        ActionValue av;
+                        av.kind         = ActionValue::Kind::FieldCopy;
+                        av.srcRef       = resolveRefChain(addOp.getSrcRef());
+                        av.copyLowBit   = (int)addOp.getSrcOffset();
+                        av.copyHighBit  = (int)addOp.getSrcOffset() + (int)addOp.getWidth() - 1;
+                        av.copyWidth    = (unsigned)addOp.getWidth();
+                        ar.assigns.push_back({resolveRefChain(addOp.getDstRef()), av, true});
+                    }
                     else if (auto cntOp = mlir::dyn_cast<bf3drmt::CounterCountOp>(&aop))
                         ar.counterInstance = cntOp.getInstance().str();
                     else if (auto meterOp = mlir::dyn_cast<bf3drmt::MeterExecuteOp>(&aop))
@@ -646,32 +644,31 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             out << "\n";
         }
 
-        // Action descriptors (field-to-field copy)
+        // Action descriptors: copy_field / add_to_field / assign(FieldCopy)
         if (hasActionDescs) {
-            out << "    /* Action descriptors: field-to-field copy */\n";
+            out << "    /* Action descriptors */\n";
             int di = 0;
             for (auto &ar : actionRegions) {
                 for (auto &sl : ar.assigns) {
                     if (sl.value.kind != ActionValue::Kind::FieldCopy &&
                         sl.value.kind != ActionValue::Kind::FieldCopyMasked)
                         continue;
-                    std::string srcStr = refPathToDocaFieldStr(sl.value.srcRef);
-                    std::string dstStr = refPathToDocaFieldStr(sl.dst);
+                    std::string srcStr = refPathToDocaFieldStr(tmpl, sl.value.srcRef);
+                    std::string dstStr = refPathToDocaFieldStr(tmpl, sl.dst);
                     std::string dstBitOff = "0";
                     if (sl.dst.valid() && sl.dst.argIdx == 1 && !sl.dst.steps.empty())
                         dstBitOff = "META_U32_BIT_OFFSET("
                                     + std::to_string(sl.dst.steps[0].fieldIdx) + ")";
-                    out << "    desc_array[" << di << "].type = DOCA_FLOW_ACTION_COPY;\n"
-                        << "    desc_array[" << di << "].field_op.src.field_string = \""
-                        << srcStr << "\";\n"
-                        << "    desc_array[" << di << "].field_op.src.bit_offset = "
-                        << sl.value.copyLowBit << ";\n"
-                        << "    desc_array[" << di << "].field_op.dst.field_string = \""
-                        << dstStr << "\";\n"
-                        << "    desc_array[" << di << "].field_op.dst.bit_offset = "
-                        << dstBitOff << ";\n"
-                        << "    desc_array[" << di << "].field_op.width = "
-                        << sl.value.copyWidth << ";\n";
+                    // Determine descriptor kind from op type (copy vs add)
+                    bool isAdd = sl.isAddToField;
+                    std::string descKey = isAdd ? "action_desc.add" : "action_desc.copy";
+                    out << tmpl.render(descKey, {
+                        {"i",          std::to_string(di)},
+                        {"src_field",  srcStr},
+                        {"dst_field",  dstStr},
+                        {"src_offset", std::to_string(sl.value.copyLowBit)},
+                        {"dst_offset", dstBitOff},
+                    }) << "\n";
                     if (sl.dst.valid() && sl.dst.argIdx == 1 && !sl.dst.steps.empty())
                         out << "    actions.meta.u32[" << sl.dst.steps[0].fieldIdx
                             << "] = UINT32_MAX;\n";
@@ -687,42 +684,32 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             for (auto &sl : ar.assigns) {
                 if (sl.value.kind != ActionValue::Kind::Constant) continue;
                 if (sl.dst.valid() && sl.dst.argIdx == 1 && !sl.dst.steps.empty())
-                    out << "    actions.meta.u32[" << sl.dst.steps[0].fieldIdx
-                        << "] = UINT32_MAX; /* mask: constant set per entry */\n";
+                    out << "    " << tmpl.render("action_desc.set_meta", {
+                        {"idx", std::to_string(sl.dst.steps[0].fieldIdx)},
+                        {"val", "UINT32_MAX"},
+                    }) << " /* mask: constant set per entry */\n";
             }
 
         // Pipe creation
-        out << "\n    result = doca_flow_pipe_cfg_create(&pipe_cfg, port);\n"
-            << "    if (result != DOCA_SUCCESS) {\n"
-            << "        DOCA_LOG_ERR(\"Block" << id
-            << ": pipe_cfg_create failed: %s\", doca_error_get_descr(result));\n"
-            << "        return result;\n"
-            << "    }\n\n"
-            << "    result = doca_flow_pipe_cfg_set_name(pipe_cfg, \"" << pipeName << "\");\n"
-            << "    if (result != DOCA_SUCCESS) goto destroy;\n"
-            << "    result = doca_flow_pipe_cfg_set_type(pipe_cfg, " << pipeTypeStr << ");\n"
-            << "    if (result != DOCA_SUCCESS) goto destroy;\n"
-            << "    result = doca_flow_pipe_cfg_set_is_root(pipe_cfg, "
-            << (hasTableKey ? "true" : "false") << ");\n"
-            << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
-        if (isHashPipe) {
-            out << "    result = doca_flow_pipe_cfg_set_match(pipe_cfg, NULL, "
-                << (matchFields.empty() ? "NULL" : "&match_mask") << ");\n"
-                << "    if (result != DOCA_SUCCESS) goto destroy;\n"
-                << "    result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, "
-                << nrEntries << ");\n"
-                << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
-        } else {
-            out << "    result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);\n"
-                << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
-        }
-        if (hasActionDescs)
-            out << "    result = doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr,"
-                   " NULL, descs_arr, NB_ACTIONS_ARR);\n";
+        out << "\n" << tmpl.render("pipe.cfg_create", {
+            {"name",      pipeName},
+            {"pipe_type", pipeTypeStr},
+            {"nr_entries",std::to_string(nrEntries)},
+        }) << "\n";
+
+        if (hasTableKey)
+            out << tmpl.render("pipe.cfg_set_root") << "\n";
+
+        if (isHashPipe)
+            out << tmpl.render(matchFields.empty()
+                    ? "pipe.cfg_set_match_with_mask"   // NULL match_mask
+                    : "pipe.cfg_set_match_with_mask") << "\n";
         else
-            out << "    result = doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr,"
-                   " NULL, NULL, NB_ACTIONS_ARR);\n";
-        out << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
+            out << tmpl.render("pipe.cfg_set_match_no_mask") << "\n";
+
+        out << tmpl.render("pipe.cfg_set_actions", {
+            {"descs_arr_ptr", hasActionDescs ? "&descs" : "NULL"},
+        }) << "\n";
 
         // Monitor: counter and/or meter
         if (hasCounter || hasMeter) {
@@ -730,17 +717,13 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             if (hasCounter) out << "per-entry hardware counter (@" << pipeCounterInstance << ")";
             if (hasCounter && hasMeter) out << " + ";
             if (hasMeter)   out << "shared meter (@" << pipeMeterInstance << ")";
-            out << " */\n"
-                << "    {\n"
-                << "        struct doca_flow_monitor monitor;\n"
-                << "        memset(&monitor, 0, sizeof(monitor));\n";
+            out << " */\n    {\n";
+            out << "        " << tmpl.render("monitor.locals") << "\n";
             if (hasCounter)
-                out << "        monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;\n";
+                out << "        " << tmpl.render("monitor.set_counter") << "\n";
             if (hasMeter)
-                out << "        monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;\n";
-            out << "        result = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);\n"
-                << "        if (result != DOCA_SUCCESS) goto destroy;\n"
-                << "    }\n\n";
+                out << "        " << tmpl.render("monitor.set_meter") << "\n";
+            out << tmpl.render("pipe.cfg_set_monitor") << "\n    }\n\n";
 
             if (hasMeter) {
                 out << "    /* Meter action template: bind shared meter (res_id overridden per entry) */\n"
@@ -752,7 +735,7 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         // Fwd / fwd_miss
         int hitNext = -1, missNext = -1, defaultNext = -1;
         for (auto &ar : actionRegions) {
-            if (ar.actionSym == "_hit")      hitNext     = ar.nextBlock;
+            if (ar.actionSym == "_hit")          hitNext     = ar.nextBlock;
             else if (ar.actionSym == "_miss")    missNext    = ar.nextBlock;
             else if (ar.actionSym == "_default") defaultNext = ar.nextBlock;
         }
@@ -760,47 +743,44 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
 
         auto emitFwd = [&](const std::string &var, int nextId) {
             if (nextId == -1) {
-                // Egress: send to the other port (port_id ^ 1 is the DOCA convention
-                // for VNF/hairpin setups where port 0 and port 1 are paired).
-                out << "    " << var << ".type = DOCA_FLOW_FWD_PORT;\n"
-                    << "    " << var << ".port_id = port_id ^ 1;\n";
+                out << "    " << tmpl.render("fwd.port", {{"var", var}}) << "\n";
                 return;
             }
             auto hwIt = blockHwMap.find(nextId);
-            int hw = (hwIt != blockHwMap.end()) ? hwIt->second : 0; // default DRMT
-            if (hw == 2) { // ARM: RSS to the entrypoint's dedicated queue
+            int hw = (hwIt != blockHwMap.end()) ? hwIt->second : 0;
+            if (hw == 2) { // ARM
                 auto qIt = armQueueMap.find(nextId);
                 int qidx = (qIt != armQueueMap.end()) ? qIt->second : 0;
-                out << "    " << var << ".type = DOCA_FLOW_FWD_RSS;\n"
+                out << "    " << tmpl.render("fwd.rss", {
+                    {"var", var}, {"l4", "UDP | DOCA_FLOW_RSS_TCP"},
+                }) << "\n"
                     << "    " << var << ".rss_queues = (uint16_t[]){ " << qidx
                     << " }; /* ARM block " << nextId << " queue */\n"
-                    << "    " << var << ".num_of_queues = 1;\n"
-                    << "    " << var << ".rss_outer_flags = DOCA_FLOW_RSS_IPV4"
-                    << " | DOCA_FLOW_RSS_UDP | DOCA_FLOW_RSS_TCP;\n";
-            } else if (hw == 1) { // DPA: RSS to dedicated queue NC_DPA_QUEUE_BASE+id
-                out << "    " << var << ".type = DOCA_FLOW_FWD_RSS;\n"
+                    << "    " << var << ".num_of_queues = 1;\n";
+            } else if (hw == 1) { // DPA
+                out << "    " << tmpl.render("fwd.rss", {
+                    {"var", var}, {"l4", "UDP | DOCA_FLOW_RSS_TCP"},
+                }) << "\n"
                     << "    " << var << ".rss_queues = (uint16_t[]){ (uint16_t)"
                     << "(NC_DPA_QUEUE_BASE + " << nextId << ") };"
                     << " /* DPA block " << nextId << " */\n"
-                    << "    " << var << ".num_of_queues = 1;\n"
-                    << "    " << var << ".rss_outer_flags = DOCA_FLOW_RSS_IPV4"
-                    << " | DOCA_FLOW_RSS_UDP | DOCA_FLOW_RSS_TCP;\n";
-            } else { // DRMT: chain to next DRMT pipe
-                out << "    " << var << ".type = DOCA_FLOW_FWD_PIPE;\n"
-                    << "    " << var << ".next_pipe = g_pipes[" << nextId
-                    << "]; /* block " << nextId << " */\n";
+                    << "    " << var << ".num_of_queues = 1;\n";
+            } else { // DRMT pipe chain
+                out << "    " << tmpl.render("fwd.pipe", {
+                    {"var",     var},
+                    {"next_id", std::to_string(nextId)},
+                }) << " /* block " << nextId << " */\n";
             }
         };
 
         emitFwd("fwd", mainNext);
-        if (hasMiss || (hasTableKey && missNext >= 0)) {
-            out << "\n";
-            emitFwd("fwd_miss", missNext);
-        }
+        bool hasMissFwd = hasMiss || (hasTableKey && missNext >= 0);
+        if (hasMissFwd) { out << "\n"; emitFwd("fwd_miss", missNext); }
 
-        out << "\n    result = doca_flow_pipe_create(pipe_cfg, &fwd, "
-            << ((hasMiss || (hasTableKey && missNext >= 0)) ? "&fwd_miss" : "NULL")
-            << ", &g_pipes[" << id << "]);\n"
+        out << "\n" << tmpl.render("pipe.create", {
+            {"id",           std::to_string(id)},
+            {"miss_fwd_ptr", hasMissFwd ? "&fwd_miss" : "NULL"},
+        }) << "\n"
             << "destroy:\n"
             << "    doca_flow_pipe_cfg_destroy(pipe_cfg);\n"
             << "    return result;\n"
@@ -815,7 +795,6 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             << "    memset(&actions, 0, sizeof(actions));\n\n";
 
         if (isHashPipe) {
-            // Hash pipe: add one entry per hash bucket using doca_flow_pipe_hash_add_entry.
             out << "    actions.action_idx = 0;\n\n"
                 << "    /* Add one entry per hash bucket */\n"
                 << "    for (uint32_t i = 0; i < " << nrEntries << "; i++) {\n";
@@ -824,10 +803,12 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                     << "        actions.shared.type = DOCA_FLOW_SHARED_RESOURCE_METER;\n"
                     << "        actions.shared.res_id = i;\n";
             }
-            out << "        result = doca_flow_pipe_hash_add_entry(i, g_pipes[" << id
-                << "], NULL, &actions, NULL, NULL,\n"
-                << "                                               DOCA_FLOW_NO_WAIT, status, &entry);\n"
-                << "        if (result != DOCA_SUCCESS) return result;\n"
+            out << "        " << tmpl.render("entry.add_hash", {
+                {"id",          std::to_string(id)},
+                {"hash_idx",    "i"},
+                {"monitor_ptr", "NULL"},
+                {"flags",       tmpl.get("entry.flags_nowait")},
+            }) << "\n"
                 << "    }\n"
                 << "    return DOCA_SUCCESS;\n"
                 << "}\n\n";
@@ -840,8 +821,10 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                 for (auto &sl : ar.assigns) {
                     if (sl.value.kind != ActionValue::Kind::Constant) continue;
                     if (sl.dst.valid() && sl.dst.argIdx == 1 && !sl.dst.steps.empty()) {
-                        out << "    actions.meta.u32[" << sl.dst.steps[0].fieldIdx
-                            << "] = " << sl.value.constVal << ";\n";
+                        out << "    " << tmpl.render("action_desc.set_meta", {
+                            {"idx", std::to_string(sl.dst.steps[0].fieldIdx)},
+                            {"val", std::to_string(sl.value.constVal)},
+                        }) << "\n";
                         hasEntryActions = true;
                     }
                 }
@@ -852,9 +835,11 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                 out << "    /* TODO: set match fields to runtime key values */\n";
 
             out << "\n    actions.action_idx = 0;\n"
-                << "    result = doca_flow_pipe_add_entry(0, g_pipes[" << id
-                << "], &match, &actions, NULL, NULL,\n"
-                << "                                     DOCA_FLOW_NO_WAIT, status, &entry);\n"
+                << "    " << tmpl.render("entry.add", {
+                    {"id",          std::to_string(id)},
+                    {"monitor_ptr", "NULL"},
+                    {"flags",       tmpl.get("entry.flags_nowait")},
+                }) << "\n"
                 << "    return result;\n"
                 << "}\n\n";
         }
@@ -971,6 +956,18 @@ mlir::LogicalResult generateDocaFlowCode(
     llvm::StringRef outDir,
     const std::map<int, int> &blockHwMap,
     const std::map<int, int> &armQueueMap) {
+
+    // Load DOCA version template
+    const char *ncRoot = std::getenv("NUTCRACKER_ROOT");
+    std::string root = ncRoot ? ncRoot : ".";
+    auto tmplOrErr = DocaFlowTemplate::loadDefault(root);
+    if (!tmplOrErr) {
+        llvm::errs() << "  ✗ Failed to load DOCA template: "
+                     << llvm::toString(tmplOrErr.takeError()) << "\n"
+                     << "    Set DOCA_TEMPLATE=<path> or NUTCRACKER_ROOT=<root>\n";
+        return mlir::failure();
+    }
+
     std::string outPath = (outDir + "/doca_flow_pipeline.c").str();
     std::error_code EC;
     llvm::raw_fd_ostream out(outPath, EC);
@@ -979,7 +976,7 @@ mlir::LogicalResult generateDocaFlowCode(
                      << ": " << EC.message() << "\n";
         return mlir::failure();
     }
-    return doGenerate(ctx, inputDir, blockHwMap, armQueueMap, out);
+    return doGenerate(ctx, inputDir, *tmplOrErr, blockHwMap, armQueueMap, out);
 }
 
 } // namespace mlir
