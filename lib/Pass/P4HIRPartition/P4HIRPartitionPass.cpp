@@ -32,6 +32,37 @@ using namespace P4::P4MLIR::P4HIR;
 namespace {
 
 // ============================================================================
+// Packet-derivation check (P4HIR level)
+// ============================================================================
+
+/// Return false if v's def-chain contains a stateful read (call_method whose
+/// leaf name is "read" or "execute").  Block arguments — which represent
+/// hdr/meta values at block boundaries — are conservatively packet-derived.
+///
+/// This is intentionally shallow: we trace through arithmetic/cast/extract
+/// ops but not through memory references (load/store on struct fields).  That
+/// keeps the analysis sound for the common case and is the "simple" starting
+/// point the architecture calls for.
+static bool isPacketDerivedP4HIR(Value v, DenseSet<Value> &visited) {
+    if (!visited.insert(v).second) return true; // cycle guard
+    Operation *def = v.getDefiningOp();
+    if (!def) return true; // block argument → conservatively packet-derived
+    if (auto callOp = dyn_cast<CallMethodOp>(def)) {
+        StringRef leaf = callOp.getCallee().getLeafReference();
+        // "read"    — register / direct stateful read
+        // "execute" — meter execute, returns color derived from state
+        if (leaf == "read" || leaf == "execute")
+            return false;
+        // Other call_methods (hash5tuple.apply, count, …) are pure
+        // packet-function calls and do not introduce state dependency.
+    }
+    for (Value operand : def->getOperands())
+        if (!isPacketDerivedP4HIR(operand, visited))
+            return false;
+    return true;
+}
+
+// ============================================================================
 // Exit Information - NEW!
 // ============================================================================
 
@@ -169,13 +200,99 @@ struct BasicBlock {
     determineMapping();
   }
   
+  /// Return false if any stateful call_method in `root` has a non-packet-derived
+  /// index argument.  Used to check both direct ops and callee bodies.
+  static bool statefulOpsAllPacketDerived(Operation *root) {
+    bool ok = true;
+    root->walk([&](CallMethodOp callOp) {
+      StringRef leaf = callOp.getCallee().getLeafReference();
+      if (leaf != "read" && leaf != "write" && leaf != "execute")
+        return WalkResult::advance();
+      auto args = callOp.getArgOperands();
+      if (args.empty()) return WalkResult::advance();
+      DenseSet<Value> visited;
+      if (!isPacketDerivedP4HIR(args[0], visited)) {
+        ok = false;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    return ok;
+  }
+
   void determineMapping() {
+    // bf3drmt is the concrete target for vDRMT blocks.  It handles counter
+    // and meter sharing natively in hardware, and uses hardware-level packet
+    // distribution for registers.  So vDRMT is always a valid target.
     capability.canMapToVDRMT = true;
+
+    // bf3dpa is the concrete target for vDPP blocks (ARM cores).  Multiple
+    // cores run in parallel with no hardware packet-sharding assist, so any
+    // stateful op whose index is NOT derived from packet fields alone could
+    // produce conflicting accesses across cores.
+    //
+    // Simple rule: if any stateful op (register read/write, meter execute) in
+    // this block (or in a directly called P4 action) uses a non-packet-derived
+    // index, the block cannot map to vDPP.
     capability.canMapToVDPP = true;
-    
-    if (memoryScope == SharedNonPartitionable) {
-      capability.canMapToVDRMT = false;
-      capability.reason = "vDRMT does not support shared non-partitionable memory";
+
+    if (operations.empty()) return;
+
+    // Find the enclosing ControlOp so we can resolve p4hir.call callees.
+    ControlOp enclosingControl =
+        operations[0]->getParentOfType<ControlOp>();
+
+    // Flatten nested ops (IfOp regions, etc.) for the scan.
+    SmallVector<Operation *> allOps;
+    for (auto *op : operations) {
+      allOps.push_back(op);
+      op->walk([&](Operation *nested) {
+        if (nested != op) allOps.push_back(nested);
+      });
+    }
+
+    for (auto *op : allOps) {
+      // ── Direct stateful call_method ────────────────────────────────────────
+      if (auto callOp = dyn_cast<CallMethodOp>(op)) {
+        StringRef leaf = callOp.getCallee().getLeafReference();
+        if (leaf == "read" || leaf == "write" || leaf == "execute") {
+          auto args = callOp.getArgOperands();
+          if (!args.empty()) {
+            DenseSet<Value> visited;
+            if (!isPacketDerivedP4HIR(args[0], visited)) {
+              capability.canMapToVDPP = false;
+              capability.reason =
+                  "stateful op index not packet-derived; "
+                  "bf3dpa requires packet-shardable indices";
+              return;
+            }
+          }
+        }
+        continue;
+      }
+
+      // ── Indirect: p4hir.call @action() — resolve one level ────────────────
+      // P4 actions are declared as p4hir.func inside the enclosing control.
+      // Walk the control to find the body and apply the same check.
+      if (auto callOp = dyn_cast<CallOp>(op)) {
+        if (!enclosingControl) continue;
+        StringRef callee = callOp.getCallee();
+        FuncOp actionFunc;
+        enclosingControl.walk([&](FuncOp f) {
+          if (f.getSymName() == callee) {
+            actionFunc = f;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+        if (actionFunc && !statefulOpsAllPacketDerived(actionFunc)) {
+          capability.canMapToVDPP = false;
+          capability.reason =
+              "stateful op in called action has non-packet-derived index; "
+              "bf3dpa requires packet-shardable indices";
+          return;
+        }
+      }
     }
   }
 };
