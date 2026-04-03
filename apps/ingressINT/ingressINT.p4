@@ -4,17 +4,6 @@
 #include "nc.p4"
 
 // ============================================================================
-// Extern Definitions
-// ============================================================================
-
-/// Register extern - stateful storage
-extern Register<V, I> {
-    Register(bit<32> size);
-    void write(in I index, in V value);
-    void read(out V value, in I index);
-}
-
-// ============================================================================
 // Type Definitions
 // ============================================================================
 
@@ -171,7 +160,7 @@ control MainControl(
     // Register Instantiation
     // ========================================================================
     
-    Register<bloom_filter_value_t, bloom_filter_index_t>(BLOOM_FILTER_ENTRIES) bloom_filter;
+    Register<bloom_filter_value_t>(BLOOM_FILTER_ENTRIES) bloom_filter;
     
     // ========================================================================
     // Actions - Bloom Filter Operations
@@ -190,7 +179,7 @@ control MainControl(
     
     action read_bloom_counter() {
         // Read counter value from bloom filter
-        bloom_filter.read(meta.bloom_counter, meta.bloom_index);
+        meta.bloom_counter = bloom_filter.read(meta.bloom_index);
     }
     
     action increment_bloom_counter() {
