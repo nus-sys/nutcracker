@@ -563,4 +563,38 @@ def BF3DRMT_MeterExecuteOp : BF3DRMT_Op<"meter.execute"> {
     let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($color) attr-dict";
 }
 
+//===----------------------------------------------------------------------===//
+// Register (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def BF3DRMT_RegisterDeclOp : BF3DRMT_Op<"register_decl", [Symbol]> {
+    let summary = "Declare a BF3 stateful register array";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$element_width
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DRMT_RegisterReadOp : BF3DRMT_Op<"register.read"> {
+    let summary = "Read one element from a BF3 register array";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($result) attr-dict";
+}
+
+def BF3DRMT_RegisterWriteOp : BF3DRMT_Op<"register.write"> {
+    let summary = "Write one element into a BF3 register array";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index,
+        AnyInteger:$value
+    );
+    let assemblyFormat = "$instance `[` $index `]` `=` $value `:` type($index) `,` type($value) attr-dict";
+}
+
 #endif // BF3DRMTOPS

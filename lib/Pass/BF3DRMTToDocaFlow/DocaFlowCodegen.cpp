@@ -20,6 +20,7 @@
 #include "Pass/BF3DRMTToDocaFlowPass.h"
 
 #include <algorithm>
+#include <cctype>
 #include <map>
 #include <set>
 #include <string>
@@ -287,6 +288,37 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
     });
     int nPipes = (int)pipes.size();
 
+    // ── Collect counter / meter declarations from all modules ──────────────
+    struct CounterDeclInfo  { std::string name; int32_t size; };
+    struct MeterDeclInfo    { std::string name; int32_t size; int32_t meterType; };
+    struct RegisterDeclInfo { std::string name; int32_t size; int32_t elementWidth; };
+    std::vector<CounterDeclInfo>  allCounterDecls;
+    std::vector<MeterDeclInfo>    allMeterDecls;
+    std::vector<RegisterDeclInfo> allRegisterDecls;
+    {
+        std::set<std::string> seenC, seenM, seenR;
+        for (auto &pr : pipes) {
+            pr.module->walk([&](bf3drmt::CounterDeclOp op) {
+                std::string n = op.getSymName().str();
+                if (seenC.insert(n).second)
+                    allCounterDecls.push_back({n, (int32_t)op.getSize()});
+            });
+            pr.module->walk([&](bf3drmt::MeterDeclOp op) {
+                std::string n = op.getSymName().str();
+                if (seenM.insert(n).second)
+                    allMeterDecls.push_back({n, (int32_t)op.getSize(),
+                                            (int32_t)op.getMeterType()});
+            });
+            pr.module->walk([&](bf3drmt::RegisterDeclOp op) {
+                std::string n = op.getSymName().str();
+                if (seenR.insert(n).second)
+                    allRegisterDecls.push_back({n, (int32_t)op.getSize(),
+                                               (int32_t)op.getElementWidth()});
+            });
+        }
+    }
+    bool hasAnyMeters = !allMeterDecls.empty();
+
     // g_pipes must be indexed by block ID (not pipe count).
     // Find the max DRMT block ID so the array covers all valid indices.
     int maxDrmtBlockId = -1;
@@ -341,6 +373,91 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         << "/* g_pipes indexed by block ID (size = max DRMT block ID + 1) */\n"
         << "static struct doca_flow_pipe *g_pipes[" << gPipesSize << "];\n\n";
 
+    // ── Counter declarations ───────────────────────────────────────────────
+    if (!allCounterDecls.empty()) {
+        out << "/* === Per-entry hardware counters (non-shared, one per pipe entry) === */\n";
+        for (auto &cd : allCounterDecls) {
+            // Convert name to upper-case macro prefix
+            std::string upper = cd.name;
+            for (char &c : upper) c = (char)std::toupper((unsigned char)c);
+            out << "#define NC_COUNTER_" << upper << "_SIZE " << cd.size << "\n";
+        }
+        out << "\n";
+    }
+
+    // ── Register declarations ──────────────────────────────────────────────
+    if (!allRegisterDecls.empty()) {
+        out << "/* === Stateful register arrays ===\n"
+            << " * NOTE: On BF3 hardware these require DPA-side backing.\n"
+            << " * The arrays below are CPU-accessible stubs for simulation.\n"
+            << " * Replace NC_REG_READ / NC_REG_WRITE with DPA calls in production.\n"
+            << " */\n";
+        for (auto &rd : allRegisterDecls) {
+            std::string upper = rd.name;
+            for (char &c : upper) c = (char)std::toupper((unsigned char)c);
+            int byteWidth = (rd.elementWidth + 7) / 8;
+            // Choose the smallest standard C type that fits.
+            std::string ctype = (byteWidth <= 1) ? "uint8_t"
+                              : (byteWidth <= 2) ? "uint16_t"
+                              : (byteWidth <= 4) ? "uint32_t" : "uint64_t";
+            out << "#define NC_REG_" << upper << "_SIZE " << rd.size << "\n";
+            out << "static " << ctype << " nc_reg_" << rd.name
+                << "[NC_REG_" << upper << "_SIZE];\n";
+            out << "#define NC_REG_READ_"  << upper << "(idx) nc_reg_" << rd.name << "[(idx)]\n";
+            out << "#define NC_REG_WRITE_" << upper << "(idx, val) (nc_reg_" << rd.name << "[(idx)] = (val))\n";
+        }
+        out << "\n";
+    }
+
+    // ── Meter declarations + init function ────────────────────────────────
+    if (hasAnyMeters) {
+        out << "/* === Shared meter resources (DOCA_FLOW_SHARED_RESOURCE_METER) === */\n";
+        for (auto &md : allMeterDecls) {
+            std::string upper = md.name;
+            for (char &c : upper) c = (char)std::toupper((unsigned char)c);
+            out << "#define NC_METER_" << upper << "_SIZE " << md.size
+                << " /* meter_type=" << md.meterType
+                << (md.meterType == 0 ? " (packets)" : " (bytes)") << " */\n";
+        }
+        out << "\n";
+
+        out << "/* Initialize all shared meter resources on the given port.\n"
+            << " * Call once from nc_setup_pipeline before creating pipes.\n"
+            << " * Default rates: CIR=1Mpps, CBS=10000, EBS=10000 -- tune per use-case. */\n"
+            << "static doca_error_t nc_init_shared_resources(struct doca_flow_port *port)\n"
+            << "{\n"
+            << "    struct doca_flow_shared_resource_cfg cfg;\n"
+            << "    doca_error_t result;\n\n";
+        for (auto &md : allMeterDecls) {
+            std::string upper = md.name;
+            for (char &c : upper) c = (char)std::toupper((unsigned char)c);
+            std::string szMacro = "NC_METER_" + upper + "_SIZE";
+            out << "    /* Meter: " << md.name << " (" << szMacro << " slots, "
+                << (md.meterType == 0 ? "packets" : "bytes") << ") */\n"
+                << "    {\n"
+                << "        uint32_t ids[" << szMacro << "];\n"
+                << "        memset(&cfg, 0, sizeof(cfg));\n"
+                << "        cfg.domain = DOCA_FLOW_PIPE_DOMAIN_DEFAULT;\n"
+                << "        cfg.meter_cfg.limit_type = "
+                << (md.meterType == 0 ? "DOCA_FLOW_METER_LIMIT_TYPE_PACKETS"
+                                      : "DOCA_FLOW_METER_LIMIT_TYPE_BYTES") << ";\n"
+                << "        cfg.meter_cfg.cir = 1000000ULL;\n"
+                << "        cfg.meter_cfg.cbs = 10000;\n"
+                << "        cfg.meter_cfg.ebs = 10000;\n"
+                << "        for (uint32_t i = 0; i < " << szMacro << "; i++) {\n"
+                << "            result = doca_flow_shared_resource_cfg("
+                   "DOCA_FLOW_SHARED_RESOURCE_METER, i, &cfg);\n"
+                << "            if (result != DOCA_SUCCESS) return result;\n"
+                << "            ids[i] = i;\n"
+                << "        }\n"
+                << "        result = doca_flow_shared_resources_bind("
+                   "DOCA_FLOW_SHARED_RESOURCE_METER, ids, " << szMacro << ", port);\n"
+                << "        if (result != DOCA_SUCCESS) return result;\n"
+                << "    }\n\n";
+        }
+        out << "    return DOCA_SUCCESS;\n}\n\n";
+    }
+
     // ── Per-pipe functions ─────────────────────────────────────────────────
     for (auto &pr : pipes) {
         int id = pr.blockId;
@@ -358,10 +475,19 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
 
         struct MatchField  { DocaFieldInfo doca; unsigned widthBits; };
         struct AssignSlot  { RefPath dst; ActionValue value; };
+        struct RegAccess {
+            std::string instance;
+            bool        isWrite;
+            ActionValue index;  // array index
+            ActionValue value;  // for writes: value to write
+        };
         struct ActionRegion {
             std::string actionSym;
             int nextBlock;
             std::vector<AssignSlot> assigns;
+            std::string counterInstance; // non-empty if action has bf3drmt.counter.count
+            std::string meterInstance;   // non-empty if action has bf3drmt.meter.execute
+            std::vector<RegAccess> registerAccesses; // register.read / register.write ops
         };
 
         std::vector<MatchField>   matchFields;
@@ -369,30 +495,52 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         bool        hasTableKey = false;
         std::string extraMatchSetup;
 
+        bool isHashPipe = (pipeOp.getPipeType() == bf3drmt::BF3DRMTPipeType::Hash);
+        int32_t nrEntries = pipeOp.getNrEntries().value_or(64);
+
         auto &body = pipeOp.getBody().front();
         for (auto &op : body) {
             if (auto tkOp = mlir::dyn_cast<bf3drmt::TableKeyOp>(&op)) {
                 hasTableKey = true;
-                tkOp.getBody().front().walk([&](bf3drmt::MatchKeyOp mkOp) {
-                    auto *kDef = mkOp.getKey().getDefiningOp();
-                    if (!kDef) return;
-                    mlir::Value refToRead;
-                    if (auto rd = mlir::dyn_cast<bf3drmt::ReadOp>(kDef))
-                        refToRead = rd.getRef();
-                    if (!refToRead) return;
-                    RefPath rp = resolveRefChain(refToRead);
-                    if (!rp.valid() || rp.argIdx != 0 || rp.steps.size() < 2)
-                        return;
-                    std::string hdrType;
-                    if (auto hTy = mlir::dyn_cast<bf3drmt::HeaderType>(
-                            rp.steps[0].objectType))
-                        hdrType = hTy.getName().str();
-                    auto doca = lookupDocaField(hdrType, rp.steps[1].fieldName);
-                    if (!doca.extraSetup.empty() &&
-                        extraMatchSetup.find(doca.extraSetup) == std::string::npos)
-                        extraMatchSetup += doca.extraSetup + "\n    ";
-                    matchFields.push_back({doca, doca.widthBits});
-                });
+                if (isHashPipe) {
+                    // For hash pipes, collect ALL ReadOps in the table_key region
+                    // (each Read corresponds to one hash function input field).
+                    tkOp.getBody().front().walk([&](bf3drmt::ReadOp rdOp) {
+                        RefPath rp = resolveRefChain(rdOp.getRef());
+                        if (!rp.valid() || rp.argIdx != 0 || rp.steps.size() < 2)
+                            return;
+                        std::string hdrType;
+                        if (auto hTy = mlir::dyn_cast<bf3drmt::HeaderType>(
+                                rp.steps[0].objectType))
+                            hdrType = hTy.getName().str();
+                        auto doca = lookupDocaField(hdrType, rp.steps[1].fieldName);
+                        if (!doca.extraSetup.empty() &&
+                            extraMatchSetup.find(doca.extraSetup) == std::string::npos)
+                            extraMatchSetup += doca.extraSetup + "\n    ";
+                        matchFields.push_back({doca, doca.widthBits});
+                    });
+                } else {
+                    tkOp.getBody().front().walk([&](bf3drmt::MatchKeyOp mkOp) {
+                        auto *kDef = mkOp.getKey().getDefiningOp();
+                        if (!kDef) return;
+                        mlir::Value refToRead;
+                        if (auto rd = mlir::dyn_cast<bf3drmt::ReadOp>(kDef))
+                            refToRead = rd.getRef();
+                        if (!refToRead) return;
+                        RefPath rp = resolveRefChain(refToRead);
+                        if (!rp.valid() || rp.argIdx != 0 || rp.steps.size() < 2)
+                            return;
+                        std::string hdrType;
+                        if (auto hTy = mlir::dyn_cast<bf3drmt::HeaderType>(
+                                rp.steps[0].objectType))
+                            hdrType = hTy.getName().str();
+                        auto doca = lookupDocaField(hdrType, rp.steps[1].fieldName);
+                        if (!doca.extraSetup.empty() &&
+                            extraMatchSetup.find(doca.extraSetup) == std::string::npos)
+                            extraMatchSetup += doca.extraSetup + "\n    ";
+                        matchFields.push_back({doca, doca.widthBits});
+                    });
+                }
                 continue;
             }
             if (auto paOp = mlir::dyn_cast<bf3drmt::PipeActionOp>(&op)) {
@@ -405,6 +553,24 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                     else if (auto assignOp = mlir::dyn_cast<bf3drmt::AssignOp>(&aop))
                         ar.assigns.push_back({resolveRefChain(assignOp.getRef()),
                                               resolveActionValue(assignOp.getValue())});
+                    else if (auto cntOp = mlir::dyn_cast<bf3drmt::CounterCountOp>(&aop))
+                        ar.counterInstance = cntOp.getInstance().str();
+                    else if (auto meterOp = mlir::dyn_cast<bf3drmt::MeterExecuteOp>(&aop))
+                        ar.meterInstance = meterOp.getInstance().str();
+                    else if (auto regRead = mlir::dyn_cast<bf3drmt::RegisterReadOp>(&aop)) {
+                        RegAccess ra;
+                        ra.instance = regRead.getInstance().str();
+                        ra.isWrite  = false;
+                        ra.index    = resolveActionValue(regRead.getIndex());
+                        ar.registerAccesses.push_back(std::move(ra));
+                    } else if (auto regWrite = mlir::dyn_cast<bf3drmt::RegisterWriteOp>(&aop)) {
+                        RegAccess ra;
+                        ra.instance = regWrite.getInstance().str();
+                        ra.isWrite  = true;
+                        ra.index    = resolveActionValue(regWrite.getIndex());
+                        ra.value    = resolveActionValue(regWrite.getValue());
+                        ar.registerAccesses.push_back(std::move(ra));
+                    }
                 }
                 actionRegions.push_back(std::move(ar));
                 continue;
@@ -423,6 +589,17 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         bool hasMiss = false;
         for (auto &ar : actionRegions)
             if (ar.actionSym == "_miss") hasMiss = true;
+
+        // Detect counter / meter / register usage in action bodies
+        bool hasCounter  = false;
+        bool hasMeter    = false;
+        bool hasRegister = false;
+        std::string pipeCounterInstance, pipeMeterInstance;
+        for (auto &ar : actionRegions) {
+            if (!ar.counterInstance.empty())    { hasCounter  = true; pipeCounterInstance = ar.counterInstance; }
+            if (!ar.meterInstance.empty())      { hasMeter    = true; pipeMeterInstance   = ar.meterInstance; }
+            if (!ar.registerAccesses.empty())   { hasRegister = true; }
+        }
 
         // ── nc_create_pipe_N(port, port_id) ──────────────────────────────
         out << "/* ── Block " << id << ": " << pipeName
@@ -452,14 +629,19 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                 << "    memset(&descs,     0, sizeof(descs));\n";
         out << "\n";
 
-        // Match fields
+        // Match / match_mask fields
+        // Hash pipe: fields go into match_mask (hash function selection), not match.
         if (!matchFields.empty()) {
-            out << "    /* Match key fields */\n";
+            std::string matchVar = isHashPipe ? "match_mask" : "match";
+            out << "    /* " << (isHashPipe ? "Hash function fields (match_mask)" : "Match key fields") << " */\n";
+            if (isHashPipe)
+                out << "    struct doca_flow_match match_mask;\n"
+                    << "    memset(&match_mask, 0, sizeof(match_mask));\n";
             if (!extraMatchSetup.empty())
                 out << "    " << extraMatchSetup << "\n";
             for (auto &mf : matchFields)
                 if (!mf.doca.matchMember.empty())
-                    out << "    match." << mf.doca.matchMember
+                    out << "    " << matchVar << "." << mf.doca.matchMember
                         << " = " << maskForWidth(mf.widthBits) << ";\n";
             out << "\n";
         }
@@ -522,9 +704,18 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             << "    if (result != DOCA_SUCCESS) goto destroy;\n"
             << "    result = doca_flow_pipe_cfg_set_is_root(pipe_cfg, "
             << (hasTableKey ? "true" : "false") << ");\n"
-            << "    if (result != DOCA_SUCCESS) goto destroy;\n\n"
-            << "    result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);\n"
             << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
+        if (isHashPipe) {
+            out << "    result = doca_flow_pipe_cfg_set_match(pipe_cfg, NULL, "
+                << (matchFields.empty() ? "NULL" : "&match_mask") << ");\n"
+                << "    if (result != DOCA_SUCCESS) goto destroy;\n"
+                << "    result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, "
+                << nrEntries << ");\n"
+                << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
+        } else {
+            out << "    result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);\n"
+                << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
+        }
         if (hasActionDescs)
             out << "    result = doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr,"
                    " NULL, descs_arr, NB_ACTIONS_ARR);\n";
@@ -532,6 +723,31 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             out << "    result = doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr,"
                    " NULL, NULL, NB_ACTIONS_ARR);\n";
         out << "    if (result != DOCA_SUCCESS) goto destroy;\n\n";
+
+        // Monitor: counter and/or meter
+        if (hasCounter || hasMeter) {
+            out << "    /* Monitor: ";
+            if (hasCounter) out << "per-entry hardware counter (@" << pipeCounterInstance << ")";
+            if (hasCounter && hasMeter) out << " + ";
+            if (hasMeter)   out << "shared meter (@" << pipeMeterInstance << ")";
+            out << " */\n"
+                << "    {\n"
+                << "        struct doca_flow_monitor monitor;\n"
+                << "        memset(&monitor, 0, sizeof(monitor));\n";
+            if (hasCounter)
+                out << "        monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;\n";
+            if (hasMeter)
+                out << "        monitor.meter_type = DOCA_FLOW_RESOURCE_TYPE_SHARED;\n";
+            out << "        result = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);\n"
+                << "        if (result != DOCA_SUCCESS) goto destroy;\n"
+                << "    }\n\n";
+
+            if (hasMeter) {
+                out << "    /* Meter action template: bind shared meter (res_id overridden per entry) */\n"
+                    << "    actions.shared.type = DOCA_FLOW_SHARED_RESOURCE_METER;\n"
+                    << "    actions.shared.res_id = UINT32_MAX; /* wildcard mask */\n\n";
+            }
+        }
 
         // Fwd / fwd_miss
         int hitNext = -1, missNext = -1, defaultNext = -1;
@@ -593,35 +809,89 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         // ── nc_add_pipe_N_entry() ──────────────────────────────────────────
         out << "static doca_error_t nc_add_pipe_" << id
             << "_entry(struct entries_status *status)\n{\n"
-            << "    struct doca_flow_match match;\n"
             << "    struct doca_flow_actions actions;\n"
             << "    struct doca_flow_pipe_entry *entry;\n"
             << "    doca_error_t result;\n\n"
-            << "    memset(&match,   0, sizeof(match));\n"
             << "    memset(&actions, 0, sizeof(actions));\n\n";
 
-        bool hasEntryActions = false;
-        for (auto &ar : actionRegions)
-            for (auto &sl : ar.assigns) {
-                if (sl.value.kind != ActionValue::Kind::Constant) continue;
-                if (sl.dst.valid() && sl.dst.argIdx == 1 && !sl.dst.steps.empty()) {
-                    out << "    actions.meta.u32[" << sl.dst.steps[0].fieldIdx
-                        << "] = " << sl.value.constVal << ";\n";
-                    hasEntryActions = true;
+        if (isHashPipe) {
+            // Hash pipe: add one entry per hash bucket using doca_flow_pipe_hash_add_entry.
+            out << "    actions.action_idx = 0;\n\n"
+                << "    /* Add one entry per hash bucket */\n"
+                << "    for (uint32_t i = 0; i < " << nrEntries << "; i++) {\n";
+            if (hasMeter) {
+                out << "        /* Bind shared meter slot i to bucket i */\n"
+                    << "        actions.shared.type = DOCA_FLOW_SHARED_RESOURCE_METER;\n"
+                    << "        actions.shared.res_id = i;\n";
+            }
+            out << "        result = doca_flow_pipe_hash_add_entry(i, g_pipes[" << id
+                << "], NULL, &actions, NULL, NULL,\n"
+                << "                                               DOCA_FLOW_NO_WAIT, status, &entry);\n"
+                << "        if (result != DOCA_SUCCESS) return result;\n"
+                << "    }\n"
+                << "    return DOCA_SUCCESS;\n"
+                << "}\n\n";
+        } else {
+            out << "    struct doca_flow_match match;\n"
+                << "    memset(&match, 0, sizeof(match));\n\n";
+
+            bool hasEntryActions = false;
+            for (auto &ar : actionRegions)
+                for (auto &sl : ar.assigns) {
+                    if (sl.value.kind != ActionValue::Kind::Constant) continue;
+                    if (sl.dst.valid() && sl.dst.argIdx == 1 && !sl.dst.steps.empty()) {
+                        out << "    actions.meta.u32[" << sl.dst.steps[0].fieldIdx
+                            << "] = " << sl.value.constVal << ";\n";
+                        hasEntryActions = true;
+                    }
+                }
+
+            if (!hasEntryActions && matchFields.empty())
+                out << "    /* No match key or constant actions for this block */\n";
+            else if (!matchFields.empty())
+                out << "    /* TODO: set match fields to runtime key values */\n";
+
+            out << "\n    actions.action_idx = 0;\n"
+                << "    result = doca_flow_pipe_add_entry(0, g_pipes[" << id
+                << "], &match, &actions, NULL, NULL,\n"
+                << "                                     DOCA_FLOW_NO_WAIT, status, &entry);\n"
+                << "    return result;\n"
+                << "}\n\n";
+        }
+
+        // ── nc_pipe_N_reg_ops(): software-side register accesses ────────────
+        // DOCA Flow has no native stateful register primitive; register read/write
+        // ops must run in a software packet handler (e.g. DPA thread or ARM callback).
+        // This stub shows what operations the block performs so you can call it from
+        // the appropriate handler.
+        if (hasRegister) {
+            // Helper: render an ActionValue as a C expression string.
+            auto avToStr = [&](const ActionValue &av, const std::string &placeholder) -> std::string {
+                if (av.kind == ActionValue::Kind::Constant)
+                    return std::to_string(av.constVal);
+                return placeholder;
+            };
+
+            out << "/* Register ops for block " << id << " – call from packet processing handler */\n"
+                << "static inline void nc_pipe_" << id << "_reg_ops"
+                << "(uint32_t idx, uint32_t val)\n{\n"
+                << "    (void)idx; (void)val;\n";
+            for (auto &ar : actionRegions) {
+                for (auto &ra : ar.registerAccesses) {
+                    std::string upper = ra.instance;
+                    for (char &c : upper) c = (char)std::toupper((unsigned char)c);
+                    std::string idxStr = avToStr(ra.index, "idx");
+                    if (ra.isWrite) {
+                        std::string valStr = avToStr(ra.value, "val");
+                        out << "    NC_REG_WRITE_" << upper << "(" << idxStr
+                            << ", " << valStr << ");\n";
+                    } else {
+                        out << "    (void)NC_REG_READ_" << upper << "(" << idxStr << ");\n";
+                    }
                 }
             }
-
-        if (!hasEntryActions && matchFields.empty())
-            out << "    /* No match key or constant actions for this block */\n";
-        else if (!matchFields.empty())
-            out << "    /* TODO: set match fields to runtime key values */\n";
-
-        out << "\n    actions.action_idx = 0;\n"
-            << "    result = doca_flow_pipe_add_entry(0, g_pipes[" << id
-            << "], &match, &actions, NULL, NULL,\n"
-            << "                                     DOCA_FLOW_NO_WAIT, status, &entry);\n"
-            << "    return result;\n"
-            << "}\n\n";
+            out << "}\n\n";
+        }
     }
 
     // ── nc_setup_pipeline() ────────────────────────────────────────────────
@@ -659,8 +929,17 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
     out << "/* ── Pipeline setup ──────────────────────────────────────────── */\n"
         << "doca_error_t nc_setup_pipeline(struct doca_flow_port *port, int port_id,\n"
         << "                               struct entries_status *status)\n{\n"
-        << "    doca_error_t result;\n\n"
-        << "    /* Create pipes in reverse topological order (leaves first) */\n";
+        << "    doca_error_t result;\n\n";
+    if (hasAnyMeters) {
+        out << "    /* Initialize shared meter resources before creating pipes */\n"
+            << "    result = nc_init_shared_resources(port);\n"
+            << "    if (result != DOCA_SUCCESS) {\n"
+            << "        DOCA_LOG_ERR(\"Failed to init shared resources: %s\","
+               " doca_error_get_descr(result));\n"
+            << "        return result;\n"
+            << "    }\n\n";
+    }
+    out << "    /* Create pipes in reverse topological order (leaves first) */\n";
     for (int id : createOrder) {
         out << "    result = nc_create_pipe_" << id << "(port, port_id);\n"
             << "    if (result != DOCA_SUCCESS) {\n"
