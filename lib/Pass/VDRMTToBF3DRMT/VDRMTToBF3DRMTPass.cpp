@@ -1136,26 +1136,131 @@ private:
         std::string name;
         std::string kind;                    // "counter","register","meter","hash5tuple"
         std::vector<int> accessingBlocks;
-        bool indexFromHash = false;
+        bool allInputsPacketDerived = true;  // false if any input traces to a stateful read
+        std::string shardingKey;             // canonical fingerprint of the index expr
+        bool shardingKeyConsistent = true;   // false if blocks use different index exprs
         MemoryLocality locality = MemoryLocality::Local;
     };
 
-    /// Walk SSA def-chain to check whether 'v' originates from a
-    /// vdrmt.hash5tuple.apply result (direct or through casts / arithmetic).
-    static bool isIndexFromHash(Value v) {
+    /// Walk the SSA def-chain of 'v' and return false if any input is derived
+    /// from a stateful read (RegisterReadOp or MeterExecuteOp).
+    ///
+    /// Rationale: if a stateful op's inputs (index or write value) are purely
+    /// packet-derived, the hardware can insert packet steering rules to shard
+    /// the stateful memory across ports/engines. If any input traces to another
+    /// stateful read the routing decision would itself depend on state, making
+    /// sharding impossible.
+    ///
+    /// Block arguments are conservatively treated as packet-derived: at block
+    /// boundaries, values come from hdr/meta which are populated from the packet
+    /// before any stateful reads execute in that block.
+    static bool isPacketDerived(Value v) {
         SmallVector<Value> worklist = {v};
         DenseSet<Value> visited;
         while (!worklist.empty()) {
             Value cur = worklist.pop_back_val();
             if (!visited.insert(cur).second) continue;
             Operation *def = cur.getDefiningOp();
-            if (!def) continue;  // block argument — not from hash
-            if (isa<Hash5TupleApplyOp>(def)) return true;
-            // Trace through type-preserving or narrowing ops.
+            if (!def) continue;  // block argument — conservatively packet-derived
+            // A value produced by a stateful read is state-derived, not packet-derived.
+            if (isa<RegisterReadOp, MeterExecuteOp>(def)) return false;
+            // Trace through all other ops (arithmetic, casts, hash, struct access, etc.).
             for (Value operand : def->getOperands())
                 worklist.push_back(operand);
         }
-        return false;
+        return true;
+    }
+
+    /// Compute a canonical fingerprint string for the def-chain of value 'v'.
+    ///
+    /// Two values with identical fingerprints use the same structural path
+    /// through hdr/meta fields, meaning they will select the same hardware
+    /// shard for any given packet — so bf3drmt per-entry mode can safely
+    /// partition the resource using this key.
+    ///
+    /// Conventions:
+    ///   "arg:N"                   — block argument (hdr/meta ref)
+    ///   "read(fp)"                — vdrmt.read from a reference
+    ///   "struct_extract[N](fp)"   — field extraction at index N
+    ///   "hash5tuple(fp0,...,fp4)" — 5-tuple hash (all input fields)
+    ///   "const"                   — any compile-time constant
+    ///   "op_name(fp0,...)"        — generic fallback for arithmetic, casts, etc.
+    static std::string keyFingerprint(Value v, DenseSet<Value> &visited) {
+        if (!visited.insert(v).second)
+            return "cycle"; // SSA is a DAG; shouldn't fire in practice
+
+        // Block argument — hdr or meta reference, packet-derived by convention.
+        if (auto ba = dyn_cast<BlockArgument>(v))
+            return "arg:" + std::to_string(ba.getArgNumber());
+
+        Operation *def = v.getDefiningOp();
+        if (!def) return "unknown";
+
+        // vdrmt.constant — compile-time constant
+        if (isa<ConstantOp>(def))
+            return "const";
+
+        // vdrmt.read %ref — load from a reference (hdr/meta field pointer)
+        if (isa<ReadOp>(def))
+            return "read(" + keyFingerprint(def->getOperand(0), visited) + ")";
+
+        // vdrmt.struct_extract %input[idx] — struct field selection by index
+        if (auto extractOp = dyn_cast<StructExtractOp>(def))
+            return "struct_extract[" + std::to_string(extractOp.getFieldIndex()) + "]("
+                   + keyFingerprint(extractOp.getInput(), visited) + ")";
+
+        // vdrmt.hash5tuple.apply @inst(src,dst,sport,dport,proto)
+        // The 5-tuple is the key; encode all operand fingerprints.
+        if (isa<Hash5TupleApplyOp>(def)) {
+            std::string fp = "hash5tuple(";
+            bool first = true;
+            for (Value operand : def->getOperands()) {
+                if (!first) fp += ",";
+                fp += keyFingerprint(operand, visited);
+                first = false;
+            }
+            return fp + ")";
+        }
+
+        // Generic fallback: op mnemonic + operand fingerprints.
+        // Handles arithmetic (add, mul, shift), casts, etc.
+        std::string fp = def->getName().getStringRef().str() + "(";
+        bool first = true;
+        for (Value operand : def->getOperands()) {
+            if (!first) fp += ",";
+            fp += keyFingerprint(operand, visited);
+            first = false;
+        }
+        return fp + ")";
+    }
+
+    /// Return the sharding key fingerprint for a VFFA execute op.
+    ///
+    /// For register/counter/meter — the index (first SSA operand) determines
+    /// which hardware shard the packet maps to.
+    /// For hash5tuple — all 5 tuple operands together form the key.
+    static std::string shardingKeyOf(VFFAExecuteOpInterface use) {
+        Operation *op = use.getOperation();
+        auto operands = op->getOperands();
+        if (operands.empty()) return "";
+
+        if (isa<Hash5TupleApplyOp>(op)) {
+            // All 5 inputs jointly form the sharding key.
+            std::string key = "hash5tuple(";
+            bool first = true;
+            for (Value operand : operands) {
+                if (!first) key += ",";
+                DenseSet<Value> visited;
+                key += keyFingerprint(operand, visited);
+                first = false;
+            }
+            return key + ")";
+        }
+
+        // register.read/write, counter.count, meter.execute:
+        // first operand is the index.
+        DenseSet<Value> visited;
+        return keyFingerprint(operands[0], visited);
     }
 
     /// Determine the VFFA kind string from an execute op.
@@ -1205,12 +1310,23 @@ private:
                 std::string instName = use.getInstanceAttr().getValue().str();
                 std::string kind     = vffaKindOf(use);
 
-                // Check if the primary index operand is hash-derived.
-                // getInputs() returns [index, ...]; the first element is the index.
-                bool fromHash = false;
-                auto inputs = use.getInputs();
-                if (!inputs.empty())
-                    fromHash = isIndexFromHash(inputs[0]);
+                // Check that ALL inputs (index and write value) are packet-derived.
+                // If any input traces back to a stateful read, sharding via packet
+                // steering is impossible for this instance.
+                //
+                // Use getOperation()->getOperands() rather than getInputs(): every
+                // getInputs() impl returns ValueRange{getSrcAddr(), ...} which is
+                // backed by a temporary initializer_list destroyed on return, so
+                // the ValueRange would dangle by the time we iterate it.
+                // getOperands() is always safe — it's backed by the op's own storage.
+                // ($instance is a FlatSymbolRefAttr, not an SSA operand, so it does
+                // not appear in getOperands().)
+                bool allPacket = true;
+                for (Value input : use.getOperation()->getOperands())
+                    if (!isPacketDerived(input)) { allPacket = false; break; }
+
+                // Compute the sharding key fingerprint for this access.
+                std::string thisKey = shardingKeyOf(use);
 
                 // Accumulate into the module-level map.
                 auto &entry = instanceMap[instName];
@@ -1223,7 +1339,17 @@ private:
                     entry.accessingBlocks.end()) {
                     entry.accessingBlocks.push_back(blockId);
                 }
-                entry.indexFromHash = entry.indexFromHash || fromHash;
+                // One non-packet-derived access taints the whole instance.
+                entry.allInputsPacketDerived =
+                    entry.allInputsPacketDerived && allPacket;
+                // Track sharding key consistency across blocks:
+                // all accesses must use the same index expression so that
+                // bf3drmt per-entry mode can shard by a single packet key.
+                if (entry.shardingKey.empty()) {
+                    entry.shardingKey = thisKey;
+                } else if (entry.shardingKey != thisKey) {
+                    entry.shardingKeyConsistent = false;
+                }
 
                 // Record this instance in the per-block list.
                 auto &blkList = blockInstances[blockId];
@@ -1233,11 +1359,20 @@ private:
         }
 
         // ── Pass 2: classify each instance ────────────────────────────────────
+        // SharedPartitionable (maps to bf3drmt per-entry mode) requires:
+        //   • accessed by multiple blocks, AND
+        //   • all inputs are packet-derived (no stateful-read dependencies), AND
+        //   • all blocks use the same index expression (consistent sharding key)
+        //     so that a single packet steering rule selects the correct shard.
+        //
+        // If inputs are packet-derived but keys differ across blocks, bf3drmt
+        // per-entry mode cannot be used (different blocks would select different
+        // shards for the same packet). Shared mode (counter, meter) can still work.
         for (auto &kv : instanceMap) {
             auto &info = kv.second;
             if (info.accessingBlocks.size() == 1) {
                 info.locality = MemoryLocality::Local;
-            } else if (info.indexFromHash) {
+            } else if (info.allInputsPacketDerived && info.shardingKeyConsistent) {
                 info.locality = MemoryLocality::SharedPartitionable;
             } else {
                 info.locality = MemoryLocality::SharedNonPartitionable;
@@ -1261,8 +1396,11 @@ private:
                     out << "      \"kind\": \"" << info.kind << "\",\n";
                     out << "      \"locality\": \""
                         << localityStr(info.locality) << "\",\n";
-                    out << "      \"indexFromHash\": "
-                        << (info.indexFromHash ? "true" : "false") << ",\n";
+                    out << "      \"allInputsPacketDerived\": "
+                        << (info.allInputsPacketDerived ? "true" : "false") << ",\n";
+                    out << "      \"shardingKey\": \"" << info.shardingKey << "\",\n";
+                    out << "      \"shardingKeyConsistent\": "
+                        << (info.shardingKeyConsistent ? "true" : "false") << ",\n";
                     out << "      \"accessingBlocks\": [";
                     for (size_t i = 0; i < info.accessingBlocks.size(); i++) {
                         if (i) out << ", ";
@@ -1304,8 +1442,11 @@ private:
                 frag << "        \"kind\": \"" << info.kind << "\",\n";
                 frag << "        \"locality\": \""
                      << localityStr(info.locality) << "\",\n";
-                frag << "        \"indexFromHash\": "
-                     << (info.indexFromHash ? "true" : "false") << "\n";
+                frag << "        \"allInputsPacketDerived\": "
+                     << (info.allInputsPacketDerived ? "true" : "false") << ",\n";
+                frag << "        \"shardingKey\": \"" << info.shardingKey << "\",\n";
+                frag << "        \"shardingKeyConsistent\": "
+                     << (info.shardingKeyConsistent ? "true" : "false") << "\n";
                 frag << "      }";
             }
             frag << "\n    ]\n  }";
