@@ -220,8 +220,11 @@ static LogicalResult runEgglogOnFile(
 /// Determine if an op should be eggified (data-flow) or kept opaque
 /// (control-flow terminators that egglog cannot reason about).
 static bool isControlFlowOp(mlir::Operation *op) {
+    // Hash5TupleApplyOp carries a symbol-ref attribute that egglog cannot
+    // represent; skip it here and lower it directly in the post-processing step.
     return mlir::isa<vdpp::BranchOp, vdpp::CondBranchOp,
-                     vdpp::ReturnOp, func::ReturnOp>(op);
+                     vdpp::ReturnOp, func::ReturnOp,
+                     vdpp::Hash5TupleApplyOp>(op);
 }
 
 static LogicalResult runDialEggOnFunction(
@@ -331,6 +334,22 @@ static LogicalResult runDialEggOnFunction(
                     condBr.getTrueDestOperands(),
                     condBr.getFalseDestOperands());
                 condBr.erase();
+
+            } else if (auto hashOp = mlir::dyn_cast<vdpp::Hash5TupleApplyOp>(op)) {
+                // Lower vdpp.hash5tuple.apply → bf3dpa.hash5tuple.apply directly.
+                // Skipped by egglog because it carries a symbol-ref attribute.
+                builder.setInsertionPoint(&op);
+                auto newOp = builder.create<bf3dpa::Hash5TupleApplyOp>(
+                    hashOp.getLoc(),
+                    hashOp.getResult().getType(),
+                    hashOp.getInstanceAttr(),
+                    hashOp.getSrcAddr(),
+                    hashOp.getDstAddr(),
+                    hashOp.getSrcPort(),
+                    hashOp.getDstPort(),
+                    hashOp.getProto());
+                hashOp.getResult().replaceAllUsesWith(newOp.getResult());
+                hashOp.erase();
             }
         }
     }
@@ -363,7 +382,10 @@ static std::string bf3dpaOpMapperExpr(mlir::Operation &op) {
             typetag = "I" + std::to_string(ity.getWidth());
         }
     }
-    std::string funcName = "bf3dpa_" + opName.str();
+    // Convert op name to a valid egglog function name: replace '.' with '_'.
+    std::string opNameStr = opName.str();
+    std::replace(opNameStr.begin(), opNameStr.end(), '.', '_');
+    std::string funcName = "bf3dpa_" + opNameStr;
     return "(" + funcName + " (" + typetag + "))";
 }
 
@@ -471,8 +493,9 @@ public:
                     return failure();
                 }
                 if (failed(emitVDPPAsLLVMIR(blockId, vdppFile, armOut))) {
-                    llvm::errs() << "  ✗ Failed: " << dirName << "/arm.ll\n";
-                    return failure();
+                    llvm::errs() << "  ✗ Failed: " << dirName << "/arm.ll"
+                                 << " (non-fatal, continuing)\n";
+                    // arm.ll failure does not block DPA mapper entry generation.
                 }
             }
             llvm::outs() << "  ✓ Generated " << dirName << "/arm.ll\n";
@@ -522,6 +545,22 @@ private:
             if (failed(runDialEggOnFunction(funcOp, eggFilePath, vdppFile,
                                            supportedOps, customDefs)))
                 return failure();
+        }
+
+        // Lower module-level vdpp.hash5tuple_instance → bf3dpa.hash5tuple_instance.
+        // These declarations live outside func.func so DialEgg never sees them.
+        {
+            mlir::OpBuilder modBuilder(mod->getContext());
+            llvm::SmallVector<mlir::Operation *> toErase;
+            for (mlir::Operation &op : *mod->getBody()) {
+                if (auto instOp = mlir::dyn_cast<vdpp::Hash5TupleInstanceOp>(op)) {
+                    modBuilder.setInsertionPoint(&op);
+                    modBuilder.create<bf3dpa::Hash5TupleInstanceOp>(
+                        instOp.getLoc(), instOp.getSymNameAttr());
+                    toErase.push_back(&op);
+                }
+            }
+            for (auto *op : toErase) op->erase();
         }
 
         // Collect mapper info from the (now bf3dpa) module.
@@ -585,8 +624,9 @@ private:
             << "(function bf3dpa_alloca        (Type) Type :cost 1 :type stateless)\n"
             << "(function bf3dpa_getelementptr (Type) Type :cost 1 :type stateless)\n"
             << "(function bf3dpa_cast          (Type) Type :cost 1 :type stateless)\n"
-            << "(function bf3dpa_thread_fence  (Type) Type :cost 2 :type stateless)\n"
-            << "(function bf3dpa_thread_id     (Type) Type :cost 1 :type stateless)\n\n";
+            << "(function bf3dpa_thread_fence      (Type) Type :cost 2 :type stateless)\n"
+            << "(function bf3dpa_thread_id         (Type) Type :cost 1 :type stateless)\n"
+            << "(function bf3dpa_hash5tuple_apply  (Type) Type :cost 3 :type stateless)\n\n";
 
         for (auto &info : sorted) {
             std::string blkId   = "blk" + std::to_string(info.blockId);

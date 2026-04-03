@@ -57,6 +57,14 @@
 #include <limits>
 #include <string>
 
+static uint32_t bswap32(uint32_t v) {
+    return ((v & 0xff000000u) >> 24) | ((v & 0x00ff0000u) >> 8) |
+           ((v & 0x0000ff00u) << 8)  | ((v & 0x000000ffu) << 24);
+}
+static uint16_t bswap16(uint16_t v) {
+    return (uint16_t)(((v & 0xff00u) >> 8) | ((v & 0x00ffu) << 8));
+}
+
 using namespace mlir;
 
 // ============================================================================
@@ -378,6 +386,42 @@ static LogicalResult convertOp(Operation &op, OpBuilder &builder,
             builder.create<vdpp::ReturnOp>(loc, *succ);
         else
             builder.create<vdpp::ReturnOp>(loc);
+        return success();
+    }
+
+    // ── Calls: constant-fold htonl/htons/ntohl/ntohs ───────────────────────
+    if (auto callOp = dyn_cast<LLVM::CallOp>(op)) {
+        auto callee = callOp.getCallee();
+        if (callee && callOp.getNumOperands() == 1) {
+            Value argVDPP = mapping.lookup(callOp.getOperand(0));
+            if (argVDPP) {
+                if (auto cst = argVDPP.getDefiningOp<vdpp::ConstantOp>()) {
+                    if (auto iAttr = dyn_cast<IntegerAttr>(cst.getValue())) {
+                        int64_t raw = iAttr.getInt();
+                        int64_t result = raw;
+                        Type resTy = convertLLVMType(
+                            op.getResult(0).getType(), ctx);
+                        if (!resTy) resTy = builder.getI32Type();
+                        if (*callee == "htonl" || *callee == "ntohl")
+                            result = (int64_t)(int32_t)bswap32(
+                                (uint32_t)(int32_t)raw);
+                        else if (*callee == "htons" || *callee == "ntohs")
+                            result = (int64_t)(int16_t)bswap16(
+                                (uint16_t)(int16_t)raw);
+                        auto foldedAttr = IntegerAttr::get(resTy, result);
+                        auto newCst = builder.create<vdpp::ConstantOp>(
+                            loc, resTy, foldedAttr);
+                        mapping.map(op.getResult(0), newCst.getRes());
+                        return success();
+                    }
+                }
+            }
+        }
+        // Non-constant or unknown call: skip silently (result absent from mapping).
+        if (op.getNumResults() > 0)
+            llvm::errs() << "  ⚠ LLVMIRToVDPP: skipping call to '"
+                         << callee.value_or("<unknown>")
+                         << "' — result will be missing\n";
         return success();
     }
 

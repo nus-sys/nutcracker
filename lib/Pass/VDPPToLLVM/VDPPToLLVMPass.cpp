@@ -396,6 +396,16 @@ LogicalResult emitVDPPAsLLVMIR(int blockId, StringRef vdppFilePath,
         return failure();
     }
 
+    // Erase module-level vdpp.hash5tuple_instance declarations: they have no
+    // LLVM IR equivalent and would otherwise be flagged as illegal ops.
+    {
+        llvm::SmallVector<mlir::Operation *> toErase;
+        for (auto &op : *mod->getBody())
+            if (mlir::isa<vdpp::Hash5TupleInstanceOp>(op))
+                toErase.push_back(&op);
+        for (auto *op : toErase) op->erase();
+    }
+
     // Step 1: preprocess — fix function signature and vdpp.return.
     if (failed(preprocessModule(*mod, blockId)))
         return failure();
