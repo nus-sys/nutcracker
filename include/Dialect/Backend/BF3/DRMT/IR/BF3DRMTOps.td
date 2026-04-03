@@ -517,4 +517,50 @@ def BF3DRMT_NextOp : BF3DRMT_Op<"next", [Pure, Terminator, ReturnLike]> {
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Counter (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def BF3DRMT_CounterDeclOp : BF3DRMT_Op<"counter_decl", [Symbol]> {
+    let summary = "Declare a BF3 hardware counter array";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DRMT_CounterCountOp : BF3DRMT_Op<"counter.count"> {
+    let summary = "Increment BF3 hardware counter at given index";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Meter (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def BF3DRMT_MeterDeclOp : BF3DRMT_Op<"meter_decl", [Symbol]> {
+    let summary = "Declare a BF3 hardware meter array";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$meter_type
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DRMT_MeterExecuteOp : BF3DRMT_Op<"meter.execute"> {
+    let summary = "Execute BF3 hardware meter at given index, returning color";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$color);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($color) attr-dict";
+}
+
 #endif // BF3DRMTOPS

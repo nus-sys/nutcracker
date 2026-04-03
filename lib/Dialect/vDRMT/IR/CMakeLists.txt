@@ -3,12 +3,14 @@ add_mlir_dialect_library(MLIRvDRMTDialect
   vDRMTOps.cpp
   vDRMTTypes.cpp
   vDRMTTypeInterfaces.cpp
+  vDRMTOpInterfaces.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${PROJECT_SOURCE_DIR}/Dialect/vDRMT
 
   DEPENDS
   VDRMT_IncGen
+  VDRMT_OpInterfacesIncGen
 
   LINK_LIBS PUBLIC
   MLIRIR

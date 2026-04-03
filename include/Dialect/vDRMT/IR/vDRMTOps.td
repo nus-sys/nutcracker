@@ -534,4 +534,235 @@ def ReturnOp : vDRMT_Op<"return", [Pure, Terminator, ReturnLike]> {
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Fixed-Function Accelerator ops (vDRMT-level, hardware-mapped)
+//
+// All instance ops implement VFFAInstanceOpInterface.
+// All execute/use ops implement VFFAExecuteOpInterface.
+//===----------------------------------------------------------------------===//
+
+// ── Counter ──────────────────────────────────────────────────────────────────
+
+def vDRMT_CounterInstanceOp : vDRMT_Op<"counter_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a hardware counter array at module scope (vDRMT level)";
+    let description = [{
+        Declares a named counter array for use in match-action blocks.
+        Maps to a hardware counter resource on the target NIC ASIC.
+        size: number of counter cells.
+
+        Example:
+          vdrmt.counter_instance @syn_count {size = 1024 : i32}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_CounterCountOp : vDRMT_Op<"counter.count",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Increment the hardware counter at the given index";
+    let description = [{
+        Increments counter instance @sym by 1 at the given index.
+        Inputs: [index].  Output: none (side-effect: counter increment).
+
+        Example:
+          vdrmt.counter.count @syn_count[%idx] : index
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) attr-dict";
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getIndex()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdrmt.counter_size"); }
+    }];
+}
+
+// ── Hash5Tuple ───────────────────────────────────────────────────────────────
+
+def vDRMT_Hash5TupleInstanceOp : vDRMT_Op<"hash5tuple_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a hardware hash-pipe instance at module scope (vDRMT level)";
+    let description = [{
+        Declares a named Hash5Tuple instance backed by a hardware hash pipe.
+        nr_entries: number of hash buckets (entries) in the hash pipe.
+        On BF3, this maps to DOCA_FLOW_PIPE_HASH with set_nr_entries(nr_entries).
+
+        Example:
+          vdrmt.hash5tuple_instance @lb_hash {nr_entries = 64 : i32}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$nr_entries
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_Hash5TupleApplyOp : vDRMT_Op<"hash5tuple.apply",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Compute a 5-tuple hash via the hardware hash pipe";
+    let description = [{
+        Computes Hash5Tuple(srcAddr, dstAddr, srcPort, dstPort, proto)
+        over the named hardware instance, returning a 32-bit bucket index.
+        Inputs: [src_addr, dst_addr, src_port, dst_port, proto].
+        Output: 32-bit hash result (bucket index).
+
+        Example:
+          %h = vdrmt.hash5tuple.apply @lb_hash(%src, %dst, %sport, %dport, %proto)
+                 : (i32, i32, i16, i16, i8) -> i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$src_addr,
+        AnyInteger:$dst_addr,
+        AnyInteger:$src_port,
+        AnyInteger:$dst_port,
+        AnyInteger:$proto
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = [{
+        $instance `(` $src_addr `,` $dst_addr `,` $src_port `,` $dst_port `,` $proto `)`
+        `:` `(` type($src_addr) `,` type($dst_addr) `,` type($src_port) `,`
+               type($dst_port) `,` type($proto) `)` `->` type($result) attr-dict
+    }];
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() {
+            return {getSrcAddr(), getDstAddr(), getSrcPort(), getDstPort(), getProto()};
+        }
+        void removeHelperAttrs() {
+            (*this)->removeAttr("vdrmt.hash5tuple_nr_entries");
+        }
+    }];
+}
+
+//===----------------------------------------------------------------------===//
+// Meter (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def vDRMT_MeterInstanceOp : vDRMT_Op<"meter_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a hardware meter instance at module scope (vDRMT level)";
+    let description = [{
+        Declares a named Meter instance backed by a hardware meter array.
+        size: number of meter slots.
+        meter_type: 0 = packets, 1 = bytes.
+
+        Example:
+          vdrmt.meter_instance @shared_meter {size = 1024 : i32, meter_type = 0 : i32}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$meter_type
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_MeterExecuteOp : vDRMT_Op<"meter.execute",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Execute a hardware meter and return color (0=green,1=yellow,2=red)";
+    let description = [{
+        Executes meter instance @sym at slot [index] and returns the
+        color result: 0=GREEN, 1=YELLOW, 2=RED.
+        Inputs: [index].  Output: color (token-bucket algorithm).
+
+        Example:
+          %color = vdrmt.meter.execute @shared_meter[%idx] : index -> i8
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$color);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($color) attr-dict";
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getIndex()}; }
+        void removeHelperAttrs() {
+            (*this)->removeAttr("vdrmt.meter_size");
+            (*this)->removeAttr("vdrmt.meter_type");
+        }
+    }];
+}
+
+//===----------------------------------------------------------------------===//
+// Register (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def vDRMT_RegisterInstanceOp : vDRMT_Op<"register_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a stateful register array at module scope";
+    let description = [{
+        Declares a named Register array. size is the number of slots.
+        element_width is the bit-width of each element.
+
+        Example:
+          vdrmt.register_instance @flow_state {size = 1024 : i32, element_width = 32 : i32}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$element_width
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_RegisterReadOp : vDRMT_Op<"register.read",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Read one element from a register array";
+    let description = [{
+        Reads register array @instance at slot [index].
+        Inputs: [index].  Output: element value (array read).
+
+        Example:
+          %val = vdrmt.register.read @flow_state[%idx] : i32 -> i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($result) attr-dict";
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getIndex()}; }
+        void removeHelperAttrs() {
+            (*this)->removeAttr("vdrmt.register_size");
+            (*this)->removeAttr("vdrmt.register_element_width");
+        }
+    }];
+}
+
+def vDRMT_RegisterWriteOp : vDRMT_Op<"register.write",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Write one element into a register array";
+    let description = [{
+        Writes value into register array @instance at slot [index].
+        Inputs: [index, value].  Output: none (side-effect: array write).
+
+        Example:
+          vdrmt.register.write @flow_state[%idx] = %val : i32, i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index,
+        AnyInteger:$value
+    );
+    let assemblyFormat = "$instance `[` $index `]` `=` $value `:` type($index) `,` type($value) attr-dict";
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getIndex(), getValue()}; }
+        void removeHelperAttrs() {
+            (*this)->removeAttr("vdrmt.register_size");
+            (*this)->removeAttr("vdrmt.register_element_width");
+        }
+    }];
+}
+
 #endif // VDRMTOPS
