@@ -24,15 +24,8 @@ DOCA_LOG_REGISTER(NC_ARM_WORKER);
 
 #define NC_ARM_BURST_SIZE  64
 
-/* Port/queue pair assigned to this lcore — set by nc_arm_worker_bind(). */
-static __thread uint16_t g_port_id  = 0;
-static __thread uint16_t g_queue_id = 0;
-
-/* Called once per lcore to bind port+queue. */
-void nc_arm_worker_bind(uint16_t port_id, uint16_t queue_id) {
-    g_port_id  = port_id;
-    g_queue_id = queue_id;
-}
+/* Shutdown flag shared with nc_runtime_main.c */
+extern volatile int g_keep_running;
 
 /* Extract nc_types.h pointers from raw packet buffer.
  *
@@ -48,25 +41,27 @@ static inline void nc_pkt_unpack(uint8_t *data,
 
 /* Main ARM worker loop — runs on a dedicated DPDK lcore. */
 int nc_arm_worker_loop(void *arg) {
-    (void)arg;
+    const struct nc_arm_worker_arg *warg = (const struct nc_arm_worker_arg *)arg;
+    uint16_t port_id  = warg->port_id;
+    uint16_t queue_id = warg->queue_id;
     struct rte_mbuf *pkts[NC_ARM_BURST_SIZE];
     uint16_t nb_rx;
 
     /* Look up this queue's entrypoint block ID once at startup. */
     int start_block = -1;
-    if (g_queue_id < NC_NUM_ARM_QUEUES)
-        start_block = nc_arm_queue_to_block[g_queue_id];
+    if (queue_id < NC_NUM_ARM_QUEUES)
+        start_block = nc_arm_queue_to_block[queue_id];
 
     if (start_block < 0 || start_block >= NC_NUM_BLOCKS) {
-        DOCA_LOG_ERR("ARM worker queue %u: no valid entrypoint block", g_queue_id);
+        DOCA_LOG_ERR("ARM worker queue %u: no valid entrypoint block", queue_id);
         return -1;
     }
 
     DOCA_LOG_INFO("ARM worker started: lcore %u, port %u, queue %u, block %d",
-                  rte_lcore_id(), g_port_id, g_queue_id, start_block);
+                  rte_lcore_id(), port_id, queue_id, start_block);
 
-    while (1) {
-        nb_rx = rte_eth_rx_burst(g_port_id, g_queue_id, pkts, NC_ARM_BURST_SIZE);
+    while (g_keep_running) {
+        nb_rx = rte_eth_rx_burst(port_id, queue_id, pkts, NC_ARM_BURST_SIZE);
         if (nb_rx == 0) continue;
 
         for (uint16_t i = 0; i < nb_rx; i++) {
@@ -85,8 +80,8 @@ int nc_arm_worker_loop(void *arg) {
             }
 
             /* Forward to egress port. */
-            uint16_t egress = g_port_id ^ 1;
-            uint16_t sent = rte_eth_tx_burst(egress, g_queue_id, &m, 1);
+            uint16_t egress = port_id ^ 1;
+            uint16_t sent = rte_eth_tx_burst(egress, queue_id, &m, 1);
             if (sent == 0) rte_pktmbuf_free(m);
         }
     }

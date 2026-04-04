@@ -20,6 +20,13 @@ typedef enum {
 /* Provided by the generated nc_pipeline.h */
 #include "nc_pipeline.h"
 
+/* ── ARM worker argument (passed via rte_eal_remote_launch arg) ───────────── */
+
+struct nc_arm_worker_arg {
+    uint16_t port_id;
+    uint16_t queue_id;
+};
+
 /* ── ARM block dispatch table ─────────────────────────────────────────────── */
 
 /* Each ARM block function: returns next block ID (-1 = pipeline done) */
