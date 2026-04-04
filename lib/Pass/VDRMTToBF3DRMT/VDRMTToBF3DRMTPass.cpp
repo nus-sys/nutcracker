@@ -1282,28 +1282,40 @@ private:
         llvm::StringMap<VFFAInstanceAnalysis> instanceMap;
         std::map<int, std::vector<std::string>> blockInstances;
 
-        std::error_code ec;
-        for (llvm::sys::fs::directory_iterator dir(inputDir, ec), end;
-             dir != end && !ec; dir.increment(ec)) {
-            auto path = dir->path();
-            if (!llvm::sys::fs::is_directory(path)) continue;
-            std::string dirName = llvm::sys::path::filename(path).str();
-            if (dirName.find("block") != 0) continue;
+        // Collect block directories and sort by block ID before processing so
+        // that accessingBlocks order and the first-seen shardingKey are
+        // deterministic across runs (directory_iterator order is filesystem-
+        // dependent and varies between ext4 runs).
+        std::vector<std::pair<int, std::string>> blockPaths; // (blockId, path)
+        {
+            std::error_code ec;
+            for (llvm::sys::fs::directory_iterator dir(inputDir, ec), end;
+                 dir != end && !ec; dir.increment(ec)) {
+                auto path = dir->path();
+                if (!llvm::sys::fs::is_directory(path)) continue;
+                std::string dirName = llvm::sys::path::filename(path).str();
+                if (dirName.find("block") != 0) continue;
+                std::string vdrmtFile = path + "/vdrmt.mlir";
+                if (!llvm::sys::fs::exists(vdrmtFile)) continue;
+                // Parse just to extract block_id, then keep for main loop.
+                auto mod = parseSourceFile<ModuleOp>(vdrmtFile, context);
+                if (!mod) continue;
+                int blockId = -1;
+                mod->walk([&](func::FuncOp fn) {
+                    if (auto attr = fn->getAttrOfType<IntegerAttr>("vdrmt.block_id"))
+                        blockId = (int)attr.getInt();
+                    return WalkResult::interrupt();
+                });
+                if (blockId >= 0)
+                    blockPaths.emplace_back(blockId, path);
+            }
+            llvm::sort(blockPaths, [](auto &a, auto &b) { return a.first < b.first; });
+        }
 
+        for (auto &[blockId, path] : blockPaths) {
             std::string vdrmtFile = path + "/vdrmt.mlir";
-            if (!llvm::sys::fs::exists(vdrmtFile)) continue;
-
             auto mod = parseSourceFile<ModuleOp>(vdrmtFile, context);
             if (!mod) continue;
-
-            // Extract the block ID from the vdrmt function attribute.
-            int blockId = -1;
-            mod->walk([&](func::FuncOp fn) {
-                if (auto attr = fn->getAttrOfType<IntegerAttr>("vdrmt.block_id"))
-                    blockId = (int)attr.getInt();
-                return WalkResult::interrupt();
-            });
-            if (blockId < 0) continue;
 
             // Walk all VFFA execute ops via the interface.
             mod->walk([&](VFFAExecuteOpInterface use) {
@@ -1358,6 +1370,10 @@ private:
             });
         }
 
+        // Sort accessingBlocks within each instance for deterministic JSON output.
+        for (auto &kv : instanceMap)
+            llvm::sort(kv.second.accessingBlocks);
+
         // ── Pass 2: classify each instance ────────────────────────────────────
         // SharedPartitionable (maps to bf3drmt per-entry mode) requires:
         //   • accessed by multiple blocks, AND
@@ -1380,6 +1396,13 @@ private:
         }
 
         // ── Pass 3: write module-level memory_analysis.json ───────────────────
+        // Collect sorted instance names for deterministic JSON output
+        // (llvm::StringMap iteration order is unspecified).
+        std::vector<std::string> sortedInstNames;
+        for (auto &kv : instanceMap)
+            sortedInstNames.push_back(kv.first().str());
+        llvm::sort(sortedInstNames);
+
         {
             std::string outFile = inputDir + "/memory_analysis.json";
             std::error_code errc;
@@ -1387,7 +1410,8 @@ private:
             if (!errc) {
                 out << "{\n  \"vffaInstances\": [\n";
                 bool firstInst = true;
-                for (auto &kv : instanceMap) {
+                for (auto &instName : sortedInstNames) {
+                    auto &kv = *instanceMap.find(instName);
                     auto &info = kv.second;
                     if (!firstInst) out << ",\n";
                     firstInst = false;
