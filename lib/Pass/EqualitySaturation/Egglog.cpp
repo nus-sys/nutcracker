@@ -1142,14 +1142,11 @@ EggifiedOp* Egglog::eggifyOperation(mlir::Operation* op) {
     // ==== Attributes ====
     // llvm::outs() << "Eggifying attributes...\n";
     llvm::ArrayRef<mlir::NamedAttribute> attrs = op->getAttrs();
+    if (attrs.size() < egglogOpDef.nAttributes) {
+        // Attribute count mismatch — fall back to opaque to avoid OOB access.
+        return eggifyOpaqueOperation(op);
+    }
     for (size_t i = 0; i < egglogOpDef.nAttributes; i++) {
-        // if (i >= attrs.size()) {
-        //     llvm::outs() << "!! WARNING: Missing attribute index " << i
-        //                  << " (expected " << egglogOpDef.nAttributes
-        //                  << ", actual " << attrs.size() << ")\n";
-        //     ss << " (NamedAttr \"MISSING\" (StringAttr \"\"))";
-        //     continue;
-        // }
         // llvm::outs() << "  Attr[" << i << "]: " << attrs[i].getName() << " = " << attrs[i].getValue() << "\n";
         ss << " " << eggifyNamedAttribute(attrs[i]);
     }

@@ -18,6 +18,7 @@
 
 #include "Dialect/vDRMT/IR/vDRMTOpsEnums.h"
 #include "Dialect/vDRMT/IR/vDRMTTypes.h"
+#include "Dialect/vDRMT/IR/vDRMTOpInterfaces.h"
 
 #define GET_OP_CLASSES
 #include "Dialect/vDRMT/IR/vDRMTOps.h.inc"

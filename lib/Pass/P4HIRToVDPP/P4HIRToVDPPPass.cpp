@@ -15,15 +15,19 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/MemoryBuffer.h"
 
+#include "mlir/Pass/PassManager.h"
+
 #include "Pass/P4HIRToVDPPPass.h"
-#include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h" 
+#include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Ops.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Types.h"
+#include "p4mlir/Transforms/Passes.h"
 #include "Dialect/vDPP/IR/vDPPDialect.h"
 #include "Dialect/vDPP/IR/vDPPOps.h"
 #include "Dialect/vDPP/IR/vDPPTypes.h"
 
 #include <fstream>
+#include <set>
 #include <vector>
 
 using namespace mlir;
@@ -102,8 +106,9 @@ struct BlockMetadata {
   bool hasTableApply;
   bool hasMemoryAccess;
   bool canMapToVDRMT;
+  bool isTerminal = false;
   std::vector<std::string> accessedMemoryObjects;
-  
+
   static BlockMetadata loadFromJSON(StringRef jsonFile) {
     BlockMetadata meta;
     meta.blockId = -1;
@@ -125,6 +130,7 @@ struct BlockMetadata {
     if (auto table = obj->getBoolean("hasTableApply")) meta.hasTableApply = *table;
     if (auto mem = obj->getBoolean("hasMemoryAccess")) meta.hasMemoryAccess = *mem;
     if (auto canMap = obj->getBoolean("canMapToVDRMT")) meta.canMapToVDRMT = *canMap;
+    if (auto term = obj->getBoolean("isTerminal")) meta.isTerminal = *term;
     
     if (auto memObjs = obj->getArray("accessedMemoryObjects")) {
       for (auto &elem : *memObjs) {
@@ -259,6 +265,13 @@ public:
     addConversion([](P4::P4MLIR::P4HIR::VoidType type) -> Type {
       return type;
     });
+
+    // P4HIR extern — keep as-is so adaptor construction doesn't fail when
+    // a CallMethodOp's base operand has ExternType.  The InstantiateOp that
+    // produces it is marked "always legal" and is erased post-conversion.
+    addConversion([](P4::P4MLIR::P4HIR::ExternType type) -> Type {
+      return type;
+    });
   }
 };
 
@@ -282,19 +295,41 @@ public:
     
     auto valueAttr = op.getValueAttr();
     
+    auto intType = convertedType.dyn_cast<IntegerType>();
+
     if (auto p4hirIntAttr = valueAttr.dyn_cast<P4::P4MLIR::P4HIR::IntAttr>()) {
       APInt value = p4hirIntAttr.getValue();
-      
-      if (auto intType = convertedType.dyn_cast<IntegerType>()) {
-        if (value.getBitWidth() != intType.getWidth()) {
+      if (intType) {
+        if (value.getBitWidth() != intType.getWidth())
           value = value.zextOrTrunc(intType.getWidth());
-        }
-        auto newAttr = IntegerAttr::get(intType, value);
-        rewriter.replaceOpWithNewOp<vdpp::ConstantOp>(op, convertedType, newAttr);
+        rewriter.replaceOpWithNewOp<vdpp::ConstantOp>(
+            op, convertedType, IntegerAttr::get(intType, value));
         return success();
       }
     }
-    
+
+    // BoolAttr (#p4hir.bool<true/false>) → i1 integer constant.
+    if (auto boolAttr = valueAttr.dyn_cast<P4::P4MLIR::P4HIR::BoolAttr>()) {
+      if (intType) {
+        rewriter.replaceOpWithNewOp<vdpp::ConstantOp>(
+            op, convertedType,
+            IntegerAttr::get(intType, boolAttr.getValue() ? 1 : 0));
+        return success();
+      }
+    }
+
+    // ValidityBitAttr (#p4hir<validity.bit valid/invalid>) → i1 integer constant.
+    if (auto vbAttr = valueAttr.dyn_cast<P4::P4MLIR::P4HIR::ValidityBitAttr>()) {
+      if (intType) {
+        bool isValid =
+            (vbAttr.getValue() == P4::P4MLIR::P4HIR::ValidityBit::Valid);
+        rewriter.replaceOpWithNewOp<vdpp::ConstantOp>(
+            op, convertedType,
+            IntegerAttr::get(intType, isValid ? 1 : 0));
+        return success();
+      }
+    }
+
     rewriter.replaceOpWithNewOp<vdpp::ConstantOp>(op, convertedType, valueAttr);
     return success();
   }
@@ -445,6 +480,253 @@ public:
     
     return success();
   }
+};
+
+// Convert p4hir.call_method @Hash5Tuple::@apply → vdpp.hash5tuple.apply + vdpp.store
+struct Hash5TupleCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty()) return failure();
+        if (callee.getRootReference().getValue() != "Hash5Tuple") return failure();
+        if (callee.getNestedReferences().back().getValue() != "apply") return failure();
+
+        // arg_operands: [result_ref(out), src_addr, dst_addr, src_port, dst_port, proto]
+        auto args = adaptor.getArgOperands();
+        if (args.size() < 6) return failure();
+
+        Value resultRef = args[0];
+        Value srcAddr   = args[1];
+        Value dstAddr   = args[2];
+        Value srcPort   = args[3];
+        Value dstPort   = args[4];
+        Value proto     = args[5];
+
+        // Determine instance name from the base operand (the Hash5Tuple instance).
+        // Capture the InstantiateOp pointer before erasing the CallMethodOp.
+        StringRef instanceName = "unknown_hash";
+        P4::P4MLIR::P4HIR::InstantiateOp capturedInstOp;
+        if (auto instOp = op.getBase().getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
+            instanceName = instOp.getName();
+            capturedInstOp = instOp;
+        }
+
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+        auto i32Ty  = rewriter.getI32Type();
+
+        // Create vdpp.hash5tuple.apply — software hash, no nr_entries constraint.
+        auto applyOp = rewriter.create<vdpp::Hash5TupleApplyOp>(
+            op.getLoc(), i32Ty, symRef,
+            srcAddr, dstAddr, srcPort, dstPort, proto);
+
+        // Store the hash result into the out-parameter reference.
+        rewriter.create<vdpp::StoreOp>(
+            op.getLoc(),
+            applyOp.getResult(),
+            resultRef,
+            rewriter.getI64IntegerAttr(0));
+
+        rewriter.eraseOp(op);
+
+        // The InstantiateOp that defined the base operand is now unused.
+        // Erase it here so it doesn't remain as an illegal P4HIR op.
+        if (capturedInstOp)
+            rewriter.eraseOp(capturedInstOp);
+
+        return success();
+    }
+};
+
+// Convert p4hir.br → vdpp.br
+// Produced by p4hir-flatten-cfg when lowering ScopeOp/IfOp/TernaryOp.
+struct BrOpConversion : OpConversionPattern<P4::P4MLIR::P4HIR::BrOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::BrOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.replaceOpWithNewOp<vdpp::BranchOp>(
+            op, op.getDest(), adaptor.getDestOperands());
+        return success();
+    }
+};
+
+// Convert p4hir.cond_br → vdpp.cond_br
+struct CondBrOpConversion : OpConversionPattern<P4::P4MLIR::P4HIR::CondBrOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CondBrOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.replaceOpWithNewOp<vdpp::CondBranchOp>(
+            op, adaptor.getCond(),
+            op.getDestTrue(), op.getDestFalse(),
+            adaptor.getDestOperandsTrue(),
+            adaptor.getDestOperandsFalse());
+        return success();
+    }
+};
+
+// Erase p4hir.instantiate once all its uses have been consumed.
+// Hash5TupleCallPattern handles the common case (erasing the InstantiateOp as
+// part of the CallMethodOp conversion).  This pattern is a safety net for any
+// instantiate that becomes use-empty through a different code path.
+struct InstantiateOpErasePattern
+    : OpConversionPattern<P4::P4MLIR::P4HIR::InstantiateOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::InstantiateOp op,
+                                  OpAdaptor /*adaptor*/,
+                                  ConversionPatternRewriter &rewriter) const override {
+        if (!op->use_empty()) return failure();  // Not ready yet; will retry
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Convert p4hir.variable → vdpp.alloca
+// p4hir.variable defines a scope-local mutable slot; its result type is
+// !p4hir.ref<T>, which the type converter maps to !vdpp.ptr<T>.
+struct VariableOpConversion : OpConversionPattern<P4::P4MLIR::P4HIR::VariableOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::VariableOp op,
+                                  OpAdaptor /*adaptor*/,
+                                  ConversionPatternRewriter &rewriter) const override {
+        Type convertedRefType = getTypeConverter()->convertType(op.getRef().getType());
+        if (!convertedRefType) return failure();
+        auto ptrType = mlir::dyn_cast<vdpp::PointerType>(convertedRefType);
+        if (!ptrType) return failure();
+        rewriter.replaceOpWithNewOp<vdpp::AllocaOp>(op, ptrType.getElementType());
+        return success();
+    }
+};
+
+// Convert p4hir.scope (void) → inline the body into the parent block.
+// Scopes that yield a value are not supported here (failure() causes fallback).
+struct ScopeOpConversion : OpConversionPattern<P4::P4MLIR::P4HIR::ScopeOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::ScopeOp op,
+                                  OpAdaptor /*adaptor*/,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // Only handle void scopes (no result).
+        if (op->getNumResults() > 0) return failure();
+
+        Location loc = op.getLoc();
+        Block *currentBlock = op->getBlock();
+        Region *parentRegion = currentBlock->getParent();
+
+        // Split so that ops after the scope land in continueBlock.
+        Block *continueBlock = rewriter.splitBlock(currentBlock, ++Block::iterator(op));
+
+        // Inline the scope's single-block region before continueBlock.
+        Region &body = op.getScopeRegion();
+        rewriter.inlineRegionBefore(body, *parentRegion, Region::iterator(continueBlock));
+
+        // The inlined block is now immediately before continueBlock.
+        Block *inlinedBlock = &*std::prev(Region::iterator(continueBlock));
+
+        // Move inlined ops to the end of currentBlock.
+        currentBlock->getOperations().splice(currentBlock->end(),
+                                             inlinedBlock->getOperations());
+
+        // The implicit/explicit yield is now the last op in currentBlock; erase it.
+        if (!currentBlock->empty()) {
+            if (isa<P4::P4MLIR::P4HIR::YieldOp>(currentBlock->back()))
+                rewriter.eraseOp(&currentBlock->back());
+        }
+
+        // Fall through from currentBlock to continueBlock.
+        rewriter.setInsertionPointToEnd(currentBlock);
+        rewriter.create<vdpp::BranchOp>(loc, continueBlock);
+
+        rewriter.eraseBlock(inlinedBlock);
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Convert p4hir.ternary → CFG with block argument at merge point.
+//
+//   %result = p4hir.ternary(%cond, true { ... yield %t }, false { ... yield %f })
+//
+// lowers to:
+//
+//   vdpp.cond_br %cond, ^trueBlock, ^falseBlock
+//   ^trueBlock:  ... ; vdpp.br ^mergeBlock(%t)
+//   ^falseBlock: ... ; vdpp.br ^mergeBlock(%f)
+//   ^mergeBlock(%result : T):
+//   ... (original ops after ternary, using %result)
+struct TernaryOpConversion : OpConversionPattern<P4::P4MLIR::P4HIR::TernaryOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::TernaryOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        Location loc = op.getLoc();
+
+        // The ternary must have exactly one result.
+        if (!op.getResult()) return failure();
+        Type resultType = getTypeConverter()->convertType(op.getResult().getType());
+        if (!resultType) return failure();
+
+        Block *currentBlock = op->getBlock();
+        Region *parentRegion = currentBlock->getParent();
+
+        // Split: ops after the ternary go into mergeBlock, which receives the
+        // ternary result as a block argument.
+        Block *mergeBlock = rewriter.splitBlock(currentBlock, ++Block::iterator(op));
+        mergeBlock->addArgument(resultType, loc);
+
+        // New true/false blocks.
+        Block *trueBlock  = new Block();
+        Block *falseBlock = new Block();
+        parentRegion->getBlocks().insert(Region::iterator(mergeBlock), trueBlock);
+        parentRegion->getBlocks().insert(Region::iterator(mergeBlock), falseBlock);
+
+        // Terminate currentBlock with a conditional branch.
+        rewriter.setInsertionPoint(currentBlock, currentBlock->end());
+        rewriter.create<vdpp::CondBranchOp>(loc, adaptor.getCond(), trueBlock, falseBlock);
+        rewriter.eraseOp(op);
+
+        // Replace all uses of the ternary result with the merge-block argument.
+        op.getResult().replaceAllUsesWith(mergeBlock->getArgument(0));
+
+        // Helper: inline one region, move ops to destBlock, replace yield with br.
+        auto inlineRegion = [&](Region &region, Block *destBlock) {
+            if (region.empty()) {
+                rewriter.setInsertionPointToEnd(destBlock);
+                rewriter.create<vdpp::BranchOp>(loc, mergeBlock,
+                                                ValueRange{mergeBlock->getArgument(0)});
+                return;
+            }
+            rewriter.inlineRegionBefore(region, *parentRegion,
+                                        Region::iterator(mergeBlock));
+            Block *inlined = &*std::prev(Region::iterator(mergeBlock));
+            destBlock->getOperations().splice(destBlock->begin(),
+                                              inlined->getOperations());
+            // Replace the terminating yield with a branch to mergeBlock.
+            if (!destBlock->empty()) {
+                if (auto yieldOp =
+                        dyn_cast<P4::P4MLIR::P4HIR::YieldOp>(destBlock->back())) {
+                    Value yieldedVal = yieldOp.getArgs().front();
+                    rewriter.setInsertionPoint(yieldOp);
+                    rewriter.replaceOpWithNewOp<vdpp::BranchOp>(
+                        yieldOp, mergeBlock, ValueRange{yieldedVal});
+                }
+            }
+            rewriter.eraseBlock(inlined);
+        };
+
+        inlineRegion(op.getTrueRegion(),  trueBlock);
+        inlineRegion(op.getFalseRegion(), falseBlock);
+
+        return success();
+    }
 };
 
 // Convert p4hir.assign → vdpp.store
@@ -856,7 +1138,9 @@ public:
           llvm::errs() << "    ✗ Failed to load metadata for " << dirName << "\n";
           continue;
         }
-        
+
+        if (meta.isTerminal) continue;
+
         std::string p4hirFile = path + "/p4hir.mlir";
         std::string vdppFile = path + "/vdpp.mlir";
         
@@ -892,16 +1176,27 @@ private:
     // Parse P4HIR module
     auto p4hirModule = parseSourceFile<ModuleOp>(p4hirFile, context);
     if (!p4hirModule) return failure();
-    
+
+    // Flatten the P4HIR CFG: this converts ScopeOp, TernaryOp, IfOp, etc.
+    // into flat multi-block CFG using p4hir.br / p4hir.cond_br terminators.
+    // Running this BEFORE applyPartialConversion avoids nested-region ordering
+    // issues where the conversion framework visits ops before their enclosing
+    // structural op (ternary / scope) is lowered.
+    {
+      mlir::PassManager pm(context);
+      pm.addPass(P4::P4MLIR::createFlattenCFGPass());
+      if (failed(pm.run(*p4hirModule))) return failure();
+    }
+
     // Find the function
     func::FuncOp p4hirFunc;
     p4hirModule->walk([&](func::FuncOp func) {
       p4hirFunc = func;
       return WalkResult::interrupt();
     });
-    
+
     if (!p4hirFunc) return failure();
-    
+
     // Load exit information from metadata
     std::string metadataFile = llvm::sys::path::parent_path(p4hirFile).str() + "/metadata.json";
     auto exitInfo = BlockExitInfo::loadFromMetadata(metadataFile);
@@ -960,51 +1255,126 @@ private:
     target.addLegalDialect<vdpp::vDPPDialect>();
     target.addLegalDialect<func::FuncDialect>();
     target.addIllegalDialect<P4::P4MLIR::P4HIR::P4HIRDialect>();
-    
+
+    // p4hir.instantiate is treated as dynamically legal so the framework does
+    // not fail when it encounters it before the scope containing its user has
+    // been inlined.  Hash5TupleCallPattern erases InstantiateOp together with
+    // the CallMethodOp; any that remain after applyPartialConversion are cleaned
+    // up in the post-processing walk below.
+    target.addDynamicallyLegalOp<P4::P4MLIR::P4HIR::InstantiateOp>(
+        [](P4::P4MLIR::P4HIR::InstantiateOp op) { return true; });
+
     // Mark func.return as illegal so it gets converted to vdpp.return
     target.addIllegalOp<func::ReturnOp>();
     
-    // Add conversion patterns
-    RewritePatternSet patterns(context);
-    patterns.add<
-      ConstOpConversion,
-      BinOpConversion,
-      CmpOpConversion,
-      CastOpConversion,
-      ReadOpConversion,
-      AssignOpConversion,
-      StructExtractOpConversion,
-      StructExtractRefOpConversion
-    >(typeConverter, context);
-    
-    // Add IfOpConversion and ReturnOpConversion with exit info
-    patterns.add<IfOpConversion>(typeConverter, context, exitInfo);
-    patterns.add<ReturnOpConversion>(typeConverter, context, exitInfo);  // ← Pass exitInfo here!
-    
-    // Create entry block
+    // Helper: build the full pattern set.  Called twice — once for the main
+    // conversion, and once for a follow-up pass that handles ops in blocks
+    // created by TernaryOpConversion (those blocks are not visited by the
+    // first pass because they are inserted via raw block::splice).
+    auto buildPatterns = [&]() {
+      RewritePatternSet p(context);
+      p.add<
+        ConstOpConversion,
+        BinOpConversion,
+        CmpOpConversion,
+        CastOpConversion,
+        ReadOpConversion,
+        AssignOpConversion,
+        StructExtractOpConversion,
+        StructExtractRefOpConversion,
+        Hash5TupleCallPattern,
+        InstantiateOpErasePattern,
+        VariableOpConversion,
+        ScopeOpConversion,
+        TernaryOpConversion,
+        BrOpConversion,
+        CondBrOpConversion
+      >(typeConverter, context);
+      p.add<IfOpConversion>(typeConverter, context, exitInfo);
+      p.add<ReturnOpConversion>(typeConverter, context, exitInfo);
+      return p;
+    };
+
+    // Clone the entire p4hir function body (all blocks) into vdppFunc.
+    // After p4hir-flatten-cfg, the function may have multiple blocks
+    // (for ternary/if CFG edges).  We must clone ALL blocks so that block
+    // successor references remain valid in the vdpp module.
     Block *vdppBody = vdppFunc.addEntryBlock();
     IRMapping mapping;
-    
-    Block &p4hirEntry = p4hirFunc.getBody().front();
-    for (unsigned i = 0; i < p4hirFunc.getNumArguments(); ++i) {
-      mapping.map(p4hirEntry.getArgument(i), vdppBody->getArgument(i));
+
+    Region &p4hirRegion = p4hirFunc.getBody();
+    Region &vdppRegion = vdppFunc.getBody();
+
+    // Map entry block and its function arguments.
+    Block *p4hirEntryBlock = &p4hirRegion.front();
+    mapping.map(p4hirEntryBlock, vdppBody);
+    for (unsigned i = 0; i < p4hirFunc.getNumArguments(); ++i)
+      mapping.map(p4hirEntryBlock->getArgument(i), vdppBody->getArgument(i));
+
+    // Create new (empty) blocks for all non-entry blocks, converting
+    // any P4HIR-typed block arguments to their vdpp equivalents.
+    for (auto &block : llvm::drop_begin(p4hirRegion)) {
+      Block *newBlock = new Block();
+      vdppRegion.push_back(newBlock);
+      mapping.map(&block, newBlock);
+      for (auto arg : block.getArguments()) {
+        Type converted = typeConverter.convertType(arg.getType());
+        Type newArgType = converted ? converted : arg.getType();
+        mapping.map(arg, newBlock->addArgument(newArgType, arg.getLoc()));
+      }
     }
-    
-    // Clone operations
+
+    // Clone all ops in all blocks using the full mapping so that block
+    // successors and value operands are remapped correctly.
     OpBuilder bodyBuilder(context);
-    bodyBuilder.setInsertionPointToStart(vdppBody);
-    
-    for (auto &op : p4hirEntry.getOperations()) {
-      bodyBuilder.clone(op, mapping);
+    for (auto &block : p4hirRegion) {
+      Block *targetBlock = mapping.lookupOrNull(&block);
+      if (!targetBlock) continue;
+      bodyBuilder.setInsertionPointToEnd(targetBlock);
+      for (auto &op : block.getOperations())
+        bodyBuilder.clone(op, mapping);
     }
-    
-    // Apply conversion
-    if (failed(applyPartialConversion(vdppFunc, target, std::move(patterns)))) {
+
+    // First conversion pass.
+    if (failed(applyPartialConversion(vdppFunc, target, buildPatterns()))) {
       vdppModule.erase();
       return failure();
     }
-    
-    // NEW: Post-process to add successor to final return if it doesn't have one
+
+    // Second pass: TernaryOpConversion and ScopeOpConversion move ops into
+    // freshly created blocks via raw splice.  Those blocks are not in the
+    // first pass's traversal, so any remaining P4HIR ops inside them need a
+    // second sweep.
+    if (failed(applyPartialConversion(vdppFunc, target, buildPatterns()))) {
+      vdppModule.erase();
+      return failure();
+    }
+
+    // Clean up any p4hir.instantiate ops that became use-empty after conversion
+    // (Hash5TupleCallPattern normally erases them, but use_empty is the guard).
+    vdppFunc.walk([&](P4::P4MLIR::P4HIR::InstantiateOp instOp) {
+      if (instOp->use_empty())
+        instOp->erase();
+    });
+
+    // Declare Hash5Tuple instances used in this block at module scope.
+    // Each block module is self-contained, so the instance declaration must
+    // be present in the same vdpp.mlir file as the apply op that uses it.
+    {
+      std::set<std::string> declaredInstances;
+      vdppFunc.walk([&](vdpp::Hash5TupleApplyOp applyOp) {
+        std::string instName = applyOp.getInstance().str();
+        if (declaredInstances.insert(instName).second) {
+          OpBuilder instBuilder(vdppModule.getBody(),
+                                vdppModule.getBody()->begin());
+          instBuilder.create<vdpp::Hash5TupleInstanceOp>(
+              vdppFunc.getLoc(),
+              instBuilder.getStringAttr(StringRef(instName)));
+        }
+      });
+    }
+
+    // Post-process to add successor to final return if it doesn't have one
     if (!exitInfo.empty()) {
       vdppFunc.walk([&](vdpp::ReturnOp returnOp) {
         // Check if this return already has a successor attribute

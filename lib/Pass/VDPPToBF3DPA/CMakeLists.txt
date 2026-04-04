@@ -15,4 +15,5 @@ add_mlir_library(MLIRVDPPToBF3DPAPass
   MLIRFuncDialect
   MLIRParser
   MLIREqualitySaturationPass
+  MLIRVDPPToLLVM
 )

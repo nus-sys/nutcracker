@@ -1,0 +1,17 @@
+add_mlir_library(MLIRLLVMIRToVDRMTPass
+  LLVMIRToVDRMTPass.cpp
+
+  ADDITIONAL_HEADER_DIRS
+  ${PROJECT_SOURCE_DIR}/include/Pass
+
+  LINK_LIBS PUBLIC
+  MLIRIR
+  MLIRPass
+  MLIRSupport
+  MLIRParser
+  MLIRFuncDialect
+  MLIRLLVMDialect
+  MLIRvDRMTDialect
+  MLIRTargetLLVMIRImport
+  MLIRLLVMIRToLLVMTranslation
+)

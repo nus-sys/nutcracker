@@ -57,6 +57,29 @@ extern Counter<I> {
     void count(in I index);
 };
 
+/// Traffic policer / meter (token-bucket, two-rate three-color marker)
+/// Returns color: 0=GREEN, 1=YELLOW, 2=RED
+/// meter_type: 0 = packets, 1 = bytes
+extern meter {
+    /// Constructor: size = number of meter slots, meter_type = 0 (packets) or 1 (bytes)
+    meter(bit<32> size, bit<8> meter_type);
+
+    /// Execute meter at slot [index]; result receives the color (bit<8>: 0=green,1=yellow,2=red)
+    void execute_meter<T>(in bit<32> index, out T result);
+};
+
+/// Stateful register array — read/write per-index storage
+extern Register<T> {
+    /// Constructor: create register array with specified size
+    Register(bit<32> size);
+
+    /// Read element at given index
+    T read(in bit<32> index);
+
+    /// Write value to element at given index
+    void write(in bit<32> index, in T value);
+};
+
 /// Hardware-accelerated 5-tuple hash (CRC32-based)
 extern Hash5Tuple {
     /// Constructor: initialize hash unit

@@ -26,3 +26,10 @@ mlir_tablegen(vDRMTTypeInterfaces.cpp.inc -gen-type-interface-defs)
 add_public_tablegen_target(VDRMT_TypeInterfacesIncGen)
 add_dependencies(mlir-headers VDRMT_TypeInterfacesIncGen)
 
+set(LLVM_TARGET_DEFINITIONS vDRMTOpInterfaces.td)
+mlir_tablegen(vDRMTOpInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(vDRMTOpInterfaces.cpp.inc -gen-op-interface-defs)
+
+add_public_tablegen_target(VDRMT_OpInterfacesIncGen)
+add_dependencies(mlir-headers VDRMT_OpInterfacesIncGen)
+

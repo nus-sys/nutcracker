@@ -13,5 +13,5 @@ add_mlir_library(MLIREmitHandlerCodePass
   MLIRvDPPDialect
   MLIRbf3dpaDialect
   MLIRBf3dpaToDPACodegen
-  MLIRBf3dpaToARMCodegen
+  MLIRVDPPToLLVM
 )

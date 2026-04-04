@@ -27,6 +27,7 @@ P4_INCLUDE_DIR="$ROOT_DIR/p4include"
 P4MLIR_TRANSLATE="$P4C_DIR/build/p4mlir-translate"
 NUTCRACKER_OPT="$BUILD_DIR/bin/nutcracker-opt"
 MAPPER="$ROOT_DIR/deps/mapper/target/release/mapper"
+CLANG="${CLANG:-$ROOT_DIR/third_party/llvm/build/bin/clang}"
 
 # ============================================================================
 # Helper Functions
@@ -339,6 +340,40 @@ run_partition_pass() {
     echo ""
 }
 
+run_vffs_coarse_grained() {
+    local output_dir=$1
+
+    print_step "Step 3b: vFFS Coarse-Grained Pass (lift counter declarations)"
+    print_substep "Partition dir: $output_dir"
+
+    if [ ! -f "$NUTCRACKER_OPT" ]; then
+        print_error "nutcracker-opt not found."
+        exit 1
+    fi
+
+    local processed=0
+    for block_dir in "$output_dir"/block*; do
+        local vdrmt_file="$block_dir/vdrmt.mlir"
+        if [ ! -f "$vdrmt_file" ]; then
+            continue
+        fi
+
+        # Run vffs-coarse-grained in-place via mlir-opt pipeline
+        local tmp_file="$vdrmt_file.vffs_tmp"
+        "$NUTCRACKER_OPT" --vffs-coarse-grained "$vdrmt_file" -o "$tmp_file" 2>/dev/null \
+            && mv "$tmp_file" "$vdrmt_file" \
+            || rm -f "$tmp_file"
+        processed=$((processed + 1))
+    done
+
+    if [ "$processed" -gt 0 ]; then
+        print_success "vFFS coarse-grained pass applied to $processed block(s)"
+    else
+        print_substep "No vdrmt.mlir blocks found (skipping)"
+    fi
+    echo ""
+}
+
 run_fine_grained_lowering() {
     local mlir_file=$1
     local output_dir=$2
@@ -607,6 +642,149 @@ generate_visualization() {
 }
 
 # ============================================================================
+# C App Functions (C → LLVM IR → vDRMT/vDPP)
+# ============================================================================
+
+precompile_c_app() {
+    local app_name=$1
+    local app_dir="$APPS_DIR/$app_name"
+    local c_file="$app_dir/${app_name}.c"
+    local ll_file="$app_dir/arm.ll"
+    local force=${2:-false}
+
+    if [ -f "$ll_file" ] && [ "$force" = false ]; then
+        print_info "LLVM IR already exists for $app_name (use --force to regenerate)"
+        return 0
+    fi
+
+    print_section "Precompiling C app: $app_name"
+    print_step "C → LLVM IR: $(basename $c_file)"
+    print_substep "Clang: $CLANG"
+    print_substep "Output: $ll_file"
+
+    if [ ! -f "$CLANG" ]; then
+        print_error "clang not found: $CLANG"
+        exit 1
+    fi
+
+    local ll_raw="$app_dir/arm_raw.ll"
+    local OPT="${OPT:-$ROOT_DIR/third_party/llvm/build/bin/opt}"
+
+    "$CLANG" -O0 -S -emit-llvm \
+        -fno-discard-value-names \
+        -o "$ll_raw" "$c_file" 2>&1
+
+    if [ $? -ne 0 ]; then
+        print_error "C compilation failed"
+        return 1
+    fi
+
+    # Promote alloca-based variables to SSA (simplifies provenance tracking).
+    # Strip 'optnone' first so mem2reg can run (it's added by -O0).
+    print_substep "Running mem2reg pass..."
+    sed 's/ optnone//g; s/noinline //g' "$ll_raw" | \
+        "$OPT" -passes=mem2reg -S -o "$ll_file" 2>&1
+
+    if [ $? -ne 0 ]; then
+        print_warning "mem2reg failed, using raw IR"
+        cp "$ll_raw" "$ll_file"
+    fi
+
+    local line_count=$(wc -l < "$ll_file")
+    print_success "Generated LLVM IR ($line_count lines)"
+    echo ""
+}
+
+compile_c_app() {
+    local app_name=$1
+    local app_dir="$APPS_DIR/$app_name"
+    local ll_file="$app_dir/arm.ll"
+    local output_dir="$OUTPUT_DIR"
+
+    print_header "Compiling C app: $app_name"
+
+    if [ ! -f "$ll_file" ]; then
+        print_error "LLVM IR not found: $ll_file (run precompile first)"
+        exit 1
+    fi
+
+    if [ ! -f "$NUTCRACKER_OPT" ]; then
+        print_error "nutcracker-opt not found. Please build NutCracker first."
+        exit 1
+    fi
+
+    rm -rf "$output_dir"
+
+    # Run vDPP lowering (non-fatal: some ops may be unhandled)
+    print_step "Step 1: LLVM IR → vDPP"
+    echo "" | "$NUTCRACKER_OPT" \
+        "--llvm-ir-to-vdpp=input-ll=$ll_file output-dir=$output_dir" \
+        /dev/null 2>&1 || true
+    local vdpp_result=$?
+
+    # Run vDRMT lowering
+    print_step "Step 2: LLVM IR → vDRMT"
+    # Run per block since each block has its own arm.ll from vDPP
+    local block_idx=0
+    for block_dir in "$output_dir"/block*; do
+        if [ -f "$block_dir/arm.ll" ]; then
+            echo "" | "$NUTCRACKER_OPT" \
+                "--llvm-ir-to-vdrmt=input-ll=$block_dir/arm.ll output-dir=$block_dir/.vdrmt_tmp" \
+                /dev/null 2>&1
+            # Move the generated vdrmt.mlir up from .vdrmt_tmp/block0/
+            if [ -f "$block_dir/.vdrmt_tmp/block0/vdrmt.mlir" ]; then
+                mv "$block_dir/.vdrmt_tmp/block0/vdrmt.mlir" "$block_dir/vdrmt.mlir"
+            fi
+            rm -rf "$block_dir/.vdrmt_tmp"
+            block_idx=$((block_idx + 1))
+        fi
+    done
+
+    # If vDPP didn't create arm.ll blocks (single-function C), run vDRMT on original
+    if [ "$block_idx" -eq 0 ]; then
+        print_substep "No per-block arm.ll found; running vDRMT on original LLVM IR"
+        mkdir -p "$output_dir/block0"
+        echo "" | "$NUTCRACKER_OPT" \
+            "--llvm-ir-to-vdrmt=input-ll=$ll_file output-dir=$output_dir/.vdrmt_tmp" \
+            /dev/null 2>&1
+        if [ -d "$output_dir/.vdrmt_tmp" ]; then
+            for b in "$output_dir/.vdrmt_tmp"/block*; do
+                local bname=$(basename "$b")
+                mkdir -p "$output_dir/$bname"
+                [ -f "$b/vdrmt.mlir" ] && mv "$b/vdrmt.mlir" "$output_dir/$bname/vdrmt.mlir"
+            done
+            rm -rf "$output_dir/.vdrmt_tmp"
+        fi
+    fi
+
+    # Summary
+    local vdrmt_count=$(find "$output_dir" -name "vdrmt.mlir" 2>/dev/null | wc -l)
+    local vdpp_count=$(find "$output_dir" -name "vdpp.mlir" 2>/dev/null | wc -l)
+    local block_count=$(find "$output_dir" -maxdepth 1 -type d -name "block*" 2>/dev/null | wc -l)
+
+    print_header "Compilation Summary"
+    echo -e "${BOLD}📦 Application:${NC} $app_name"
+    echo -e "${BOLD}🧩 Blocks:${NC}      $block_count"
+    echo -e "${BOLD}📂 Output:${NC}      $output_dir"
+    echo ""
+    echo -e "  ${GREEN}vDRMT blocks:${NC} $vdrmt_count"
+    echo -e "  ${BLUE}vDPP blocks:${NC}  $vdpp_count"
+    echo ""
+    for block_dir in "$output_dir"/block*; do
+        if [ -d "$block_dir" ]; then
+            local bname=$(basename "$block_dir")
+            echo -e "  ${CYAN}📦 $bname:${NC}"
+            [ -f "$block_dir/vdpp.mlir"  ] && echo -e "    ${BLUE}📄 vdpp.mlir${NC}"
+            [ -f "$block_dir/vdrmt.mlir" ] && echo -e "    ${GREEN}📄 vdrmt.mlir${NC}"
+            [ -f "$block_dir/arm.ll"     ] && echo -e "    ${MAGENTA}📄 arm.ll${NC}"
+        fi
+    done
+    echo ""
+    print_success "Compilation complete!"
+    echo ""
+}
+
+# ============================================================================
 # Precompile Functions
 # ============================================================================
 
@@ -614,9 +792,16 @@ precompile_app() {
     local app_name=$1
     local app_dir="$APPS_DIR/$app_name"
     local p4_file="$app_dir/${app_name}.p4"
+    local c_file="$app_dir/${app_name}.c"
     local mlir_file="$app_dir/${app_name}.mlir"
     local force=${2:-false}
-    
+
+    # Dispatch to C path if no P4 but C exists
+    if [ ! -f "$p4_file" ] && [ -f "$c_file" ]; then
+        precompile_c_app "$app_name" "$force"
+        return $?
+    fi
+
     if [ ! -f "$p4_file" ]; then
         print_error "P4 file not found: $p4_file"
         return 1
@@ -688,11 +873,18 @@ compile_app() {
     local app_name=$1
     local app_dir="$APPS_DIR/$app_name"
     local p4_file="$app_dir/${app_name}.p4"
+    local c_file="$app_dir/${app_name}.c"
     local mlir_file="$app_dir/${app_name}.mlir"
     local output_dir="$OUTPUT_DIR"
-    
+
+    # Dispatch to C path if no P4 but C exists
+    if [ ! -f "$p4_file" ] && [ -f "$c_file" ]; then
+        compile_c_app "$app_name"
+        return $?
+    fi
+
     print_header "Compiling: $app_name"
-    
+
     if [ ! -f "$p4_file" ]; then
         print_error "P4 file not found: $p4_file"
         exit 1
@@ -711,6 +903,9 @@ compile_app() {
     
     # Step 3: Lower to both vDRMT and vDPP
     run_lowering_passes "$mlir_file" "$output_dir"
+
+    # Step 3b: vFFS coarse-grained pass (lift counter declarations to module scope)
+    run_vffs_coarse_grained "$output_dir"
 
     # Step 4a: Fine-grained lowering: vDRMT → bf3drmt  +  mapper.egg generation
     run_fine_grained_lowering "$mlir_file" "$output_dir"

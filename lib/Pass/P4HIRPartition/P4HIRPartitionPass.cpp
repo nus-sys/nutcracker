@@ -32,6 +32,37 @@ using namespace P4::P4MLIR::P4HIR;
 namespace {
 
 // ============================================================================
+// Packet-derivation check (P4HIR level)
+// ============================================================================
+
+/// Return false if v's def-chain contains a stateful read (call_method whose
+/// leaf name is "read" or "execute").  Block arguments — which represent
+/// hdr/meta values at block boundaries — are conservatively packet-derived.
+///
+/// This is intentionally shallow: we trace through arithmetic/cast/extract
+/// ops but not through memory references (load/store on struct fields).  That
+/// keeps the analysis sound for the common case and is the "simple" starting
+/// point the architecture calls for.
+static bool isPacketDerivedP4HIR(Value v, DenseSet<Value> &visited) {
+    if (!visited.insert(v).second) return true; // cycle guard
+    Operation *def = v.getDefiningOp();
+    if (!def) return true; // block argument → conservatively packet-derived
+    if (auto callOp = dyn_cast<CallMethodOp>(def)) {
+        StringRef leaf = callOp.getCallee().getLeafReference();
+        // "read"    — register / direct stateful read
+        // "execute" — meter execute, returns color derived from state
+        if (leaf == "read" || leaf == "execute")
+            return false;
+        // Other call_methods (hash5tuple.apply, count, …) are pure
+        // packet-function calls and do not introduce state dependency.
+    }
+    for (Value operand : def->getOperands())
+        if (!isPacketDerivedP4HIR(operand, visited))
+            return false;
+    return true;
+}
+
+// ============================================================================
 // Exit Information - NEW!
 // ============================================================================
 
@@ -89,6 +120,7 @@ struct BasicBlock {
   int blockId;
   std::string controlName;
   SmallVector<Operation*> operations;
+  llvm::SmallPtrSet<Operation*, 4> branchPointIfOps; // IfOps whose branches became separate blocks
   SmallVector<Value> liveIns;
   SmallVector<Value> liveOuts;
   
@@ -103,6 +135,8 @@ struct BasicBlock {
   bool hasConditionalBranch = false;
   bool isPacketProcessing = false;
   bool hasNestedControlCall = false;
+  bool setsDropBit = false;  // writes standard_meta.drop = 1
+  bool isTerminal = false;   // synthetic forward/drop terminal block
   
   struct MappingCapability {
     bool canMapToVDRMT = true;
@@ -121,37 +155,144 @@ struct BasicBlock {
   MemoryScope memoryScope = NoMemory;
   
   void analyze() {
+    // Collect all ops including those nested inside IfOp regions.
+    SmallVector<Operation *> allOps;
     for (auto *op : operations) {
-      if (isa<TableApplyOp>(op)) {
+      allOps.push_back(op);
+      op->walk([&](Operation *nested) {
+        if (nested != op) allOps.push_back(nested);
+      });
+    }
+
+    // Track which Values are refs to the "drop" field so we can detect writes.
+    llvm::SmallPtrSet<Value, 4> dropRefs;
+
+    for (auto *op : allOps) {
+      if (isa<TableApplyOp>(op))
         hasTableApply = true;
-      }
       if (auto callOp = dyn_cast<CallMethodOp>(op)) {
         auto methodName = callOp.getCallee().getLeafReference();
-        if (methodName == "read" || methodName == "write") {
+        if (methodName == "read" || methodName == "write")
           hasMemoryAccess = true;
+      }
+      if (isa<IfOp>(op))
+        hasConditionalBranch = true;
+      if (isa<StructExtractOp, StructExtractRefOp>(op))
+        isPacketProcessing = true;
+      if (isa<ApplyOp>(op))
+        hasNestedControlCall = true;
+
+      // Detect: p4hir.struct_extract_ref %standard_meta['drop']
+      if (auto extractRef = dyn_cast<StructExtractRefOp>(op)) {
+        if (extractRef.getFieldName() == "drop")
+          dropRefs.insert(extractRef.getResult());
+      }
+      // Detect: p4hir.assign %const_1 → drop_ref
+      if (auto assignOp = dyn_cast<AssignOp>(op)) {
+        if (dropRefs.contains(assignOp.getRef())) {
+          // Any assignment to the drop field counts — the constant value is
+          // always 1 in well-formed P4 (you only set drop, never clear it).
+          setsDropBit = true;
         }
       }
-      if (isa<IfOp>(op)) {
-        hasConditionalBranch = true;
-      }
-      if (isa<StructExtractOp, StructExtractRefOp>(op)) {
-        isPacketProcessing = true;
-      }
-      if (isa<ApplyOp>(op)) {
-        hasNestedControlCall = true;
-      }
     }
-    
+
     determineMapping();
   }
   
+  /// Return false if any stateful call_method in `root` has a non-packet-derived
+  /// index argument.  Used to check both direct ops and callee bodies.
+  static bool statefulOpsAllPacketDerived(Operation *root) {
+    bool ok = true;
+    root->walk([&](CallMethodOp callOp) {
+      StringRef leaf = callOp.getCallee().getLeafReference();
+      if (leaf != "read" && leaf != "write" && leaf != "execute")
+        return WalkResult::advance();
+      auto args = callOp.getArgOperands();
+      if (args.empty()) return WalkResult::advance();
+      DenseSet<Value> visited;
+      if (!isPacketDerivedP4HIR(args[0], visited)) {
+        ok = false;
+        return WalkResult::interrupt();
+      }
+      return WalkResult::advance();
+    });
+    return ok;
+  }
+
   void determineMapping() {
+    // bf3drmt is the concrete target for vDRMT blocks.  It handles counter
+    // and meter sharing natively in hardware, and uses hardware-level packet
+    // distribution for registers.  So vDRMT is always a valid target.
     capability.canMapToVDRMT = true;
+
+    // bf3dpa is the concrete target for vDPP blocks (ARM cores).  Multiple
+    // cores run in parallel with no hardware packet-sharding assist, so any
+    // stateful op whose index is NOT derived from packet fields alone could
+    // produce conflicting accesses across cores.
+    //
+    // Simple rule: if any stateful op (register read/write, meter execute) in
+    // this block (or in a directly called P4 action) uses a non-packet-derived
+    // index, the block cannot map to vDPP.
     capability.canMapToVDPP = true;
-    
-    if (memoryScope == SharedNonPartitionable) {
-      capability.canMapToVDRMT = false;
-      capability.reason = "vDRMT does not support shared non-partitionable memory";
+
+    if (operations.empty()) return;
+
+    // Find the enclosing ControlOp so we can resolve p4hir.call callees.
+    ControlOp enclosingControl =
+        operations[0]->getParentOfType<ControlOp>();
+
+    // Flatten nested ops (IfOp regions, etc.) for the scan.
+    SmallVector<Operation *> allOps;
+    for (auto *op : operations) {
+      allOps.push_back(op);
+      op->walk([&](Operation *nested) {
+        if (nested != op) allOps.push_back(nested);
+      });
+    }
+
+    for (auto *op : allOps) {
+      // ── Direct stateful call_method ────────────────────────────────────────
+      if (auto callOp = dyn_cast<CallMethodOp>(op)) {
+        StringRef leaf = callOp.getCallee().getLeafReference();
+        if (leaf == "read" || leaf == "write" || leaf == "execute") {
+          auto args = callOp.getArgOperands();
+          if (!args.empty()) {
+            DenseSet<Value> visited;
+            if (!isPacketDerivedP4HIR(args[0], visited)) {
+              capability.canMapToVDPP = false;
+              capability.reason =
+                  "stateful op index not packet-derived; "
+                  "bf3dpa requires packet-shardable indices";
+              return;
+            }
+          }
+        }
+        continue;
+      }
+
+      // ── Indirect: p4hir.call @action() — resolve one level ────────────────
+      // P4 actions are declared as p4hir.func inside the enclosing control.
+      // Walk the control to find the body and apply the same check.
+      if (auto callOp = dyn_cast<CallOp>(op)) {
+        if (!enclosingControl) continue;
+        StringRef callee = callOp.getCallee();
+        FuncOp actionFunc;
+        enclosingControl.walk([&](FuncOp f) {
+          if (f.getSymName() == callee) {
+            actionFunc = f;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+        if (actionFunc && !statefulOpsAllPacketDerived(actionFunc)) {
+          capability.canMapToVDPP = false;
+          capability.reason =
+              "stateful op in called action has non-packet-derived index; "
+              "bf3dpa requires packet-shardable indices";
+          return;
+        }
+      }
     }
   }
 };
@@ -508,9 +649,12 @@ public:
     auto blocks = flattenControl(mainControl);
     llvm::outs() << "    → Generated " << blocks.size() << " blocks\n\n";
     
-    // NEW: Link successor IDs now that all blocks exist
+    // Link conditional/fallthrough successors now that all blocks exist.
     linkSuccessors(blocks);
-    
+
+    // Append synthetic terminal blocks and wire all pipeline-exit leaves to them.
+    appendTerminalBlocks(blocks);
+
     return blocks;
   }
 
@@ -520,8 +664,13 @@ private:
   ModuleOp module;
   int nextBlockId = 0;
   
-  // NEW: Track which blocks are successors
+  // Conditional successors: if-condition block → [then-entry, else-entry]
   DenseMap<BasicBlock*, SmallVector<BasicBlock*>> pendingSuccessors;
+  // Fall-through successors: table block → index in blocks[] of the next block
+  DenseMap<BasicBlock*, size_t> pendingFallthroughIdx;
+  // Implicit else: no-else if-condition block → index in blocks[] where
+  // continuation starts (or past-end if nothing follows → wire to FORWARD).
+  DenseMap<BasicBlock*, size_t> pendingImplicitElseIdx;
   
   SmallVector<BasicBlock*> flattenControl(ControlOp controlOp) {
     SmallVector<BasicBlock*> blocks;
@@ -583,37 +732,48 @@ private:
         llvm::outs() << "            → IfOp: INCLUDING it WITH condition\n";
         
         bb->operations.push_back(&op);
+        bb->branchPointIfOps.insert(&op); // mark as partitioned branch point
         bb->hasConditionalBranch = true;
         bb->analyze();
         blocks.push_back(bb);
-        
-        llvm::outs() << "              Created block " << bb->blockId 
+
+        llvm::outs() << "              Created block " << bb->blockId
                      << " with " << bb->operations.size() << " ops\n";
-        
-        // NEW: Flatten branches and track successors
+
+        // Flatten branches and track successors.
         auto branchSuccessors = flattenIfBranches(ifOp, blocks, bb, controlName);
         pendingSuccessors[bb] = branchSuccessors;
-        
+
+        // If the P4 source had no else branch, record the index where the
+        // continuation block will be created.  appendTerminalBlocks() uses
+        // this to wire the implicit else edge (→ continuation or → FORWARD).
+        BasicBlock *condBB = bb;
         bb = new BasicBlock();
         bb->blockId = nextBlockId++;
         bb->controlName = controlName;
+        if (ifOp.getElseRegion().empty())
+          pendingImplicitElseIdx[condBB] = blocks.size();
         
       } else if (auto tableApply = dyn_cast<TableApplyOp>(&op)) {
         llvm::outs() << "            → TableApplyOp\n";
-        
+
         if (!bb->operations.empty()) {
           bb->analyze();
           blocks.push_back(bb);
+          // Pre-table ops block falls through to the table block (pushed next).
+          pendingFallthroughIdx[bb] = blocks.size();
           bb = new BasicBlock();
           bb->blockId = nextBlockId++;
           bb->controlName = controlName;
         }
-        
+
         bb->operations.push_back(&op);
         bb->hasTableApply = true;
         bb->analyze();
         blocks.push_back(bb);
-        
+        // Table block falls through to the first block created after it.
+        pendingFallthroughIdx[bb] = blocks.size();
+
         bb = new BasicBlock();
         bb->blockId = nextBlockId++;
         bb->controlName = controlName;
@@ -636,96 +796,151 @@ private:
   }
   
   // NEW: Returns successors for linking later
-  SmallVector<BasicBlock*> flattenIfBranches(IfOp ifOp, SmallVector<BasicBlock*> &blocks, 
+  SmallVector<BasicBlock*> flattenIfBranches(IfOp ifOp, SmallVector<BasicBlock*> &blocks,
                                               BasicBlock *conditionBB, const std::string& controlName) {
     SmallVector<BasicBlock*> successors;
-    
-    auto *thenBB = new BasicBlock();
-    thenBB->blockId = nextBlockId++;
-    thenBB->controlName = controlName;
-    thenBB->predecessors.push_back(conditionBB);
-    
-    llvm::outs() << "              Processing then branch\n";
-    
-    for (auto &thenBlock : ifOp.getThenRegion().getBlocks()) {
-      for (auto &op : thenBlock.getOperations()) {
-        if (!op.hasTrait<mlir::OpTrait::IsTerminator>()) {
-          llvm::outs() << "                - " << op.getName() << "\n";
-          thenBB->operations.push_back(&op);
-        }
-      }
+
+    // ── then branch ──────────────────────────────────────────────────────────
+    llvm::outs() << "              Processing then branch (recursive)\n";
+    size_t beforeThen = blocks.size();
+    for (auto &thenBlock : ifOp.getThenRegion().getBlocks())
+      flattenBlock(&thenBlock, blocks, controlName);
+
+    if (blocks.size() > beforeThen) {
+      BasicBlock *thenEntry = blocks[beforeThen];
+      thenEntry->predecessors.push_back(conditionBB);
+      successors.push_back(thenEntry);
+      llvm::outs() << "              Then entry block " << thenEntry->blockId
+                   << " (" << (blocks.size() - beforeThen) << " blocks total)\n";
     }
-    thenBB->analyze();
-    blocks.push_back(thenBB);
-    successors.push_back(thenBB);
-    
-    llvm::outs() << "              Created then block " << thenBB->blockId 
-                 << " with " << thenBB->operations.size() << " ops\n";
-    
+
+    // ── else branch (optional) ────────────────────────────────────────────────
     if (!ifOp.getElseRegion().empty()) {
-      auto *elseBB = new BasicBlock();
-      elseBB->blockId = nextBlockId++;
-      elseBB->controlName = controlName;
-      elseBB->predecessors.push_back(conditionBB);
-      
-      llvm::outs() << "              Processing else branch\n";
-      
-      for (auto &elseBlock : ifOp.getElseRegion().getBlocks()) {
-        for (auto &op : elseBlock.getOperations()) {
-          if (!op.hasTrait<mlir::OpTrait::IsTerminator>()) {
-            llvm::outs() << "                - " << op.getName() << "\n";
-            elseBB->operations.push_back(&op);
-          }
-        }
+      llvm::outs() << "              Processing else branch (recursive)\n";
+      size_t beforeElse = blocks.size();
+      for (auto &elseBlock : ifOp.getElseRegion().getBlocks())
+        flattenBlock(&elseBlock, blocks, controlName);
+
+      if (blocks.size() > beforeElse) {
+        BasicBlock *elseEntry = blocks[beforeElse];
+        elseEntry->predecessors.push_back(conditionBB);
+        successors.push_back(elseEntry);
+        llvm::outs() << "              Else entry block " << elseEntry->blockId
+                     << " (" << (blocks.size() - beforeElse) << " blocks total)\n";
       }
-      elseBB->analyze();
-      blocks.push_back(elseBB);
-      successors.push_back(elseBB);
-      
-      llvm::outs() << "              Created else block " << elseBB->blockId 
-                   << " with " << elseBB->operations.size() << " ops\n";
     }
-    
+
     return successors;
   }
   
-  // NEW: Link successor block IDs after all blocks are created
   void linkSuccessors(SmallVector<BasicBlock*> &blocks) {
     llvm::outs() << "\n  Linking block successors...\n";
-    
+
     for (auto *bb : blocks) {
       if (pendingSuccessors.count(bb)) {
+        // If-condition block: then/else branch exits.
         auto &successorBlocks = pendingSuccessors[bb];
-        
-        // Update the actual successor list
         bb->successors = successorBlocks;
-        
-        // Create exit info
         int exitId = 0;
         for (auto *succ : successorBlocks) {
           ControlFlowExit exit;
           exit.exitId = exitId;
           exit.successorBlockId = succ->blockId;
           exit.condition = (exitId == 0) ? "then" : "else";
-          
           bb->exits.push_back(exit);
-          
-          llvm::outs() << "    Block " << bb->blockId << " exit " << exitId 
+          llvm::outs() << "    Block " << bb->blockId << " exit " << exitId
                        << " → Block " << succ->blockId << " (" << exit.condition << ")\n";
-          
           exitId++;
         }
+      } else if (pendingFallthroughIdx.count(bb)) {
+        // Table block (or pre-table block): single fall-through exit.
+        size_t idx = pendingFallthroughIdx[bb];
+        if (idx < blocks.size()) {
+          BasicBlock *dst = blocks[idx];
+          bb->successors.push_back(dst);
+          ControlFlowExit exit;
+          exit.exitId = 0;
+          exit.successorBlockId = dst->blockId;
+          exit.condition = "default";
+          bb->exits.push_back(exit);
+          llvm::outs() << "    Block " << bb->blockId << " fallthrough → Block "
+                       << dst->blockId << "\n";
+        } else {
+          // Table is the last block in its branch → end of pipeline.
+          ControlFlowExit exit;
+          exit.exitId = 0;
+          exit.successorBlockId = -1;
+          exit.condition = "default";
+          bb->exits.push_back(exit);
+          llvm::outs() << "    Block " << bb->blockId << " fallthrough → END\n";
+        }
       } else if (!bb->operations.empty()) {
-        // No explicit successors = end of pipeline
+        // Leaf block with no recorded successors → end of pipeline.
         ControlFlowExit exit;
         exit.exitId = 0;
-        exit.successorBlockId = -1;  // -1 = end of pipeline
+        exit.successorBlockId = -1;
         exit.condition = "default";
         bb->exits.push_back(exit);
-        
         llvm::outs() << "    Block " << bb->blockId << " exit 0 → END\n";
       }
     }
+  }
+
+  // Create synthetic forward/drop terminal blocks.  Every leaf that currently
+  // has successorBlockId == -1 is rewired to the appropriate terminal.
+  void appendTerminalBlocks(SmallVector<BasicBlock*> &blocks) {
+    // Build the two terminals.
+    auto *fwdBlock = new BasicBlock();
+    fwdBlock->blockId = nextBlockId++;
+    fwdBlock->controlName = "pipeline_exit";
+    fwdBlock->isTerminal = true;
+
+    auto *dropBlock = new BasicBlock();
+    dropBlock->blockId = nextBlockId++;
+    dropBlock->controlName = "pipeline_exit";
+    dropBlock->isTerminal = true;
+
+    // Wire leaves to the appropriate terminal and update their exit records.
+    bool anyDrop = false;
+    for (auto *bb : blocks) {
+      for (auto &exit : bb->exits) {
+        if (exit.successorBlockId != -1) continue;
+        BasicBlock *terminal = bb->setsDropBit ? dropBlock : fwdBlock;
+        exit.successorBlockId = terminal->blockId;
+        exit.condition = bb->setsDropBit ? "drop" : "forward";
+        bb->successors.push_back(terminal);
+        terminal->predecessors.push_back(bb);
+        if (bb->setsDropBit) anyDrop = true;
+        llvm::outs() << "    Block " << bb->blockId << " → terminal "
+                     << exit.condition << " (block " << terminal->blockId << ")\n";
+      }
+    }
+
+    // Wire implicit else edges for no-else if-condition blocks.
+    // At this point blocks[] contains all pipeline blocks but NOT the terminals
+    // yet, so idx >= blocks.size() reliably means "nothing follows → forward".
+    for (auto &[condBB, idx] : pendingImplicitElseIdx) {
+      BasicBlock *elseDst = (idx < blocks.size()) ? blocks[idx] : fwdBlock;
+      condBB->successors.push_back(elseDst);
+      ControlFlowExit exit;
+      exit.exitId = (int)condBB->exits.size();
+      exit.successorBlockId = elseDst->blockId;
+      exit.condition = "else";
+      condBB->exits.push_back(exit);
+      elseDst->predecessors.push_back(condBB);
+      llvm::outs() << "    Block " << condBB->blockId << " implicit else → Block "
+                   << elseDst->blockId << "\n";
+    }
+
+    blocks.push_back(fwdBlock);
+    if (anyDrop)
+      blocks.push_back(dropBlock);
+    else
+      delete dropBlock;
+
+    llvm::outs() << "    Added terminal block: forward (block " << fwdBlock->blockId << ")\n";
+    if (anyDrop)
+      llvm::outs() << "    Added terminal block: drop (block " << dropBlock->blockId << ")\n";
   }
 };
 
@@ -780,13 +995,71 @@ private:
       llvm::errs() << "Failed to create directory: " << blockDir << "\n";
       return failure();
     }
-    
-    if (failed(writeP4HIR(bb, blockDir, blockNum))) return failure();
+
+    // Terminal blocks have no ops — only emit metadata.
+    if (!bb->isTerminal) {
+      if (failed(writeP4HIR(bb, blockDir, blockNum))) return failure();
+    }
     if (failed(writeMetadata(bb, blockDir))) return failure();
-    
+
     return success();
   }
     
+  // Ensure that 'v' (a value defined in the original control) is available in
+  // 'mapping'. If not, recursively clone its defining op (and all its
+  // transitive dependencies) using 'builder'.
+  void ensureAvailable(Value v, IRMapping &mapping, OpBuilder &builder) {
+    if (mapping.contains(v)) return;
+    Operation *defOp = v.getDefiningOp();
+    if (!defOp) return; // block argument — should already be mapped
+    for (auto operand : defOp->getOperands())
+      ensureAvailable(operand, mapping, builder);
+    Operation *cloned = builder.clone(*defOp, mapping);
+    for (unsigned i = 0; i < defOp->getNumResults(); ++i)
+      mapping.map(defOp->getResult(i), cloned->getResult(i));
+  }
+
+  // Walk 'root' looking for p4hir.call ops whose callee is an action in
+  // 'originalControl'. For each one, inline the action body in-place (inserting
+  // ops immediately before the call) and erase the call.
+  void inlineActionCalls(Operation *root, ControlOp originalControl,
+                         IRMapping &outerMapping) {
+    // Collect calls first (walk + erase is unsafe).
+    SmallVector<CallOp> calls;
+    root->walk([&](CallOp c) { calls.push_back(c); });
+
+    for (auto callOp : calls) {
+      StringRef actionName = callOp.getCallee();
+
+      // Find the matching action FuncOp in the original control.
+      FuncOp actionFunc;
+      originalControl.walk([&](FuncOp f) {
+        if (f.getSymName() == actionName) {
+          actionFunc = f;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (!actionFunc || actionFunc.getBody().empty()) continue;
+
+      // Insert action body ops immediately before the call.
+      OpBuilder ab(callOp);
+      IRMapping actionMapping(outerMapping); // inherits control-arg mappings
+
+      Block &entry = actionFunc.getBody().front();
+      for (auto &aOp : entry.getOperations()) {
+        if (aOp.hasTrait<OpTrait::IsTerminator>()) break;
+        // Ensure every operand (potentially from outer control scope) is mapped.
+        for (auto operand : aOp.getOperands())
+          ensureAvailable(operand, actionMapping, ab);
+        Operation *inlined = ab.clone(aOp, actionMapping);
+        for (unsigned i = 0; i < aOp.getNumResults(); ++i)
+          actionMapping.map(aOp.getResult(i), inlined->getResult(i));
+      }
+      callOp.erase();
+    }
+  }
+
   LogicalResult writeP4HIR(BasicBlock *bb, StringRef blockDir, int blockNum) {
     std::string filename = (blockDir + "/p4hir.mlir").str();
     std::error_code ec;
@@ -836,46 +1109,75 @@ private:
     
     for (auto *op : bb->operations) {
       if (auto ifOp = dyn_cast<IfOp>(op)) {
-        Value condition = ifOp.getCondition();
-        Value mappedCondition = mapping.lookupOrDefault(condition);
-        
-        bool hasElse = !ifOp.getElseRegion().empty();
-        
-        auto emptyBuilder = [](OpBuilder &b, Location loc) {
-          b.create<YieldOp>(loc);
-        };
-        
-        if (hasElse) {
-          builder.create<IfOp>(
-            UnknownLoc::get(context),
-            mappedCondition,
-            true,
-            emptyBuilder,
-            DictionaryAttr(),
-            emptyBuilder,
-            DictionaryAttr()
-          );
+        if (bb->branchPointIfOps.count(op)) {
+          // This IfOp was partitioned: its branches became separate blocks.
+          // Reconstruct with empty bodies (condition-only marker).
+          Value condition = ifOp.getCondition();
+          Value mappedCondition = mapping.lookupOrDefault(condition);
+
+          bool hasElse = !ifOp.getElseRegion().empty();
+
+          auto emptyBuilder = [](OpBuilder &b, Location loc) {
+            b.create<YieldOp>(loc);
+          };
+
+          if (hasElse) {
+            builder.create<IfOp>(
+              UnknownLoc::get(context),
+              mappedCondition,
+              true,
+              emptyBuilder,
+              DictionaryAttr(),
+              emptyBuilder,
+              DictionaryAttr()
+            );
+          } else {
+            builder.create<IfOp>(
+              UnknownLoc::get(context),
+              mappedCondition,
+              false,
+              emptyBuilder,
+              DictionaryAttr()
+            );
+          }
         } else {
-          builder.create<IfOp>(
-            UnknownLoc::get(context),
-            mappedCondition,
-            false,
-            emptyBuilder,
-            DictionaryAttr()
-          );
+          // Inline IfOp (action-level control flow): clone with full content,
+          // then inline any p4hir.call to actions so the output module is
+          // self-contained (no dangling callee references).
+          Operation *cloned = builder.clone(*op, mapping);
+          inlineActionCalls(cloned, originalControl, mapping);
+          for (unsigned i = 0; i < op->getNumResults(); ++i) {
+            mapping.map(op->getResult(i), cloned->getResult(i));
+          }
         }
-        
+
       } else {
+        // Ensure all values used in this op's subtree (including nested
+        // regions) that are defined outside this op are available in mapping.
+        // This covers extern instances (e.g. p4hir.instantiate @Hash5Tuple)
+        // defined at control scope but referenced inside p4hir.scope regions.
+        op->walk([&](Operation *nested) {
+          for (auto operand : nested->getOperands()) {
+            Operation *defOp = operand.getDefiningOp();
+            if (!defOp) continue; // block argument, already mapped
+            if (!op->isAncestor(defOp))
+              ensureAvailable(operand, mapping, builder);
+          }
+        });
         Operation *cloned = builder.clone(*op, mapping);
-        
+
         for (unsigned i = 0; i < op->getNumResults(); ++i) {
           mapping.map(op->getResult(i), cloned->getResult(i));
         }
       }
     }
     
+    // Inline any top-level action calls that weren't inside an IfOp
+    // (e.g. leaf blocks that contain only a bare action call like count_syn()).
+    inlineActionCalls(func, originalControl, mapping);
+
     builder.create<func::ReturnOp>(UnknownLoc::get(context));
-    
+
     OpPrintingFlags flags;
     flags.printGenericOpForm(false);
     flags.enableDebugInfo(false, false);
@@ -896,6 +1198,8 @@ private:
     llvm::json::Object meta;
     meta["blockId"] = bb->blockId;
     meta["controlName"] = bb->controlName;
+    meta["isTerminal"] = bb->isTerminal;
+    meta["setsDropBit"] = bb->setsDropBit;
     meta["operations"] = (int64_t)bb->operations.size();
     meta["hasTableApply"] = bb->hasTableApply;
     meta["hasMemoryAccess"] = bb->hasMemoryAccess;
@@ -962,8 +1266,12 @@ private:
     
     for (auto *bb : blocks) {
       file << "  block" << bb->blockId << " [";
-      
-      if (bb->hasConditionalBranch) {
+
+      if (bb->isTerminal) {
+        // Terminal blocks: double-octagon shape, color by action type.
+        file << "shape=doubleoctagon, ";
+        file << (bb->setsDropBit ? "fillcolor=\"salmon\"" : "fillcolor=\"lightgreen\"") << ", ";
+      } else if (bb->hasConditionalBranch) {
         file << "fillcolor=\"lightyellow\", ";
       } else if (bb->hasTableApply) {
         file << "fillcolor=\"lightblue\", ";
@@ -972,29 +1280,36 @@ private:
       } else {
         file << "fillcolor=\"white\", ";
       }
-      
-      file << "label=\"Block " << bb->blockId << "\\n━━━━━━━━━━━━━━━━━━\\n";
-      
-      int opIdx = 0;
-      for (auto *op : bb->operations) {
-        std::string opName = op->getName().getStringRef().str();
-        if (opName.find("p4hir.") == 0) {
-          opName = opName.substr(6);
+
+      if (bb->isTerminal) {
+        // Compact label for terminal blocks.
+        std::string action = bb->setsDropBit ? "DROP" : "FORWARD";
+        file << "label=\"" << action << "\\nBlock " << bb->blockId << "\"";
+      } else {
+        file << "label=\"Block " << bb->blockId << "\\n━━━━━━━━━━━━━━━━━━\\n";
+
+        int opIdx = 0;
+        for (auto *op : bb->operations) {
+          std::string opName = op->getName().getStringRef().str();
+          if (opName.find("p4hir.") == 0)
+            opName = opName.substr(6);
+          file << opIdx << ": " << opName << "\\l";
+          opIdx++;
         }
-        file << opIdx << ": " << opName << "\\l";
-        opIdx++;
+
+        file << "━━━━━━━━━━━━━━━━━━\\nTotal: " << bb->operations.size() << " ops\\l";
+
+        if (bb->hasConditionalBranch) file << "[BRANCH]\\l";
+        if (bb->hasTableApply)        file << "[TABLE]\\l";
+        if (bb->hasMemoryAccess)      file << "[MEMORY]\\l";
+        if (bb->setsDropBit)          file << "[DROP]\\l";
+
+        file << "\\nvDRMT: " << (bb->capability.canMapToVDRMT ? "✓" : "✗");
+        file << " | vDPP: " << (bb->capability.canMapToVDPP ? "✓" : "✗") << "\\l";
+        file << "\"";
       }
-      
-      file << "━━━━━━━━━━━━━━━━━━\\nTotal: " << bb->operations.size() << " ops\\l";
-      
-      if (bb->hasConditionalBranch) file << "[BRANCH]\\l";
-      if (bb->hasTableApply) file << "[TABLE]\\l";
-      if (bb->hasMemoryAccess) file << "[MEMORY]\\l";
-      
-      file << "\\nvDRMT: " << (bb->capability.canMapToVDRMT ? "✓" : "✗");
-      file << " | vDPP: " << (bb->capability.canMapToVDPP ? "✓" : "✗") << "\\l";
-      
-      file << "\"];\n";
+
+      file << "];\n";
     }
     
     file << "\n";
@@ -1008,6 +1323,10 @@ private:
             file << ", color=\"green\"";
           } else if (exit.condition == "else") {
             file << ", color=\"red\"";
+          } else if (exit.condition == "forward") {
+            file << ", color=\"blue\", style=\"bold\"";
+          } else if (exit.condition == "drop") {
+            file << ", color=\"darkred\", style=\"bold\"";
           }
           file << "];\n";
         }
@@ -1015,7 +1334,7 @@ private:
     }
     
     file << "\n  legend [shape=box, style=\"filled\", fillcolor=\"lightgray\", label=\"";
-    file << "Legend:\\lYellow = Conditional\\lBlue = Table\\lGreen = Memory\\l\"];\n";
+    file << "Legend:\\lYellow = Conditional\\lBlue = Table\\lGreen = Memory/Forward\\lSalmon = Drop terminal\\l\"];\n";
     file << "}\n";
     
     llvm::outs() << "  Generated DOT: " << filename << "\n";

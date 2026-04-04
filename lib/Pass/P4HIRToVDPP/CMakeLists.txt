@@ -13,5 +13,8 @@ add_mlir_library(MLIRP4HIRToVDPPPass
   MLIRSupport
 )
 
+# Link P4MLIR transforms library for FlattenCFGPass
+target_link_libraries(MLIRP4HIRToVDPPPass PRIVATE ${LIB_TRANSFORMS})
+
 # Link external P4MLIR library
 target_link_libraries(MLIRP4HIRToVDPPPass PRIVATE ${LIB_P4HIR})

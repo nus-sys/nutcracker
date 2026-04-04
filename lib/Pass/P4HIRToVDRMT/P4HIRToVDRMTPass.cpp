@@ -16,9 +16,10 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include "Pass/P4HIRToVDRMTPass.h"
-#include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h" 
+#include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Ops.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Types.h"
+#include "p4mlir/Dialect/P4HIR/P4HIR_Attrs.h"
 #include "Dialect/vDRMT/IR/vDRMTDialect.h"
 #include "Dialect/vDRMT/IR/vDRMTOps.h"
 #include "Dialect/vDRMT/IR/vDRMTTypes.h"
@@ -102,6 +103,7 @@ struct BlockMetadata {
   bool hasTableApply;
   bool hasMemoryAccess;
   bool canMapToVDRMT;
+  bool isTerminal = false;
   std::vector<std::string> accessedMemoryObjects;
   
   static BlockMetadata loadFromJSON(StringRef jsonFile) {
@@ -125,6 +127,7 @@ struct BlockMetadata {
     if (auto table = obj->getBoolean("hasTableApply")) meta.hasTableApply = *table;
     if (auto mem = obj->getBoolean("hasMemoryAccess")) meta.hasMemoryAccess = *mem;
     if (auto canMap = obj->getBoolean("canMapToVDRMT")) meta.canMapToVDRMT = *canMap;
+    if (auto term = obj->getBoolean("isTerminal")) meta.isTerminal = *term;
     
     if (auto memObjs = obj->getArray("accessedMemoryObjects")) {
       for (auto &elem : *memObjs) {
@@ -266,6 +269,12 @@ public:
       return vdrmt::ReferenceType::get(convertedInner);
     });
     
+    // P4HIR extern type — identity (used symbolically by CounterCallPattern;
+    // the SSA value is not emitted into vDRMT).
+    addConversion([](P4::P4MLIR::P4HIR::ExternType type) -> Type {
+      return type;
+    });
+
     // P4HIR void
     addConversion([](P4::P4MLIR::P4HIR::VoidType type) -> Type {
       return type;
@@ -456,10 +465,17 @@ public:
       } else {
         newValueAttr = valueAttr;
       }
+    } else if (auto validityAttr =
+                   mlir::dyn_cast<P4::P4MLIR::P4HIR::ValidityBitAttr>(valueAttr)) {
+      // validity.bit valid → 1 : i1, invalid → 0 : i1
+      int64_t bitVal =
+          (validityAttr.getValue() == P4::P4MLIR::P4HIR::ValidityBit::Valid) ? 1 : 0;
+      newValueAttr = IntegerAttr::get(IntegerType::get(op.getContext(), 1), bitVal);
+      convertedType = IntegerType::get(op.getContext(), 1);
     } else {
       newValueAttr = valueAttr;
     }
-    
+
     rewriter.replaceOpWithNewOp<vdrmt::ConstantOp>(
       op,
       convertedType,
@@ -596,6 +612,332 @@ public:
   }
 };
 
+// Convert p4hir.scope → inline its body into the parent block.
+// The scope has no results in our usage (it performs side effects only).
+struct ScopeOpConversion : OpConversionPattern<P4::P4MLIR::P4HIR::ScopeOp> {
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::ScopeOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    // Only handle scopes that produce no values.
+    if (op.getNumResults() > 0) return failure();
+
+    Region &body = op.getScopeRegion();
+    if (body.empty()) {
+      rewriter.eraseOp(op);
+      return success();
+    }
+
+    Block &bodyBlock = body.front();
+    // Remove the terminator (p4hir.yield with no values).
+    Operation *term = bodyBlock.getTerminator();
+    if (term) rewriter.eraseOp(term);
+
+    // Move all remaining ops before the scope op, then erase it.
+    rewriter.inlineBlockBefore(&bodyBlock, op);
+    rewriter.eraseOp(op);
+    return success();
+  }
+};
+
+// Convert p4hir.variable → vdrmt.variable
+// Needed so that out-parameter temporaries (e.g. result_out_arg for Hash5Tuple::apply)
+// survive through DialectConversion and are accessible by downstream patterns.
+class VariableOpConversion : public OpConversionPattern<P4::P4MLIR::P4HIR::VariableOp> {
+public:
+  using OpConversionPattern<P4::P4MLIR::P4HIR::VariableOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      P4::P4MLIR::P4HIR::VariableOp op,
+      OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    if (!convertedType) return failure();
+
+    StringRef name = op.getName().value_or("tmp");
+    rewriter.replaceOpWithNewOp<vdrmt::VariableOp>(
+        op, convertedType, rewriter.getStringAttr(name),
+        /*init=*/nullptr);
+    return success();
+  }
+};
+
+// ── Hash5Tuple call_method:
+//   p4hir.call_method @Hash5Tuple::@apply → vdrmt.hash5tuple.apply + vdrmt.assign
+struct Hash5TupleCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty()) return failure();
+        if (callee.getRootReference().getValue() != "Hash5Tuple") return failure();
+        if (callee.getNestedReferences().back().getValue() != "apply") return failure();
+
+        // arg_operands: [result_ref(out), src_addr, dst_addr, src_port, dst_port, proto]
+        auto args = adaptor.getArgOperands();
+        if (args.size() < 6) return failure();
+
+        Value resultRef = args[0];
+        Value srcAddr   = args[1];
+        Value dstAddr   = args[2];
+        Value srcPort   = args[3];
+        Value dstPort   = args[4];
+        Value proto     = args[5];
+
+        // Determine instance name from the base operand.
+        StringRef instanceName = "unknown_hash";
+        int32_t nrEntries = 64; // default
+        if (auto instOp = op.getBase().getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>())
+            instanceName = instOp.getName();
+
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+
+        // Result type of the apply op is i32 (hash value).
+        auto i32Ty = rewriter.getI32Type();
+        auto applyOp = rewriter.create<vdrmt::Hash5TupleApplyOp>(
+            op.getLoc(), i32Ty, symRef,
+            srcAddr, dstAddr, srcPort, dstPort, proto);
+        // Annotate with nr_entries so VDRMTCoarseGrainedPass can emit the decl.
+        applyOp->setAttr("vdrmt.hash5tuple_nr_entries",
+                         rewriter.getI32IntegerAttr(nrEntries));
+
+        // Assign the hash result into the out-parameter reference.
+        rewriter.create<vdrmt::AssignOp>(op.getLoc(), applyOp.getResult(), resultRef);
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// ── Counter call_method: p4hir.call_method @Counter::@count → vdrmt.counter.count
+struct CounterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        // callee format: @Counter::@count — check root and nested references.
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty())
+            return failure();
+
+        auto rootRef   = callee.getRootReference().getValue();
+        auto methodRef = callee.getNestedReferences().back().getValue();
+
+        if (rootRef != "Counter" || methodRef != "count")
+            return failure();
+
+        // getBase() is the Counter instance SSA value.
+        Value instanceVal = op.getBase();
+        StringRef instanceName = "unknown_counter";
+        int32_t size = 1024; // default
+
+        if (auto instOp = instanceVal.getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
+            instanceName = instOp.getName();
+            // Constructor arg[0] is the size constant.
+            if (!instOp.getArgOperands().empty()) {
+                if (auto cst = instOp.getArgOperands()[0]
+                                   .getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>()) {
+                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                        size = (int32_t)ia.getInt();
+                }
+            }
+        }
+
+        // The index argument is the first element of arg_operands.
+        if (op.getArgOperands().empty())
+            return failure();
+        Value idx = adaptor.getArgOperands()[0];
+
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+        auto countOp = rewriter.replaceOpWithNewOp<vdrmt::CounterCountOp>(
+            op, symRef, idx);
+        // Annotate with instance size so VDRMTCoarseGrainedPass can emit the decl.
+        countOp->setAttr("vdrmt.counter_size", rewriter.getI32IntegerAttr(size));
+        return success();
+    }
+};
+
+// ── Meter call_method: p4hir.call_method @meter::@execute_meter → vdrmt.meter.execute
+struct MeterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty())
+            return failure();
+
+        auto rootRef   = callee.getRootReference().getValue();
+        auto methodRef = callee.getNestedReferences().back().getValue();
+
+        if (rootRef != "meter" || methodRef != "execute_meter")
+            return failure();
+
+        // getBase() is the meter instance SSA value.
+        Value instanceVal = op.getBase();
+        StringRef instanceName = "unknown_meter";
+        int32_t size = 1024;   // default number of slots
+        int32_t meterType = 0; // 0=packets, 1=bytes
+
+        if (auto instOp = instanceVal.getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
+            instanceName = instOp.getName();
+            auto ctorArgs = instOp.getArgOperands();
+            // Constructor arg[0] = size
+            if (ctorArgs.size() >= 1)
+                if (auto cst = ctorArgs[0].getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>())
+                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                        size = (int32_t)ia.getInt();
+            // Constructor arg[1] = MeterType enum (0=packets,1=bytes)
+            if (ctorArgs.size() >= 2)
+                if (auto cst = ctorArgs[1].getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>())
+                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                        meterType = (int32_t)ia.getInt();
+        }
+
+        // arg_operands: [index, result_ref(out)]
+        auto args = adaptor.getArgOperands();
+        if (args.size() < 2) return failure();
+        Value idx       = args[0];
+        Value resultRef = args[1];
+
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+        auto i8Ty = rewriter.getIntegerType(8);
+        auto execOp = rewriter.create<vdrmt::MeterExecuteOp>(
+            op.getLoc(), i8Ty, symRef, idx);
+        // Annotate with size and type so VDRMTCoarseGrainedPass can emit the decl.
+        execOp->setAttr("vdrmt.meter_size",      rewriter.getI32IntegerAttr(size));
+        execOp->setAttr("vdrmt.meter_type",      rewriter.getI32IntegerAttr(meterType));
+
+        // Assign the color result into the out-parameter reference.
+        rewriter.create<vdrmt::AssignOp>(op.getLoc(), execOp.getColor(), resultRef);
+
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// ── Register call_method: @Register::@read → vdrmt.register.read
+//                         @Register::@write → vdrmt.register.write
+struct RegisterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty())
+            return failure();
+
+        auto rootRef   = callee.getRootReference().getValue();
+        auto methodRef = callee.getNestedReferences().back().getValue();
+
+        if (rootRef != "Register")
+            return failure();
+        if (methodRef != "read" && methodRef != "write")
+            return failure();
+
+        Value instanceVal = op.getBase();
+        StringRef instanceName = "unknown_register";
+        int32_t size = 1024;
+        int32_t elementWidth = 32;
+
+        if (auto instOp = instanceVal.getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
+            instanceName = instOp.getName();
+            if (!instOp.getArgOperands().empty())
+                if (auto cst = instOp.getArgOperands()[0]
+                                     .getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>())
+                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                        size = (int32_t)ia.getInt();
+            // Infer element width from the instance type parameter if possible.
+            // Fall back to 32 bits as the default.
+            if (auto instType = instOp.getType())
+                if (auto intTy = dyn_cast<IntegerType>(instType))
+                    elementWidth = (int32_t)intTy.getWidth();
+        }
+
+        auto args   = adaptor.getArgOperands();
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+
+        if (methodRef == "read") {
+            // read(index) → vdrmt.register.read @inst[index] : idx_ty -> elem_ty
+            if (args.empty()) return failure();
+            Value idx = args[0];
+            auto elemTy = rewriter.getIntegerType(elementWidth);
+            auto readOp = rewriter.replaceOpWithNewOp<vdrmt::RegisterReadOp>(
+                op, elemTy, symRef, idx);
+            readOp->setAttr("vdrmt.register_size",          rewriter.getI32IntegerAttr(size));
+            readOp->setAttr("vdrmt.register_element_width", rewriter.getI32IntegerAttr(elementWidth));
+        } else {
+            // write(index, value) → vdrmt.register.write @inst[index] = value
+            if (args.size() < 2) return failure();
+            Value idx = args[0];
+            Value val = args[1];
+            auto writeOp = rewriter.create<vdrmt::RegisterWriteOp>(
+                op.getLoc(), symRef, idx, val);
+            writeOp->setAttr("vdrmt.register_size",          rewriter.getI32IntegerAttr(size));
+            writeOp->setAttr("vdrmt.register_element_width", rewriter.getI32IntegerAttr(elementWidth));
+            rewriter.eraseOp(op);
+        }
+        return success();
+    }
+};
+
+// Drop p4hir.instantiate — extern instances (Counter, Hash, Meter, etc.) are handled
+// symbolically by CounterCallPattern etc.; the SSA value is not needed in vDRMT.
+struct InstantiateDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::InstantiateOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::InstantiateOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Drop p4hir.table_apply — the match-action table dispatch is handled by the
+// vDRMT firmware itself; the lowered IR records the has_table attribute.
+struct TableApplyDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::TableApplyOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::TableApplyOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Drop p4hir.call — action bodies are inlined by the partitioner; call sites
+// that survive into the per-block P4HIR have no lowering in vDRMT.
+struct CallOpDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Drop p4hir.call_method for unrecognized extern calls (not Counter::count).
+struct CallMethodDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+    // Lower priority than CounterCallPattern (benefit = 0).
+    CallMethodDropPattern(TypeConverter &tc, MLIRContext *ctx)
+        : OpConversionPattern(tc, ctx, /*benefit=*/0) {}
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
 // ============================================================================
 // vDRMT Block Generator
 // ============================================================================
@@ -640,6 +982,12 @@ public:
           continue;
         }
         
+        if (meta.isTerminal) {
+          llvm::outs() << "    ⊘ Skipping " << dirName << " (terminal block)\n";
+          skipCount++;
+          continue;
+        }
+
         if (!meta.canMapToVDRMT) {
           llvm::outs() << "    ⊘ Skipping " << dirName << " (not vDRMT compatible)\n";
           skipCount++;
@@ -673,6 +1021,68 @@ private:
   std::string inputDir;
   P4HIRToVDRMTTypeConverter typeConverter;
   
+  // Preprocess: lower p4hir.ternary(A, true { ops; yield B }, false { yield false })
+  // to: [inline true-region ops] + p4hir.binop(and, A, B).
+  // This is the standard P4 encoding of A && B.
+  static void lowerTernaryToBinOp(func::FuncOp f) {
+    using namespace P4::P4MLIR::P4HIR;
+
+    SmallVector<TernaryOp> worklist;
+    f.walk([&](TernaryOp t) { worklist.push_back(t); });
+
+    for (auto t : llvm::reverse(worklist)) { // reverse = inner-first
+      if (!t.getResult()) continue;
+
+      // Check: false-region yields a constant 'false'.
+      Region &falseReg = t.getFalseRegion();
+      if (falseReg.empty()) continue;
+      bool falseIsConst = false;
+      for (auto &op : falseReg.front()) {
+        if (auto y = dyn_cast<YieldOp>(&op)) {
+          if (y.getNumOperands() == 1) {
+            if (auto cst = y.getOperand(0).getDefiningOp<ConstOp>()) {
+              if (auto ba = dyn_cast<P4::P4MLIR::P4HIR::BoolAttr>(cst.getValue()))
+                falseIsConst = !ba.getValue(); // it's 'false'
+            }
+          }
+        }
+      }
+      if (!falseIsConst) continue;
+
+      // Find yield in true-region.
+      Region &trueReg = t.getTrueRegion();
+      if (trueReg.empty()) continue;
+      Block &trueBlock = trueReg.front();
+      YieldOp trueYield = dyn_cast<YieldOp>(trueBlock.getTerminator());
+      if (!trueYield || trueYield.getNumOperands() == 0) continue;
+      Value trueResult = trueYield.getOperand(0);
+
+      // Move all non-yield ops before the ternary.
+      OpBuilder builder(t);
+      for (auto &op : llvm::make_early_inc_range(trueBlock.getOperations())) {
+        if (&op == trueYield.getOperation()) break;
+        op.moveBefore(t);
+      }
+
+      // p4hir.binop requires AnyIntP4Type (not bool). Cast bool→bit<1>, And, cast back.
+      Location loc = t.getLoc();
+      MLIRContext *ctx = t.getContext();
+      auto b1Ty = P4::P4MLIR::P4HIR::BitsType::get(ctx, 1, /*isSigned=*/false);
+      auto boolTy = t.getCond().getType();  // !p4hir.bool
+
+      Value castCond = builder.create<CastOp>(loc, b1Ty, t.getCond());
+      Value castTrue = builder.create<CastOp>(loc, b1Ty, trueResult);
+      Value andBits  = builder.create<BinOp>(loc, BinOpKind::And, castCond, castTrue);
+      Value andBool  = builder.create<CastOp>(loc, boolTy, andBits);
+
+      t.getResult().replaceAllUsesWith(andBool);
+
+      // Erase the yield and the ternary.
+      trueYield.erase();
+      t.erase();
+    }
+  }
+
   LogicalResult generateBlockVDRMT(StringRef p4hirFile,
                                   StringRef vdrmtFile,
                                   BlockMetadata &meta,
@@ -750,7 +1160,7 @@ private:
     target.addLegalDialect<vdrmt::vDRMTDialect>();
     target.addLegalDialect<func::FuncDialect>();
     target.addIllegalDialect<P4::P4MLIR::P4HIR::P4HIRDialect>();
-    
+
     // Add conversion patterns
     RewritePatternSet patterns(context);
     patterns.add<
@@ -762,9 +1172,20 @@ private:
       ConstOpConversion,
       CastOpConversion,
       CmpOpConversion,
-      YieldOpConversion
+      YieldOpConversion,
+      ScopeOpConversion,
+      VariableOpConversion,
+      Hash5TupleCallPattern,
+      CounterCallPattern,
+      MeterCallPattern,
+      RegisterCallPattern,
+      TableApplyDropPattern,
+      CallOpDropPattern,
+      InstantiateDropPattern
     >(typeConverter, context);
-    
+    // Lower priority than CounterCallPattern/Hash5TupleCallPattern/MeterCallPattern so those match first.
+    patterns.add<CallMethodDropPattern>(typeConverter, context);
+
     // Add IfOpConversion with exit info
     patterns.add<IfOpConversion>(typeConverter, context, exitInfo);
     
@@ -784,6 +1205,10 @@ private:
     for (auto &op : p4hirEntry.getOperations()) {
       cloneBuilder.clone(op, mapping);
     }
+
+    // Preprocess: lower p4hir.ternary(A, {yield B}, {yield false}) → binop(and,A,B)
+    // This must happen before DialectConversion since ternary has no conversion pattern.
+    lowerTernaryToBinOp(vdrmtFunc);
 
     // Apply conversion
     if (failed(applyPartialConversion(vdrmtFunc, target, std::move(patterns)))) {

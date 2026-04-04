@@ -440,4 +440,85 @@ def ReturnOp : vDPP_Op<"return", [Pure, Terminator, ReturnLike]> {
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Fixed-Function Accelerator ops (vDPP-level, software-mapped)
+//===----------------------------------------------------------------------===//
+
+def vDPP_CounterInstanceOp : vDPP_Op<"counter_instance", [Symbol]> {
+    let summary = "Declare a software counter array at module scope (vDPP level)";
+    let description = [{
+        Declares a named counter array for use in programmable blocks.
+        Maps to an atomic counter array in DPA/ARM C code.
+        size: number of counter cells.
+
+        Example:
+          vdpp.counter_instance @syn_count {size = 1024 : i32}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDPP_CounterCountOp : vDPP_Op<"counter.count"> {
+    let summary = "Increment the software counter at the given index";
+    let description = [{
+        Increments counter instance @sym by 1 at the given index.
+        Lowers to an atomic increment in DPA/ARM C code.
+
+        Example:
+          vdpp.counter.count @syn_count[%idx] : index
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) attr-dict";
+}
+
+def vDPP_Hash5TupleInstanceOp : vDPP_Op<"hash5tuple_instance", [Symbol]> {
+    let summary = "Declare a software hash-function instance at module scope (vDPP level)";
+    let description = [{
+        Declares a named Hash5Tuple instance backed by a software hash computation.
+        Unlike the vDRMT counterpart, there is no nr_entries constraint — the SW
+        implementation returns a raw hash value and the caller decides the range.
+        On BF3 DPA, this lowers to a CRC or Toeplitz computation in C.
+
+        Example:
+          vdpp.hash5tuple_instance @lb_hash
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDPP_Hash5TupleApplyOp : vDPP_Op<"hash5tuple.apply"> {
+    let summary = "Compute a 5-tuple hash in software";
+    let description = [{
+        Computes Hash5Tuple(srcAddr, dstAddr, srcPort, dstPort, proto)
+        via a software hash function, returning a 32-bit value.
+        Fields may be arbitrary integers (not limited to outer packet headers).
+
+        Example:
+          %h = vdpp.hash5tuple.apply @lb_hash(%src, %dst, %sport, %dport, %proto)
+                 : (i32, i32, i16, i16, i8) -> i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$src_addr,
+        AnyInteger:$dst_addr,
+        AnyInteger:$src_port,
+        AnyInteger:$dst_port,
+        AnyInteger:$proto
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = [{
+        $instance `(` $src_addr `,` $dst_addr `,` $src_port `,` $dst_port `,` $proto `)`
+        `:` `(` type($src_addr) `,` type($dst_addr) `,` type($src_port) `,`
+               type($dst_port) `,` type($proto) `)` `->` type($result) attr-dict
+    }];
+}
+
 #endif // VDPPOPS

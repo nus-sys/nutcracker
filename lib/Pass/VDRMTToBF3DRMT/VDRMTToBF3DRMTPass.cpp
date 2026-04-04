@@ -34,17 +34,20 @@
 #include <string>
 
 #include "mlir/Pass/Pass.h"
+#include "mlir/Pass/PassManager.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Parser/Parser.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 
 #include "Pass/VDRMTToBF3DRMTPass.h"
 #include "Pass/BF3DRMTToDocaFlowPass.h"
+#include "Pass/VFFSCoarseGrainedPass.h"
 #include "Pass/Egglog.h"
 #include "Pass/Utils.h"
 #include "Dialect/vDRMT/IR/vDRMTDialect.h"
@@ -429,6 +432,48 @@ static std::pair<int32_t, int32_t> getIfSuccessors(vdrmt::IfOp ifOp) {
     return {thenSucc, elseSucc};
 }
 
+/// Recursively convert a vdrmt-chain value to its bf3drmt equivalent.
+/// Handles: block args (identity lookup via mapping), vdrmt.struct_extract
+/// (converts the read+struct_extract pair to struct_extract_ref+read).
+/// Emits bf3drmt ops into 'b', updating 'mapping'.
+static Value convertValToBF3DRMT(Value val, IRMapping &mapping, OpBuilder &b) {
+    if (mapping.contains(val))
+        return mapping.lookup(val);
+
+    Operation *defOp = val.getDefiningOp();
+    if (!defOp)
+        return mapping.lookupOrDefault(val); // block argument
+
+    if (auto seOp = dyn_cast<vdrmt::StructExtractOp>(defOp)) {
+        // Pattern: vdrmt.read(ref) + vdrmt.struct_extract(readResult, idx)
+        // → bf3drmt.struct_extract_ref(bf3Ref, idx) + bf3drmt.read(fieldRef)
+        Value srcInput = seOp.getInput();
+        Value bf3Ref;
+        if (auto srcRead = srcInput.getDefiningOp<vdrmt::ReadOp>())
+            bf3Ref = convertValToBF3DRMT(srcRead.getRef(), mapping, b);
+        else
+            bf3Ref = convertValToBF3DRMT(srcInput, mapping, b);
+
+        Type fieldTy     = convertToBF3DRMTType(seOp.getResult().getType());
+        Type fieldRefTy  = bf3drmt::ReferenceType::get(b.getContext(), fieldTy);
+        auto seRefOp     = b.create<bf3drmt::StructExtractRefOp>(
+            seOp.getLoc(), fieldRefTy, bf3Ref,
+            b.getI32IntegerAttr(seOp.getFieldIndex()));
+        auto readOp      = b.create<bf3drmt::ReadOp>(
+            seOp.getLoc(), fieldTy, seRefOp.getResult());
+        mapping.map(val, readOp.getResult());
+        return readOp.getResult();
+    }
+
+    // Fallback: recursively convert operands, then clone the op.
+    for (Value operand : defOp->getOperands())
+        convertValToBF3DRMT(operand, mapping, b);
+    auto *cloned = b.clone(*defOp, mapping);
+    for (unsigned i = 0; i < defOp->getNumResults(); ++i)
+        mapping.map(defOp->getResult(i), cloned->getResult(i));
+    return (defOp->getNumResults() > 0) ? mapping.lookup(val) : Value();
+}
+
 /// Convert a single (DialEgg-lowered) func.func into a bf3drmt.pipe.
 ///
 /// After DialEgg, the function body may still contain vdrmt.cmp / vdrmt.if
@@ -437,6 +482,87 @@ static std::pair<int32_t, int32_t> getIfSuccessors(vdrmt::IfOp ifOp) {
 static LogicalResult convertFuncToPipe(func::FuncOp funcOp) {
     MLIRContext *ctx = funcOp.getContext();
     Block &funcEntry = funcOp.getFunctionBody().front();
+
+    // ── Check for hash5tuple block first ─────────────────────────────────
+    vdrmt::Hash5TupleApplyOp hashApplyOp = nullptr;
+    funcOp.walk([&](vdrmt::Hash5TupleApplyOp op) {
+        hashApplyOp = op;
+        return WalkResult::interrupt();
+    });
+
+    if (hashApplyOp) {
+        // ── Hash pipe: vdrmt.hash5tuple.apply → bf3drmt.pipe type(hash) ───
+        // The hash pipe uses match_mask (not match) for the 5-tuple fields.
+        // Each hash bucket selects an entry; the action sets the next block.
+
+        int32_t nrEntries = 64;
+        funcOp->getParentOfType<ModuleOp>().walk(
+            [&](vdrmt::Hash5TupleInstanceOp inst) {
+                if (inst.getSymName() == hashApplyOp.getInstance())
+                    nrEntries = (int32_t)inst.getNrEntries();
+            });
+
+        OpBuilder builder(funcOp);
+        auto pipeOp = builder.create<bf3drmt::PipeOp>(
+            funcOp.getLoc(),
+            funcOp.getName(),
+            bf3drmt::BF3DRMTPipeType::Hash,
+            /*match_mask=*/nullptr,
+            builder.getI32IntegerAttr(nrEntries),
+            /*annotations=*/nullptr);
+        Block &pipeEntry = pipeOp.getBody().emplaceBlock();
+        IRMapping mapping;
+        for (BlockArgument arg : funcEntry.getArguments()) {
+            BlockArgument pipeArg =
+                pipeEntry.addArgument(convertToBF3DRMTType(arg.getType()), arg.getLoc());
+            mapping.map(arg, pipeArg);
+        }
+        builder.setInsertionPointToStart(&pipeEntry);
+
+        // Build table_key with all 5-tuple fields.
+        // DOCA hash pipe: fields in table_key → go into match_mask (hash function selection).
+        auto tableKeyOp = builder.create<bf3drmt::TableKeyOp>(funcOp.getLoc());
+        Block &tkBlock  = tableKeyOp.getBody().emplaceBlock();
+        OpBuilder tkBuilder(ctx);
+        tkBuilder.setInsertionPointToStart(&tkBlock);
+
+        auto buildKeyField = [&](Value vdrmtVal) -> Value {
+            return convertValToBF3DRMT(vdrmtVal, mapping, tkBuilder);
+        };
+
+        // All five tuple fields; only the last MatchKeyOp is the terminator.
+        // Emit all five as match_key ops — the codegen will loop over them.
+        // Since MatchKeyOp is [Terminator], only ONE can appear per region.
+        // We use a helper attribute on the table_key to encode all hash fields.
+        // For now, use src_addr as the match_key terminator and annotate the rest.
+        Value srcBF3   = buildKeyField(hashApplyOp.getSrcAddr());
+        Value dstBF3   = buildKeyField(hashApplyOp.getDstAddr());
+        Value sportBF3 = buildKeyField(hashApplyOp.getSrcPort());
+        Value dportBF3 = buildKeyField(hashApplyOp.getDstPort());
+        Value protoBF3 = buildKeyField(hashApplyOp.getProto());
+        // The table_key terminator is match_key on src_addr.
+        // The other fields are preserved in bf3drmt.read ops already emitted
+        // into the table_key block by buildKeyField — the codegen can walk them.
+        tkBuilder.create<bf3drmt::MatchKeyOp>(hashApplyOp.getLoc(), srcBF3);
+        (void)dstBF3; (void)sportBF3; (void)dportBF3; (void)protoBF3;
+
+        // Determine the successor for the default action.
+        int32_t nextSucc = -1;
+        funcOp.walk([&](vdrmt::NextOp nop) {
+            nextSucc = nop.getThenSuccessor();
+        });
+
+        auto defSym   = mlir::SymbolRefAttr::get(ctx, "_default");
+        auto actionOp = builder.create<bf3drmt::PipeActionOp>(
+            funcOp.getLoc(), defSym, /*annotations=*/nullptr);
+        Block &actionBlock = actionOp.getBody().emplaceBlock();
+        OpBuilder actionBuilder(ctx);
+        actionBuilder.setInsertionPointToStart(&actionBlock);
+        actionBuilder.create<bf3drmt::NextOp>(funcOp.getLoc(), nextSucc);
+
+        funcOp.erase();
+        return success();
+    }
 
     // Locate structural vdrmt ops (at function body top level only).
     vdrmt::CmpOp  cmpOp      = nullptr;
@@ -495,7 +621,18 @@ static LogicalResult convertFuncToPipe(func::FuncOp funcOp) {
         Value clonedKey = tkMapping.lookupOrDefault(keyVal);
         tkBuilder.create<bf3drmt::MatchKeyOp>(cmpOp.getLoc(), clonedKey);
 
-        // Build pipe_action @_hit { bf3drmt.next N_then }.
+        // Collect top-level side-effectful ops (meter/counter) that appear before
+        // the cmp/if — these run for every packet and must appear in the pipe
+        // actions so the codegen can configure the pipe monitor.
+        llvm::SmallVector<Operation *> prologueOps;
+        for (auto &op : funcEntry) {
+            if (&op == cmpOp.getOperation() || &op == ifOp.getOperation()) break;
+            if (isa<vdrmt::CounterCountOp, vdrmt::MeterExecuteOp,
+                vdrmt::RegisterReadOp,  vdrmt::RegisterWriteOp>(&op))
+                prologueOps.push_back(&op);
+        }
+
+        // Build pipe_action @_hit { <prologue>; <then-region body>; bf3drmt.next N_then }.
         auto [thenSucc, elseSucc] = getIfSuccessors(ifOp);
 
         auto hitSym    = mlir::SymbolRefAttr::get(ctx, "_hit");
@@ -504,15 +641,65 @@ static LogicalResult convertFuncToPipe(func::FuncOp funcOp) {
         Block &hitBlock = hitAction.getBody().emplaceBlock();
         OpBuilder hitBuilder(ctx);
         hitBuilder.setInsertionPointToStart(&hitBlock);
+        IRMapping hitMapping(mapping);
+
+        // Emit prologue side-effectful ops (meter/counter) first.
+        auto emitSideEffectOp = [&](Operation &op, OpBuilder &b, IRMapping &m) {
+            if (auto counterOp = dyn_cast<vdrmt::CounterCountOp>(&op)) {
+                Value bf3Idx = convertValToBF3DRMT(counterOp.getIndex(), m, b);
+                b.create<vdrmt::CounterCountOp>(
+                    counterOp.getLoc(), counterOp.getInstance(), bf3Idx);
+                return;
+            }
+            if (auto meterOp = dyn_cast<vdrmt::MeterExecuteOp>(&op)) {
+                Value bf3Idx = convertValToBF3DRMT(meterOp.getIndex(), m, b);
+                auto newOp = b.create<vdrmt::MeterExecuteOp>(
+                    meterOp.getLoc(), meterOp.getColor().getType(),
+                    meterOp.getInstance(), bf3Idx);
+                m.map(meterOp.getColor(), newOp.getColor());
+            }
+            if (auto regRead = dyn_cast<vdrmt::RegisterReadOp>(&op)) {
+                Value bf3Idx = convertValToBF3DRMT(regRead.getIndex(), m, b);
+                auto newOp = b.create<vdrmt::RegisterReadOp>(
+                    regRead.getLoc(), regRead.getResult().getType(),
+                    regRead.getInstance(), bf3Idx);
+                m.map(regRead.getResult(), newOp.getResult());
+            }
+            if (auto regWrite = dyn_cast<vdrmt::RegisterWriteOp>(&op)) {
+                Value bf3Idx = convertValToBF3DRMT(regWrite.getIndex(), m, b);
+                Value bf3Val = convertValToBF3DRMT(regWrite.getValue(), m, b);
+                b.create<vdrmt::RegisterWriteOp>(
+                    regWrite.getLoc(), regWrite.getInstance(), bf3Idx, bf3Val);
+            }
+        };
+        for (Operation *op : prologueOps)
+            emitSideEffectOp(*op, hitBuilder, hitMapping);
+
+        // Emit ops from the then-region.
+        for (auto &op : ifOp.getThenRegion().front()) {
+            if (isa<vdrmt::CounterCountOp, vdrmt::MeterExecuteOp,
+                    vdrmt::RegisterReadOp,  vdrmt::RegisterWriteOp>(&op)) {
+                emitSideEffectOp(op, hitBuilder, hitMapping);
+                continue;
+            }
+            // Skip other vdrmt dialect ops (structural or dead).
+            if (op.getDialect()->getNamespace() == "vdrmt") continue;
+            // Non-vdrmt ops (e.g. bf3drmt ops from DialEgg): clone as-is.
+            hitBuilder.clone(op, hitMapping);
+        }
         hitBuilder.create<bf3drmt::NextOp>(funcOp.getLoc(), thenSucc);
 
-        // Build pipe_action @_miss { bf3drmt.next N_else }.
+        // Build pipe_action @_miss { <prologue>; bf3drmt.next N_else }.
         auto missSym    = mlir::SymbolRefAttr::get(ctx, "_miss");
         auto missAction = builder.create<bf3drmt::PipeActionOp>(
             funcOp.getLoc(), missSym, /*annotations=*/nullptr);
         Block &missBlock = missAction.getBody().emplaceBlock();
         OpBuilder missBuilder(ctx);
         missBuilder.setInsertionPointToStart(&missBlock);
+        IRMapping missMapping(mapping);
+        // Prologue side-effectful ops run in _miss too (they run for every packet).
+        for (Operation *op : prologueOps)
+            emitSideEffectOp(*op, missBuilder, missMapping);
         missBuilder.create<bf3drmt::NextOp>(funcOp.getLoc(), elseSucc);
 
     } else {
@@ -736,6 +923,117 @@ static MapperBlockInfo eggifyPipeForMapper(bf3drmt::PipeOp pipeOp) {
 }
 
 // ============================================================================
+// vFFS → bf3drmt lowering helper
+// ============================================================================
+
+/// Replace vdrmt.counter_instance → bf3drmt.counter_decl and
+/// vdrmt.counter.count → bf3drmt.counter.count within a module.
+static void lowerVFFSCounters(ModuleOp mod, OpBuilder &builder) {
+    // 1. Replace vdrmt.counter_instance → bf3drmt.counter_decl
+    SmallVector<vdrmt::CounterInstanceOp> instances;
+    mod.walk([&](vdrmt::CounterInstanceOp op) { instances.push_back(op); });
+    for (auto inst : instances) {
+        builder.setInsertionPoint(inst);
+        auto nameAttr = builder.getStringAttr(inst.getSymName());
+        builder.create<bf3drmt::CounterDeclOp>(
+            inst.getLoc(), nameAttr, inst.getSizeAttr());
+        inst.erase();
+    }
+
+    // 2. Replace vdrmt.counter.count → bf3drmt.counter.count
+    SmallVector<vdrmt::CounterCountOp> counts;
+    mod.walk([&](vdrmt::CounterCountOp op) { counts.push_back(op); });
+    for (auto count : counts) {
+        builder.setInsertionPoint(count);
+        builder.create<bf3drmt::CounterCountOp>(
+            count.getLoc(), count.getInstance(), count.getIndex());
+        count.erase();
+    }
+}
+
+/// Replace vdrmt.hash5tuple_instance and vdrmt.hash5tuple.apply within a module.
+/// hash5tuple_instance is simply removed (the hash pipe decl is implicit in
+/// bf3drmt.pipe type(hash) + nr_entries).
+/// hash5tuple.apply ops are erased (their work is done in convertFuncToPipe).
+static void lowerVFFSHash5Tuple(ModuleOp mod) {
+    SmallVector<vdrmt::Hash5TupleInstanceOp> instances;
+    mod.walk([&](vdrmt::Hash5TupleInstanceOp op) { instances.push_back(op); });
+    for (auto inst : instances)
+        inst.erase();
+
+    SmallVector<vdrmt::Hash5TupleApplyOp> applies;
+    mod.walk([&](vdrmt::Hash5TupleApplyOp op) { applies.push_back(op); });
+    for (auto apply : applies)
+        apply.erase();
+}
+
+/// Replace vdrmt.meter_instance → bf3drmt.meter_decl and
+/// vdrmt.meter.execute → bf3drmt.meter.execute within a module.
+static void lowerVDRMTMeters(ModuleOp mod, OpBuilder &builder) {
+    // 1. Replace vdrmt.meter_instance → bf3drmt.meter_decl
+    SmallVector<vdrmt::MeterInstanceOp> instances;
+    mod.walk([&](vdrmt::MeterInstanceOp op) { instances.push_back(op); });
+    for (auto inst : instances) {
+        builder.setInsertionPoint(inst);
+        auto nameAttr = builder.getStringAttr(inst.getSymName());
+        builder.create<bf3drmt::MeterDeclOp>(
+            inst.getLoc(), nameAttr, inst.getSizeAttr(), inst.getMeterTypeAttr());
+        inst.erase();
+    }
+
+    // 2. Replace vdrmt.meter.execute → bf3drmt.meter.execute
+    SmallVector<vdrmt::MeterExecuteOp> execs;
+    mod.walk([&](vdrmt::MeterExecuteOp op) { execs.push_back(op); });
+    for (auto exec : execs) {
+        builder.setInsertionPoint(exec);
+        auto newOp = builder.create<bf3drmt::MeterExecuteOp>(
+            exec.getLoc(), exec.getColor().getType(),
+            exec.getInstance(), exec.getIndex());
+        exec.getColor().replaceAllUsesWith(newOp.getColor());
+        exec.erase();
+    }
+}
+
+/// Replace vdrmt.register_instance → bf3drmt.register_decl and
+/// vdrmt.register.read/write → bf3drmt.register.read/write within a module.
+static void lowerVDRMTRegisters(ModuleOp mod, OpBuilder &builder) {
+    // 1. Replace vdrmt.register_instance → bf3drmt.register_decl
+    SmallVector<vdrmt::RegisterInstanceOp> instances;
+    mod.walk([&](vdrmt::RegisterInstanceOp op) { instances.push_back(op); });
+    for (auto inst : instances) {
+        builder.setInsertionPoint(inst);
+        builder.create<bf3drmt::RegisterDeclOp>(
+            inst.getLoc(),
+            builder.getStringAttr(inst.getSymName()),
+            inst.getSizeAttr(),
+            inst.getElementWidthAttr());
+        inst.erase();
+    }
+
+    // 2. Replace vdrmt.register.read → bf3drmt.register.read
+    SmallVector<vdrmt::RegisterReadOp> reads;
+    mod.walk([&](vdrmt::RegisterReadOp op) { reads.push_back(op); });
+    for (auto op : reads) {
+        builder.setInsertionPoint(op);
+        auto newOp = builder.create<bf3drmt::RegisterReadOp>(
+            op.getLoc(), op.getResult().getType(),
+            op.getInstance(), op.getIndex());
+        op.getResult().replaceAllUsesWith(newOp.getResult());
+        op.erase();
+    }
+
+    // 3. Replace vdrmt.register.write → bf3drmt.register.write
+    SmallVector<vdrmt::RegisterWriteOp> writes;
+    mod.walk([&](vdrmt::RegisterWriteOp op) { writes.push_back(op); });
+    for (auto op : writes) {
+        builder.setInsertionPoint(op);
+        builder.create<bf3drmt::RegisterWriteOp>(
+            op.getLoc(), op.getInstance(), op.getIndex(), op.getValue());
+        op.erase();
+    }
+}
+
+// ============================================================================
 // BF3DRMT Block Generator
 // ============================================================================
 
@@ -746,6 +1044,10 @@ public:
 
     LogicalResult generate() {
         int successCount = 0, skipCount = 0;
+
+        // ── Phase 0: cross-block memory access isolation analysis ─────────
+        llvm::outs() << "\n  Memory access isolation analysis ...\n";
+        runMemoryAnalysis();
 
         std::error_code ec;
         for (llvm::sys::fs::directory_iterator dir(inputDir, ec), end;
@@ -798,6 +1100,409 @@ public:
 private:
     MLIRContext *context;
     std::string inputDir;
+
+    // =========================================================================
+    // Memory Access Isolation Analysis
+    // =========================================================================
+    //
+    // Implements §Memory accessing isolation from the paper:
+    //
+    //   For each VFFA instance (counter, register, meter, hash5tuple), determine:
+    //     • which blocks access it  (locality: local vs. shared)
+    //     • whether its index is derived from a packet hash  (partitionable?)
+    //
+    //   Classification:
+    //     Local                  — accessed by exactly one block
+    //     SharedPartitionable    — multiple blocks, index ← hash5tuple result
+    //     SharedNonPartitionable — multiple blocks, index not hash-derived
+    //
+    //   Results are written to:
+    //     <outputDir>/memory_analysis.json   (module-level summary)
+    //     <blockN>/metadata.json             (per-block "memoryAnalysis" section)
+    // =========================================================================
+
+    enum class MemoryLocality { Local, SharedPartitionable, SharedNonPartitionable };
+
+    static StringRef localityStr(MemoryLocality l) {
+        switch (l) {
+        case MemoryLocality::Local:                  return "local";
+        case MemoryLocality::SharedPartitionable:    return "shared_partitionable";
+        case MemoryLocality::SharedNonPartitionable: return "shared_non_partitionable";
+        }
+        return "unknown";
+    }
+
+    struct VFFAInstanceAnalysis {
+        std::string name;
+        std::string kind;                    // "counter","register","meter","hash5tuple"
+        std::vector<int> accessingBlocks;
+        bool allInputsPacketDerived = true;  // false if any input traces to a stateful read
+        std::string shardingKey;             // canonical fingerprint of the index expr
+        bool shardingKeyConsistent = true;   // false if blocks use different index exprs
+        MemoryLocality locality = MemoryLocality::Local;
+    };
+
+    /// Walk the SSA def-chain of 'v' and return false if any input is derived
+    /// from a stateful read (RegisterReadOp or MeterExecuteOp).
+    ///
+    /// Rationale: if a stateful op's inputs (index or write value) are purely
+    /// packet-derived, the hardware can insert packet steering rules to shard
+    /// the stateful memory across ports/engines. If any input traces to another
+    /// stateful read the routing decision would itself depend on state, making
+    /// sharding impossible.
+    ///
+    /// Block arguments are conservatively treated as packet-derived: at block
+    /// boundaries, values come from hdr/meta which are populated from the packet
+    /// before any stateful reads execute in that block.
+    static bool isPacketDerived(Value v) {
+        SmallVector<Value> worklist = {v};
+        DenseSet<Value> visited;
+        while (!worklist.empty()) {
+            Value cur = worklist.pop_back_val();
+            if (!visited.insert(cur).second) continue;
+            Operation *def = cur.getDefiningOp();
+            if (!def) continue;  // block argument — conservatively packet-derived
+            // A value produced by a stateful read is state-derived, not packet-derived.
+            if (isa<RegisterReadOp, MeterExecuteOp>(def)) return false;
+            // Trace through all other ops (arithmetic, casts, hash, struct access, etc.).
+            for (Value operand : def->getOperands())
+                worklist.push_back(operand);
+        }
+        return true;
+    }
+
+    /// Compute a canonical fingerprint string for the def-chain of value 'v'.
+    ///
+    /// Two values with identical fingerprints use the same structural path
+    /// through hdr/meta fields, meaning they will select the same hardware
+    /// shard for any given packet — so bf3drmt per-entry mode can safely
+    /// partition the resource using this key.
+    ///
+    /// Conventions:
+    ///   "arg:N"                   — block argument (hdr/meta ref)
+    ///   "read(fp)"                — vdrmt.read from a reference
+    ///   "struct_extract[N](fp)"   — field extraction at index N
+    ///   "hash5tuple(fp0,...,fp4)" — 5-tuple hash (all input fields)
+    ///   "const"                   — any compile-time constant
+    ///   "op_name(fp0,...)"        — generic fallback for arithmetic, casts, etc.
+    static std::string keyFingerprint(Value v, DenseSet<Value> &visited) {
+        if (!visited.insert(v).second)
+            return "cycle"; // SSA is a DAG; shouldn't fire in practice
+
+        // Block argument — hdr or meta reference, packet-derived by convention.
+        if (auto ba = dyn_cast<BlockArgument>(v))
+            return "arg:" + std::to_string(ba.getArgNumber());
+
+        Operation *def = v.getDefiningOp();
+        if (!def) return "unknown";
+
+        // vdrmt.constant — compile-time constant
+        if (isa<ConstantOp>(def))
+            return "const";
+
+        // vdrmt.read %ref — load from a reference (hdr/meta field pointer)
+        if (isa<ReadOp>(def))
+            return "read(" + keyFingerprint(def->getOperand(0), visited) + ")";
+
+        // vdrmt.struct_extract %input[idx] — struct field selection by index
+        if (auto extractOp = dyn_cast<StructExtractOp>(def))
+            return "struct_extract[" + std::to_string(extractOp.getFieldIndex()) + "]("
+                   + keyFingerprint(extractOp.getInput(), visited) + ")";
+
+        // vdrmt.hash5tuple.apply @inst(src,dst,sport,dport,proto)
+        // The 5-tuple is the key; encode all operand fingerprints.
+        if (isa<Hash5TupleApplyOp>(def)) {
+            std::string fp = "hash5tuple(";
+            bool first = true;
+            for (Value operand : def->getOperands()) {
+                if (!first) fp += ",";
+                fp += keyFingerprint(operand, visited);
+                first = false;
+            }
+            return fp + ")";
+        }
+
+        // Generic fallback: op mnemonic + operand fingerprints.
+        // Handles arithmetic (add, mul, shift), casts, etc.
+        std::string fp = def->getName().getStringRef().str() + "(";
+        bool first = true;
+        for (Value operand : def->getOperands()) {
+            if (!first) fp += ",";
+            fp += keyFingerprint(operand, visited);
+            first = false;
+        }
+        return fp + ")";
+    }
+
+    /// Return the sharding key fingerprint for a VFFA execute op.
+    ///
+    /// For register/counter/meter — the index (first SSA operand) determines
+    /// which hardware shard the packet maps to.
+    /// For hash5tuple — all 5 tuple operands together form the key.
+    static std::string shardingKeyOf(VFFAExecuteOpInterface use) {
+        Operation *op = use.getOperation();
+        auto operands = op->getOperands();
+        if (operands.empty()) return "";
+
+        if (isa<Hash5TupleApplyOp>(op)) {
+            // All 5 inputs jointly form the sharding key.
+            std::string key = "hash5tuple(";
+            bool first = true;
+            for (Value operand : operands) {
+                if (!first) key += ",";
+                DenseSet<Value> visited;
+                key += keyFingerprint(operand, visited);
+                first = false;
+            }
+            return key + ")";
+        }
+
+        // register.read/write, counter.count, meter.execute:
+        // first operand is the index.
+        DenseSet<Value> visited;
+        return keyFingerprint(operands[0], visited);
+    }
+
+    /// Determine the VFFA kind string from an execute op.
+    static std::string vffaKindOf(VFFAExecuteOpInterface use) {
+        Operation *op = use.getOperation();
+        if (isa<CounterCountOp>(op))      return "counter";
+        if (isa<MeterExecuteOp>(op))      return "meter";
+        if (isa<Hash5TupleApplyOp>(op))   return "hash5tuple";
+        if (isa<RegisterReadOp>(op) ||
+            isa<RegisterWriteOp>(op))     return "register";
+        return "unknown";
+    }
+
+    void runMemoryAnalysis() {
+        // ── Pass 1: scan every vdrmt.mlir and collect per-instance access info ──
+        //
+        // instanceMap : name → VFFAInstanceAnalysis (accumulated across blocks)
+        // blockInstances : blockId → list of instance names accessed
+        llvm::StringMap<VFFAInstanceAnalysis> instanceMap;
+        std::map<int, std::vector<std::string>> blockInstances;
+
+        // Collect block directories and sort by block ID before processing so
+        // that accessingBlocks order and the first-seen shardingKey are
+        // deterministic across runs (directory_iterator order is filesystem-
+        // dependent and varies between ext4 runs).
+        std::vector<std::pair<int, std::string>> blockPaths; // (blockId, path)
+        {
+            std::error_code ec;
+            for (llvm::sys::fs::directory_iterator dir(inputDir, ec), end;
+                 dir != end && !ec; dir.increment(ec)) {
+                auto path = dir->path();
+                if (!llvm::sys::fs::is_directory(path)) continue;
+                std::string dirName = llvm::sys::path::filename(path).str();
+                if (dirName.find("block") != 0) continue;
+                std::string vdrmtFile = path + "/vdrmt.mlir";
+                if (!llvm::sys::fs::exists(vdrmtFile)) continue;
+                // Parse just to extract block_id, then keep for main loop.
+                auto mod = parseSourceFile<ModuleOp>(vdrmtFile, context);
+                if (!mod) continue;
+                int blockId = -1;
+                mod->walk([&](func::FuncOp fn) {
+                    if (auto attr = fn->getAttrOfType<IntegerAttr>("vdrmt.block_id"))
+                        blockId = (int)attr.getInt();
+                    return WalkResult::interrupt();
+                });
+                if (blockId >= 0)
+                    blockPaths.emplace_back(blockId, path);
+            }
+            llvm::sort(blockPaths, [](auto &a, auto &b) { return a.first < b.first; });
+        }
+
+        for (auto &[blockId, path] : blockPaths) {
+            std::string vdrmtFile = path + "/vdrmt.mlir";
+            auto mod = parseSourceFile<ModuleOp>(vdrmtFile, context);
+            if (!mod) continue;
+
+            // Walk all VFFA execute ops via the interface.
+            mod->walk([&](VFFAExecuteOpInterface use) {
+                std::string instName = use.getInstanceAttr().getValue().str();
+                std::string kind     = vffaKindOf(use);
+
+                // Check that ALL inputs (index and write value) are packet-derived.
+                // If any input traces back to a stateful read, sharding via packet
+                // steering is impossible for this instance.
+                //
+                // Use getOperation()->getOperands() rather than getInputs(): every
+                // getInputs() impl returns ValueRange{getSrcAddr(), ...} which is
+                // backed by a temporary initializer_list destroyed on return, so
+                // the ValueRange would dangle by the time we iterate it.
+                // getOperands() is always safe — it's backed by the op's own storage.
+                // ($instance is a FlatSymbolRefAttr, not an SSA operand, so it does
+                // not appear in getOperands().)
+                bool allPacket = true;
+                for (Value input : use.getOperation()->getOperands())
+                    if (!isPacketDerived(input)) { allPacket = false; break; }
+
+                // Compute the sharding key fingerprint for this access.
+                std::string thisKey = shardingKeyOf(use);
+
+                // Accumulate into the module-level map.
+                auto &entry = instanceMap[instName];
+                if (entry.name.empty()) {
+                    entry.name = instName;
+                    entry.kind = kind;
+                }
+                // Only record each blockId once per instance.
+                if (llvm::find(entry.accessingBlocks, blockId) ==
+                    entry.accessingBlocks.end()) {
+                    entry.accessingBlocks.push_back(blockId);
+                }
+                // One non-packet-derived access taints the whole instance.
+                entry.allInputsPacketDerived =
+                    entry.allInputsPacketDerived && allPacket;
+                // Track sharding key consistency across blocks:
+                // all accesses must use the same index expression so that
+                // bf3drmt per-entry mode can shard by a single packet key.
+                if (entry.shardingKey.empty()) {
+                    entry.shardingKey = thisKey;
+                } else if (entry.shardingKey != thisKey) {
+                    entry.shardingKeyConsistent = false;
+                }
+
+                // Record this instance in the per-block list.
+                auto &blkList = blockInstances[blockId];
+                if (llvm::find(blkList, instName) == blkList.end())
+                    blkList.push_back(instName);
+            });
+        }
+
+        // Sort accessingBlocks within each instance for deterministic JSON output.
+        for (auto &kv : instanceMap)
+            llvm::sort(kv.second.accessingBlocks);
+
+        // ── Pass 2: classify each instance ────────────────────────────────────
+        // SharedPartitionable (maps to bf3drmt per-entry mode) requires:
+        //   • accessed by multiple blocks, AND
+        //   • all inputs are packet-derived (no stateful-read dependencies), AND
+        //   • all blocks use the same index expression (consistent sharding key)
+        //     so that a single packet steering rule selects the correct shard.
+        //
+        // If inputs are packet-derived but keys differ across blocks, bf3drmt
+        // per-entry mode cannot be used (different blocks would select different
+        // shards for the same packet). Shared mode (counter, meter) can still work.
+        for (auto &kv : instanceMap) {
+            auto &info = kv.second;
+            if (info.accessingBlocks.size() == 1) {
+                info.locality = MemoryLocality::Local;
+            } else if (info.allInputsPacketDerived && info.shardingKeyConsistent) {
+                info.locality = MemoryLocality::SharedPartitionable;
+            } else {
+                info.locality = MemoryLocality::SharedNonPartitionable;
+            }
+        }
+
+        // ── Pass 3: write module-level memory_analysis.json ───────────────────
+        // Collect sorted instance names for deterministic JSON output
+        // (llvm::StringMap iteration order is unspecified).
+        std::vector<std::string> sortedInstNames;
+        for (auto &kv : instanceMap)
+            sortedInstNames.push_back(kv.first().str());
+        llvm::sort(sortedInstNames);
+
+        {
+            std::string outFile = inputDir + "/memory_analysis.json";
+            std::error_code errc;
+            llvm::raw_fd_ostream out(outFile, errc);
+            if (!errc) {
+                out << "{\n  \"vffaInstances\": [\n";
+                bool firstInst = true;
+                for (auto &instName : sortedInstNames) {
+                    auto &kv = *instanceMap.find(instName);
+                    auto &info = kv.second;
+                    if (!firstInst) out << ",\n";
+                    firstInst = false;
+                    out << "    {\n";
+                    out << "      \"name\": \"" << info.name << "\",\n";
+                    out << "      \"kind\": \"" << info.kind << "\",\n";
+                    out << "      \"locality\": \""
+                        << localityStr(info.locality) << "\",\n";
+                    out << "      \"allInputsPacketDerived\": "
+                        << (info.allInputsPacketDerived ? "true" : "false") << ",\n";
+                    out << "      \"shardingKey\": \"" << info.shardingKey << "\",\n";
+                    out << "      \"shardingKeyConsistent\": "
+                        << (info.shardingKeyConsistent ? "true" : "false") << ",\n";
+                    out << "      \"accessingBlocks\": [";
+                    for (size_t i = 0; i < info.accessingBlocks.size(); i++) {
+                        if (i) out << ", ";
+                        out << info.accessingBlocks[i];
+                    }
+                    out << "]\n    }";
+                }
+                out << "\n  ]\n}\n";
+                llvm::outs() << "  ✓ memory_analysis.json\n";
+            }
+        }
+
+        // ── Pass 4: annotate each block's metadata.json ────────────────────────
+        for (auto &[blockId, instNames] : blockInstances) {
+            // Find the block directory.
+            std::string blockDir = inputDir + "/block" + std::to_string(blockId);
+            std::string metaFile = blockDir + "/metadata.json";
+            if (!llvm::sys::fs::exists(metaFile)) continue;
+
+            // Read existing metadata.json.
+            auto buf = llvm::MemoryBuffer::getFile(metaFile);
+            if (!buf) continue;
+            std::string existing = buf.get()->getBuffer().str();
+
+            // Build the memoryAnalysis JSON fragment.
+            std::string fragment;
+            llvm::raw_string_ostream frag(fragment);
+            frag << "  \"memoryAnalysis\": {\n";
+            frag << "    \"accessedInstances\": [\n";
+            bool firstInst = true;
+            for (auto &instName : instNames) {
+                auto it = instanceMap.find(instName);
+                if (it == instanceMap.end()) continue;
+                auto &info = it->second;
+                if (!firstInst) frag << ",\n";
+                firstInst = false;
+                frag << "      {\n";
+                frag << "        \"name\": \"" << info.name << "\",\n";
+                frag << "        \"kind\": \"" << info.kind << "\",\n";
+                frag << "        \"locality\": \""
+                     << localityStr(info.locality) << "\",\n";
+                frag << "        \"allInputsPacketDerived\": "
+                     << (info.allInputsPacketDerived ? "true" : "false") << ",\n";
+                frag << "        \"shardingKey\": \"" << info.shardingKey << "\",\n";
+                frag << "        \"shardingKeyConsistent\": "
+                     << (info.shardingKeyConsistent ? "true" : "false") << "\n";
+                frag << "      }";
+            }
+            frag << "\n    ]\n  }";
+            frag.flush();
+
+            // Inject the fragment before the closing '}'.
+            // Find the last '}' and insert before it.
+            auto pos = existing.rfind('}');
+            if (pos == std::string::npos) continue;
+            std::string updated = existing.substr(0, pos)
+                                + ",\n" + fragment + "\n}";
+
+            std::error_code errc;
+            llvm::raw_fd_ostream out(metaFile, errc);
+            if (!errc) out << updated;
+        }
+
+        // ── Summary ────────────────────────────────────────────────────────────
+        int nLocal = 0, nSharedPart = 0, nSharedNonPart = 0;
+        for (auto &kv : instanceMap) {
+            switch (kv.second.locality) {
+            case MemoryLocality::Local:                  nLocal++;        break;
+            case MemoryLocality::SharedPartitionable:    nSharedPart++;   break;
+            case MemoryLocality::SharedNonPartitionable: nSharedNonPart++;break;
+            }
+        }
+        llvm::outs() << "  Instances: " << instanceMap.size()
+                     << " total  ("
+                     << nLocal        << " local, "
+                     << nSharedPart   << " shared-partitionable, "
+                     << nSharedNonPart<< " shared-non-partitionable)\n";
+    }
 
     LogicalResult generateMapperEgglog() {
         // ── Collect per-block info from all generated bf3drmt.mlir files ──
@@ -922,6 +1627,14 @@ private:
             return failure();
         }
 
+        // ── Phase 0b: run VFFSCoarseGrainedPass to lift counter decls ──────
+        {
+            PassManager pm(vdrmtMod->getContext());
+            pm.addPass(mlir::createVFFSCoarseGrainedPass());
+            // Non-fatal: ignore errors (no counter ops means nothing to do).
+            (void)pm.run(*vdrmtMod);
+        }
+
         // ── Phase 1: DialEgg op-level conversion ───────────────────────────
         std::string eggFilePath = "egglog_rules/vdrmt_to_bf3drmt.egg";
         if (!llvm::sys::fs::exists(eggFilePath)) {
@@ -949,6 +1662,27 @@ private:
             llvm::errs() << "  ✗ Structural conversion failed for "
                          << vdrmtFile << "\n";
             return failure();
+        }
+
+        // ── Phase 2b: lower vFFS counter ops → bf3drmt counter ops ─────────
+        {
+            OpBuilder b(vdrmtMod->getContext());
+            lowerVFFSCounters(*vdrmtMod, b);
+        }
+
+        // ── Phase 2c: remove residual vFFS hash5tuple ops ───────────────
+        lowerVFFSHash5Tuple(*vdrmtMod);
+
+        // ── Phase 2d: lower vDRMT meter ops → bf3drmt meter ops ─────────
+        {
+            OpBuilder b(vdrmtMod->getContext());
+            lowerVDRMTMeters(*vdrmtMod, b);
+        }
+
+        // ── Phase 2e: lower vDRMT register ops → bf3drmt register ops ───
+        {
+            OpBuilder b(vdrmtMod->getContext());
+            lowerVDRMTRegisters(*vdrmtMod, b);
         }
 
         // ── Write output ────────────────────────────────────────────────────

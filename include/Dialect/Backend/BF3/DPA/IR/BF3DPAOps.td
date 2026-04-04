@@ -443,4 +443,50 @@ def BF3DPA_ReturnOp : BF3DPA_Op<"return", [Pure, Terminator, ReturnLike]> {
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Hash5Tuple — software 5-tuple hash on BF3 DPA
+//===----------------------------------------------------------------------===//
+
+def BF3DPA_Hash5TupleInstanceOp : BF3DPA_Op<"hash5tuple_instance", [Symbol]> {
+    let summary = "Declare a software Hash5Tuple instance at module scope (BF3 DPA)";
+    let description = [{
+        Declares a named Hash5Tuple instance backed by a software hash computation.
+        On BF3 DPA, this lowers to a CRC32 or Toeplitz hash function call in C.
+        Unlike the vDRMT counterpart, there is no nr_entries constraint.
+
+        Example:
+          bf3dpa.hash5tuple_instance @lb_hash
+    }];
+    let arguments = (ins SymbolNameAttr:$sym_name);
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DPA_Hash5TupleApplyOp : BF3DPA_Op<"hash5tuple.apply"> {
+    let summary = "Compute a 5-tuple hash on BF3 DPA (software CRC/Toeplitz)";
+    let description = [{
+        Computes Hash5Tuple(srcAddr, dstAddr, srcPort, dstPort, proto)
+        via a software hash function on the DPA, returning a 32-bit value.
+        The caller is responsible for applying a modulo or mask to obtain a
+        bucket index.
+
+        Example:
+          %h = bf3dpa.hash5tuple.apply @lb_hash(%src, %dst, %sport, %dport, %proto)
+                 : (i32, i32, i16, i16, i8) -> i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$src_addr,
+        AnyInteger:$dst_addr,
+        AnyInteger:$src_port,
+        AnyInteger:$dst_port,
+        AnyInteger:$proto
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = [{
+        $instance `(` $src_addr `,` $dst_addr `,` $src_port `,` $dst_port `,` $proto `)`
+        `:` `(` type($src_addr) `,` type($dst_addr) `,` type($src_port) `,`
+               type($dst_port) `,` type($proto) `)` `->` type($result) attr-dict
+    }];
+}
+
 #endif // BF3DPAOPS

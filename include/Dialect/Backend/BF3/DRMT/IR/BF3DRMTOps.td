@@ -517,4 +517,84 @@ def BF3DRMT_NextOp : BF3DRMT_Op<"next", [Pure, Terminator, ReturnLike]> {
     ];
 }
 
+//===----------------------------------------------------------------------===//
+// Counter (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def BF3DRMT_CounterDeclOp : BF3DRMT_Op<"counter_decl", [Symbol]> {
+    let summary = "Declare a BF3 hardware counter array";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DRMT_CounterCountOp : BF3DRMT_Op<"counter.count"> {
+    let summary = "Increment BF3 hardware counter at given index";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Meter (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def BF3DRMT_MeterDeclOp : BF3DRMT_Op<"meter_decl", [Symbol]> {
+    let summary = "Declare a BF3 hardware meter array";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$meter_type
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DRMT_MeterExecuteOp : BF3DRMT_Op<"meter.execute"> {
+    let summary = "Execute BF3 hardware meter at given index, returning color";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$color);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($color) attr-dict";
+}
+
+//===----------------------------------------------------------------------===//
+// Register (Fixed-Function Accelerator)
+//===----------------------------------------------------------------------===//
+
+def BF3DRMT_RegisterDeclOp : BF3DRMT_Op<"register_decl", [Symbol]> {
+    let summary = "Declare a BF3 stateful register array";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$element_width
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def BF3DRMT_RegisterReadOp : BF3DRMT_Op<"register.read"> {
+    let summary = "Read one element from a BF3 register array";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($result) attr-dict";
+}
+
+def BF3DRMT_RegisterWriteOp : BF3DRMT_Op<"register.write"> {
+    let summary = "Write one element into a BF3 register array";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index,
+        AnyInteger:$value
+    );
+    let assemblyFormat = "$instance `[` $index `]` `=` $value `:` type($index) `,` type($value) attr-dict";
+}
+
 #endif // BF3DRMTOPS
