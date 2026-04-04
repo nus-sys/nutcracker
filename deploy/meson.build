@@ -36,6 +36,10 @@ deploy_sources = [
     '../runtime/nc_flexio_host.c',
     '../runtime/nc_arm_worker.c',
     '../vdsa_output/doca_flow_pipeline.c',
+    # Stub DPA symbols (nc_dpa_app / nc_dpa_event_handler) for all-DRMT
+    # deployments where DPACC is not invoked.  The actual DPA binary replaces
+    # this file when DPA blocks are present.
+    'nc_dpa_stub.c',
 ]
 
 executable('nc_runtime',
