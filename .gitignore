@@ -155,3 +155,7 @@ Cargo.lock
 build/
 
 # End of https://www.toptal.com/developers/gitignore/api/git,c++,macos,linux,visualstudiocode,rust,cmake
+
+### NutCracker generated output ###
+vdsa_output/
+deploy/

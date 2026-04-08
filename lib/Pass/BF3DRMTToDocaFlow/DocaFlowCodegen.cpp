@@ -306,10 +306,24 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
     bool hasAnyMeters = !allMeterDecls.empty();
 
     // g_pipes must be indexed by block ID (not pipe count).
-    // Find the max DRMT block ID so the array covers all valid indices.
+    // Find the max block ID referenced by ANY pipe (including successor targets
+    // that may be terminal blocks not in the DRMT pipe list).
     int maxDrmtBlockId = -1;
-    for (auto &pr : pipes)
+    for (auto &pr : pipes) {
         if (pr.blockId > maxDrmtBlockId) maxDrmtBlockId = pr.blockId;
+        // Explicitly iterate pipe action bodies to find successor block IDs.
+        auto &pipeBody = pr.pipeOp.getBody().front();
+        for (auto &op : pipeBody) {
+            if (auto paOp = mlir::dyn_cast<bf3drmt::PipeActionOp>(&op)) {
+                for (auto &aop : paOp.getBody().front()) {
+                    if (auto nextOp = mlir::dyn_cast<bf3drmt::NextOp>(&aop)) {
+                        int s = (int)nextOp.getSuccessor();
+                        if (s > maxDrmtBlockId) maxDrmtBlockId = s;
+                    }
+                }
+            }
+        }
+    }
     int gPipesSize = maxDrmtBlockId + 1;
 
     // Successor map: blockId → [successor blockIds] (DRMT-only successors for topo sort)

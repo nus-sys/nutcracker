@@ -9,13 +9,32 @@ Before building the project you should initialize and update the repository subm
 git submodule update --init --recursive
 ```
 
+### System Requirements
+
+- **Rust toolchain** (version 1.74.0 or later)
+  
+  Install Rust using rustup:
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source $HOME/.cargo/env
+  ```
+  
+  Verify installation:
+  ```bash
+  rustc --version  # Should show 1.74.0 or later
+  cargo --version
+  ```
+
+- **CMake** (version 3.20 or later)
+- **Ninja** build system
+
 ### Third-party Dependencies
 
 To set up the required third-party dependencies, run the following commands:
 
 1. **Initialize LLVM**
    ```bash
-   bash build/build_llvm.sh
+   bash build_scripts/build_llvm.sh
    export LLVM="$PWD/third_party/llvm/build/bin"
    ```
 
@@ -33,13 +52,6 @@ To set up the required third-party dependencies, run the following commands:
    cargo build --release
    popd
    export EGGLOG="$PWD/third_party/egglog/target/release"
-   ```
-
-   > The egglog rewrite rules live in `egglog_rules/`. The `NUTCRACKER_ROOT`
-   > environment variable tells the compiler where to find them when invoked
-   > from a different directory:
-   > ```bash
-   export NUTCRACKER_ROOT="$PWD"
    ```
 
 4. **Set environment variable:**
@@ -134,3 +146,81 @@ on the BlueField-3 DPU.
 > export NUTCRACKER_ROOT=/path/to/nutcracker
 > ./build/bin/nutcracker-opt <input.mlir> [options]
 > ```
+
+## Running the Pipeline
+
+After building the generated pipeline, run it on the BlueField-3 DPU with the
+following command (run as root or with `sudo`):
+
+```bash
+sudo ./deploy/build_deploy/nc_runtime \
+    -l 0-3 -n 4 \
+    -a 0000:03:00.0,dv_flow_en=2 \
+    -a 0000:03:00.1,dv_flow_en=2 \
+    -- --device mlx5_0 --queues 1
+```
+
+### EAL arguments (before `--`)
+
+| Argument | Description |
+|---|---|
+| `-l 0-3` | Use lcores 0–3 (one main + up to 3 ARM workers) |
+| `-n 4` | 4 memory channels |
+| `-a 0000:03:00.0,dv_flow_en=2` | Bind PF 0 with DOCA Flow HWS (hardware steering) enabled |
+| `-a 0000:03:00.1,dv_flow_en=2` | Bind PF 1 with DOCA Flow HWS enabled |
+
+> **`dv_flow_en=2` is required.** DOCA Flow hardware-steering mode (`hws`) will
+> fail to start the port without it.  Both PFs must be listed even when only one
+> port carries traffic, because the runtime opens both ports and calls
+> `doca_flow_port_pair` to enable VNF forwarding between them.
+
+### Application arguments (after `--`)
+
+| Argument | Default | Description |
+|---|---|---|
+| `--device mlx5_0` | `mlx5_0` | IBV device name used by FlexIO/DPA init (skipped automatically when no DPA blocks are present) |
+| `--queues N` | `1` | Number of RSS queues per port; must match the number of ARM worker lcores for ARM-mapped blocks |
+
+### Expected output
+
+A successful run prints (via DOCA logging) messages similar to:
+
+```
+[NC_RUNTIME][INF] DPDK port 0 started (1 RX/TX queues)
+[NC_RUNTIME][INF] DPDK port 1 started (1 RX/TX queues)
+[NC_PIPELINE][INF] Created pipe 0: …
+[NC_PIPELINE][INF] Created pipe 1: …
+[NC_PIPELINE][INF] Created pipe 2: …
+[NC_PIPELINE][INF] Created pipe 3: …
+[NC_PIPELINE][INF] Pipeline entries committed to HW: 4 processed, failure=0
+[NC_RUNTIME][INF] nutcracker runtime running (Ctrl-C to stop)
+```
+
+Press **Ctrl-C** to shut down gracefully.
+
+### Hardware prerequisites
+
+- BlueField-3 DPU with both PFs (`0000:03:00.0`, `0000:03:00.1`) bound to the
+  DPDK-compatible driver (typically `mlx5_core`/`mlx5_pci`).
+- Hugepages configured (e.g. `4096 × 2 MB` pages).  Check with:
+  ```bash
+  cat /proc/meminfo | grep HugePages
+  ```
+- DOCA SDK and FlexIO libraries installed (available in the BlueField BSP).
+
+### Shared-counter example
+
+The `apps/shared_counter/` example is a minimal pipeline with four all-DRMT
+blocks.  After building the deploy directory for that example:
+
+```bash
+sudo ./deploy/build_deploy/nc_runtime \
+    -l 0-1 -n 4 \
+    -a 0000:03:00.0,dv_flow_en=2 \
+    -a 0000:03:00.1,dv_flow_en=2 \
+    -- --queues 1
+```
+
+All four blocks are handled in hardware (DRMT); no ARM worker threads are
+launched.  The runtime reaches steady state immediately after the pipeline
+entries are committed.
