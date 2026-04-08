@@ -9,13 +9,32 @@ Before building the project you should initialize and update the repository subm
 git submodule update --init --recursive
 ```
 
+### System Requirements
+
+- **Rust toolchain** (version 1.74.0 or later)
+  
+  Install Rust using rustup:
+  ```bash
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+  source $HOME/.cargo/env
+  ```
+  
+  Verify installation:
+  ```bash
+  rustc --version  # Should show 1.74.0 or later
+  cargo --version
+  ```
+
+- **CMake** (version 3.20 or later)
+- **Ninja** build system
+
 ### Third-party Dependencies
 
 To set up the required third-party dependencies, run the following commands:
 
 1. **Initialize LLVM**
    ```bash
-   bash build/build_llvm.sh
+   bash build_scripts/build_llvm.sh
    export LLVM="$PWD/third_party/llvm/build/bin"
    ```
 
@@ -33,13 +52,6 @@ To set up the required third-party dependencies, run the following commands:
    cargo build --release
    popd
    export EGGLOG="$PWD/third_party/egglog/target/release"
-   ```
-
-   > The egglog rewrite rules live in `egglog_rules/`. The `NUTCRACKER_ROOT`
-   > environment variable tells the compiler where to find them when invoked
-   > from a different directory:
-   > ```bash
-   export NUTCRACKER_ROOT="$PWD"
    ```
 
 4. **Set environment variable:**
