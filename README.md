@@ -6,7 +6,7 @@ Compilation Framework For Hybrid DPU
 Before building the project you should initialize and update the repository submodules (this will fetch the `third_party` sources used below):
 
 ```bash
-git submodule update --init --recursive
+git submodule update --init
 ```
 
 ### System Requirements
