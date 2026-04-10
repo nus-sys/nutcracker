@@ -1,7 +1,7 @@
-diff --git a/build_tools/build_p4c_with_p4mlir_ext.sh b/build_tools/build_p4c_with_p4mlir_ext.sh
+diff --git a/build_scripts/build_p4c_with_p4mlir_ext.sh b/build_tools/build_p4c_with_p4mlir_ext.sh
 index 1b30d52..bb08b5a 100755
---- a/build_tools/build_p4c_with_p4mlir_ext.sh
-+++ b/build_tools/build_p4c_with_p4mlir_ext.sh
+--- a/build_scripts/build_p4c_with_p4mlir_ext.sh
++++ b/build_scripts/build_p4c_with_p4mlir_ext.sh
 @@ -10,9 +10,9 @@ set -ex
  SCRIPT_DIR=$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )  # p4mlir/build_tools
  P4MLIR_REPO_DIR=$( cd "$SCRIPT_DIR"/.. &> /dev/null && pwd )
