@@ -40,8 +40,8 @@ To set up the required third-party dependencies, run the following commands:
 
 2. **Initialize P4MLIR**
     ```bash
-    git apply ../../patches/01_fix_p4mlir_build_script.patch
     pushd third_party/p4mlir/build_tools/
+    git apply ../../../patches/01_fix_p4mlir_build_script.patch
     bash build_p4c_with_p4mlir_ext.sh
     popd
     ```
