@@ -373,6 +373,54 @@ public:
   }
 };
 
+// Convert p4hir.shr → vdrmt.shr
+class ShrOpConversion : public OpConversionPattern<P4::P4MLIR::P4HIR::ShrOp> {
+public:
+  using OpConversionPattern<P4::P4MLIR::P4HIR::ShrOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      P4::P4MLIR::P4HIR::ShrOp op,
+      OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    if (!convertedType) return failure();
+
+    rewriter.replaceOpWithNewOp<vdrmt::ShrOp>(
+      op,
+      convertedType,
+      adaptor.getLhs(),
+      adaptor.getRhs()
+    );
+
+    return success();
+  }
+};
+
+// Convert p4hir.shl → vdrmt.shl
+class ShlOpConversion : public OpConversionPattern<P4::P4MLIR::P4HIR::ShlOp> {
+public:
+  using OpConversionPattern<P4::P4MLIR::P4HIR::ShlOp>::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(
+      P4::P4MLIR::P4HIR::ShlOp op,
+      OpAdaptor adaptor,
+      ConversionPatternRewriter &rewriter) const override {
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    if (!convertedType) return failure();
+
+    rewriter.replaceOpWithNewOp<vdrmt::ShlOp>(
+      op,
+      convertedType,
+      adaptor.getLhs(),
+      adaptor.getRhs()
+    );
+
+    return success();
+  }
+};
+
 // Convert p4hir.struct_extract → vdrmt.struct_extract
 class StructExtractOpConversion : public OpConversionPattern<P4::P4MLIR::P4HIR::StructExtractOp> {
 public:
@@ -1167,6 +1215,8 @@ private:
       ReadOpConversion,
       AssignOpConversion,
       BinOpConversion,
+      ShrOpConversion,
+      ShlOpConversion,
       StructExtractOpConversion,
       StructExtractRefOpConversion,
       ConstOpConversion,

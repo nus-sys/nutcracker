@@ -185,6 +185,8 @@ mlir::Type Egglog::parseType(std::string typeStr) {
         return mlir::Float128Type::get(&context);
     } else if (type == "I1") {
         return mlir::IntegerType::get(&context, 1);
+    } else if (type == "I4") {
+        return mlir::IntegerType::get(&context, 4);
     } else if (type == "I8") {
         return mlir::IntegerType::get(&context, 8);
     } else if (type == "I16") {
@@ -308,11 +310,11 @@ std::string Egglog::eggifyType(mlir::Type type) {
         size_t width = intType.getWidth();
 
         if (intType.isSignless()) {
-            ss << "(Int" << width << ")";
+            ss << "(Int " << width << ")";
         } else if (intType.isSigned()) {
-            ss << "(SInt" << width << ")";
+            ss << "(SInt " << width << ")";
         } else if (intType.isUnsigned()) {
-            ss << "(UInt" << width << ")";
+            ss << "(UInt " << width << ")";
         } else {
             ss << "(OtherInt \"" << type << "\")";
         }

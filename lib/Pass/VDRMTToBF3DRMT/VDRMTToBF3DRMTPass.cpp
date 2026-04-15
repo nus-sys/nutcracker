@@ -389,6 +389,31 @@ static LogicalResult runDialEggOnFunction(
         }
     }
 
+    // ── Lower remaining vdrmt.variable → bf3drmt.variable ───────────────────
+    // vdrmt.variable is encoded as an opaque Value in egglog (not as a
+    // vdrmt_variable term), so the egglog rewrite rules cannot fire on it.
+    // After the egglog phase, egglog may have created bf3drmt.read ops whose
+    // operand is the result of a vdrmt.variable op; the bf3drmt.read verifier
+    // rejects this because it only allows bf3drmt.variable (or
+    // bf3drmt.struct_extract_ref) as the defining op.
+    // Fix: replace every surviving vdrmt.variable with an equivalent
+    // bf3drmt.variable.  The result type has already been updated to
+    // !bf3drmt.ref<...> by parseValue's setType call, so we use it directly.
+    for (mlir::Block &block : funcOp.getFunctionBody().getBlocks()) {
+        for (auto it = block.begin(); it != block.end(); ) {
+            mlir::Operation &op = *it++;
+            if (op.getName().getStringRef() != "vdrmt.variable")
+                continue;
+            mlir::OpBuilder builder(&op);
+            mlir::OperationState state(op.getLoc(), "bf3drmt.variable");
+            state.addAttributes(op.getAttrs());
+            state.addTypes(op.getResultTypes());
+            mlir::Operation *newOp = builder.create(state);
+            op.getResult(0).replaceAllUsesWith(newOp->getResult(0));
+            op.erase();
+        }
+    }
+
     return success();
 }
 
