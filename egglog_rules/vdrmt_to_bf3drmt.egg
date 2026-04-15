@@ -48,8 +48,13 @@
 (function bf3drmt_assign (Op Op) Op :cost 1)
 (function bf3drmt_struct_extract_ref (Op AttrPair Type) Op :cost 1)
 (function bf3drmt_binop (Op Op AttrPair Type) Op :cost 1)
-(function bf3drmt_shl (Op Op Type) Op :cost 1)
-(function bf3drmt_shr (Op Op Type) Op :cost 1)
+;; SHL/SHR are NOT natively supported by the BF3 NIC ASIC.
+;; They survive here only as high-cost fallback nodes for variable-shift-amount
+;; cases that cannot be statically lowered to concat+slice.  The egglog rules
+;; below replace them with concat+slice whenever the shift amount is a
+;; compile-time constant (the common case in P4).
+(function bf3drmt_shl (Op Op Type) Op :cost 500)
+(function bf3drmt_shr (Op Op Type) Op :cost 500)
 (function bf3drmt_cast (Op Type) Op :cost 1)
 (function bf3drmt_slice (Op AttrPair AttrPair Type) Op :cost 1)
 (function bf3drmt_concat (Op Op Type) Op :cost 1)
@@ -89,14 +94,194 @@
     (bf3drmt_cast ?val ?t)
     :ruleset rules)
 
+;; ── read / struct_extract_ref: direct 1-to-1 lowering ───────────────────
+;;
+;;   vdrmt_read and vdrmt_struct_extract_ref have identical semantics to their
+;;   bf3drmt counterparts.  Direct rewrites let the extractor always choose the
+;;   cheaper bf3drmt form (cost 1 vs 100) regardless of context.
+;;
+;;   These catch-all rules are necessary for two reasons:
+;;
+;;   1. struct_extract_ref used as a bare operand (not immediately under a
+;;      vdrmt_read or vdrmt_assign) — e.g., the inner ref in a two-level
+;;      chain (main_headers → int_header → field) would remain as vdrmt form
+;;      without this rule, causing MLIR type verification failures because the
+;;      operand type becomes !bf3drmt.ref<...> after type lowering.
+;;
+;;   2. vdrmt_read whose operand was already rewritten to a bf3drmt ref by
+;;      rule (1) above — the existing context-sensitive read rules match on
+;;      vdrmt_struct_extract_ref specifically, so they don't fire once the
+;;      operand is a bf3drmt_struct_extract_ref.  This direct rewrite covers
+;;      the remaining cases.
+;;
+;;   The more specific context-sensitive rules (Cases 1–4 below) are kept for
+;;   completeness and may produce lower-cost forms in some cases.
 (rewrite
-    (vdrmt_shl ?lhs ?rhs ?t)
-    (bf3drmt_shl ?lhs ?rhs ?t)
+    (vdrmt_struct_extract_ref ?src ?field ?reft)
+    (bf3drmt_struct_extract_ref ?src ?field ?reft)
     :ruleset rules)
 
 (rewrite
-    (vdrmt_shr ?lhs ?rhs ?t)
-    (bf3drmt_shr ?lhs ?rhs ?t)
+    (vdrmt_read ?ref ?t)
+    (bf3drmt_read ?ref ?t)
+    :ruleset rules)
+
+;; ── Fallback: shl/shr with variable (unknown) shift amount ───────────────
+;;   Cost 500 — beaten by the concat+slice rules below whenever the shift
+;;   amount is a compile-time constant.
+(rewrite (vdrmt_shl ?lhs ?rhs ?t) (bf3drmt_shl ?lhs ?rhs ?t) :ruleset rules)
+(rewrite (vdrmt_shr ?lhs ?rhs ?t) (bf3drmt_shr ?lhs ?rhs ?t) :ruleset rules)
+
+;; ── shr(x: iN, const n) → concat(zeros_n, slice(x, N-1, n, i(N-n)), iN) ──
+;;
+;;   Logical right shift by compile-time constant n:
+;;     upper n bits are zero-filled
+;;     lower N-n bits come from x[N-1 : n]
+;;
+;;   concat([zeros_n : upper], [x[N-1:n] : lower]) : iN
+;;
+;;   Separate rules for each standard integer width so that the highBit
+;;   literal (N-1) can be a compile-time constant in the egg expression.
+;;   A generic rule covers variable-width Int types.
+
+(rule
+    ((= ?shr (vdrmt_shr ?lhs ?rhs (I8)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shr
+        (bf3drmt_concat
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr 7 (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr ?n (I32)))
+                (Int (- 8 ?n)))
+            (I8))))
+    :ruleset rules)
+
+(rule
+    ((= ?shr (vdrmt_shr ?lhs ?rhs (I16)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shr
+        (bf3drmt_concat
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr 15 (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr ?n (I32)))
+                (Int (- 16 ?n)))
+            (I16))))
+    :ruleset rules)
+
+(rule
+    ((= ?shr (vdrmt_shr ?lhs ?rhs (I32)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shr
+        (bf3drmt_concat
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr 31 (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr ?n (I32)))
+                (Int (- 32 ?n)))
+            (I32))))
+    :ruleset rules)
+
+(rule
+    ((= ?shr (vdrmt_shr ?lhs ?rhs (I64)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shr
+        (bf3drmt_concat
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr 63 (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr ?n (I32)))
+                (Int (- 64 ?n)))
+            (I64))))
+    :ruleset rules)
+
+;; Generic shr for variable-width Int types
+(rule
+    ((= ?shr (vdrmt_shr ?lhs ?rhs (Int ?N)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shr
+        (bf3drmt_concat
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr (- ?N 1) (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr ?n (I32)))
+                (Int (- ?N ?n)))
+            (Int ?N))))
+    :ruleset rules)
+
+;; ── shl(x: iN, const n) → concat(slice(x, N-n-1, 0, i(N-n)), zeros_n, iN) ──
+;;
+;;   Logical left shift by compile-time constant n:
+;;     lower n bits are zero-filled
+;;     upper N-n bits come from x[N-n-1 : 0]
+;;
+;;   concat([x[N-n-1:0] : upper], [zeros_n : lower]) : iN
+
+(rule
+    ((= ?shl (vdrmt_shl ?lhs ?rhs (I8)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shl
+        (bf3drmt_concat
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr (- (- 8 ?n) 1) (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr 0 (I32)))
+                (Int (- 8 ?n)))
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (I8))))
+    :ruleset rules)
+
+(rule
+    ((= ?shl (vdrmt_shl ?lhs ?rhs (I16)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shl
+        (bf3drmt_concat
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr (- (- 16 ?n) 1) (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr 0 (I32)))
+                (Int (- 16 ?n)))
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (I16))))
+    :ruleset rules)
+
+(rule
+    ((= ?shl (vdrmt_shl ?lhs ?rhs (I32)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shl
+        (bf3drmt_concat
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr (- (- 32 ?n) 1) (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr 0 (I32)))
+                (Int (- 32 ?n)))
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (I32))))
+    :ruleset rules)
+
+(rule
+    ((= ?shl (vdrmt_shl ?lhs ?rhs (I64)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shl
+        (bf3drmt_concat
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr (- (- 64 ?n) 1) (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr 0 (I32)))
+                (Int (- 64 ?n)))
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (I64))))
+    :ruleset rules)
+
+;; Generic shl for variable-width Int types
+(rule
+    ((= ?shl (vdrmt_shl ?lhs ?rhs (Int ?N)))
+     (= ?rhs (vdrmt_constant (NamedAttr "value" (IntegerAttr ?n ?st)) ?st)))
+    ((union ?shl
+        (bf3drmt_concat
+            (bf3drmt_slice ?lhs
+                (NamedAttr "highBit" (IntegerAttr (- (- ?N ?n) 1) (I32)))
+                (NamedAttr "lowBit"  (IntegerAttr 0 (I32)))
+                (Int (- ?N ?n)))
+            (bf3drmt_constant (NamedAttr "value" (IntegerAttr 0 (Int ?n))) (Int ?n))
+            (Int ?N))))
     :ruleset rules)
 
 (rewrite
