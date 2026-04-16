@@ -94,6 +94,28 @@ SuccessorOperands vdpp::CondBranchOp::getSuccessorOperands(unsigned index) {
                                         : getFalseDestOperandsMutable());
 }
 
+// CompressOp / DecompressOp: $output_len must point to an integer slot so
+// the BF/ARM lowering can write the produced byte count back through it.
+static mlir::LogicalResult verifyVdppOutputLenPtr(mlir::Operation *op,
+                                                  mlir::Value outputLen) {
+    auto ptrTy = mlir::dyn_cast<vdpp::PointerType>(outputLen.getType());
+    if (!ptrTy)
+        return op->emitOpError("output_len must be a vdpp.ptr type");
+    if (!ptrTy.getElementType().isIntOrIndex())
+        return op->emitOpError(
+            "output_len must point to an integer/index slot, got ")
+            << ptrTy.getElementType();
+    return mlir::success();
+}
+
+mlir::LogicalResult vdpp::CompressOp::verify() {
+    return verifyVdppOutputLenPtr(*this, getOutputLen());
+}
+
+mlir::LogicalResult vdpp::DecompressOp::verify() {
+    return verifyVdppOutputLenPtr(*this, getOutputLen());
+}
+
 #define GET_OP_CLASSES
 #include "Dialect/vDPP/IR/vDPPDialect.cpp.inc"
 #include "Dialect/vDPP/IR/vDPPOps.cpp.inc"

@@ -20,7 +20,6 @@ set(LIBS
         MLIREmitHandlerCodePass
         MLIRLLVMIRToVDPPPass
         MLIRLLVMIRToVDRMTPass
-        MLIRVFFSCoarseGrainedPass
         MLIRTargetLLVMIRImport
         #MLIRP4HIRToDPUPass
         #MLIRP4HIRToDRMTPass

@@ -1,6 +1,5 @@
 add_subdirectory(P4HIRPartition)
 add_subdirectory(P4HIRToVDRMT)
-add_subdirectory(VFFSCoarseGrainedPass)
 add_subdirectory(P4HIRToVDPP)
 add_subdirectory(EqualitySaturation)
 add_subdirectory(VDRMTToBF3DRMT)

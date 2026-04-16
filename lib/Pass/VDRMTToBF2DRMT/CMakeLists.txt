@@ -16,5 +16,4 @@ add_mlir_library(MLIRVDRMTToBF2DRMTPass
   MLIRParser
   MLIREqualitySaturationPass
   MLIRBf2drmtToDocaFlowCodegen
-  MLIRVFFSCoarseGrainedPass
 )

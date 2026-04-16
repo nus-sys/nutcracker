@@ -16,6 +16,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 
 #include "Pass/P4HIRToVDRMTPass.h"
+#include "Dialect/vDRMT/IR/vDRMTOpInterfaces.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Ops.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Types.h"
@@ -31,6 +32,114 @@ using namespace mlir;
 using namespace P4::P4MLIR::P4HIR;
 
 namespace {
+
+// ============================================================================
+// Coarse-grained finalization
+// ============================================================================
+// Lift VFFA instance declarations to module scope and strip helper attrs.
+// Input shape (after the conversion patterns below run): execute ops carry
+// vdrmt.{counter,hash5tuple,meter,register}_* helper attrs encoding the
+// instance config; no module-scope instance ops yet. Output: every
+// execute op has a matching module-scope instance, helper attrs are gone.
+// Step 1 (collect) and Step 3 (strip) are generic via VFFA*OpInterface;
+// Step 2 (lift) is per-VFFA-type because instance constructors differ.
+static void coarseGrainVDRMT(ModuleOp mod) {
+    OpBuilder modBuilder(mod.getBodyRegion());
+    modBuilder.setInsertionPointToStart(mod.getBody());
+
+    // Step 1: collect already-declared instances.
+    DenseSet<StringAttr> declared;
+    mod.walk([&](vdrmt::VFFAInstanceOpInterface inst) {
+        declared.insert(inst.getSymNameAttr());
+    });
+
+    // Step 2: lift missing instance decls (per-type).
+
+    // Counter
+    DenseMap<StringAttr, int32_t> counterSizes;
+    mod.walk([&](vdrmt::CounterCountOp op) {
+        auto sym  = op.getInstanceAttr().getAttr();
+        auto attr = op->getAttrOfType<IntegerAttr>("vdrmt.counter_size");
+        int32_t sz = attr ? (int32_t)attr.getInt() : 1024;
+        auto it = counterSizes.find(sym);
+        if (it == counterSizes.end() || it->second < sz)
+            counterSizes[sym] = sz;
+    });
+    for (auto &[sym, sz] : counterSizes) {
+        if (declared.contains(sym)) continue;
+        modBuilder.create<vdrmt::CounterInstanceOp>(
+            mod.getLoc(), sym, modBuilder.getI32IntegerAttr(sz));
+        declared.insert(sym);
+    }
+
+    // Hash5Tuple
+    DenseMap<StringAttr, int32_t> hashSizes;
+    mod.walk([&](vdrmt::Hash5TupleApplyOp op) {
+        auto sym  = op.getInstanceAttr().getAttr();
+        auto attr = op->getAttrOfType<IntegerAttr>("vdrmt.hash5tuple_nr_entries");
+        int32_t sz = attr ? (int32_t)attr.getInt() : 64;
+        auto it = hashSizes.find(sym);
+        if (it == hashSizes.end() || it->second < sz)
+            hashSizes[sym] = sz;
+    });
+    for (auto &[sym, sz] : hashSizes) {
+        if (declared.contains(sym)) continue;
+        modBuilder.create<vdrmt::Hash5TupleInstanceOp>(
+            mod.getLoc(), sym, modBuilder.getI32IntegerAttr(sz));
+        declared.insert(sym);
+    }
+
+    // Meter
+    struct MeterInfo { int32_t size; int32_t type; };
+    DenseMap<StringAttr, MeterInfo> meterInfos;
+    mod.walk([&](vdrmt::MeterExecuteOp op) {
+        auto sym      = op.getInstanceAttr().getAttr();
+        auto sizeAttr = op->getAttrOfType<IntegerAttr>("vdrmt.meter_size");
+        auto typeAttr = op->getAttrOfType<IntegerAttr>("vdrmt.meter_type");
+        int32_t sz = sizeAttr ? (int32_t)sizeAttr.getInt() : 1024;
+        int32_t mt = typeAttr ? (int32_t)typeAttr.getInt() : 0;
+        auto it = meterInfos.find(sym);
+        if (it == meterInfos.end())
+            meterInfos[sym] = {sz, mt};
+        else if (it->second.size < sz)
+            it->second.size = sz;
+    });
+    for (auto &[sym, info] : meterInfos) {
+        if (declared.contains(sym)) continue;
+        modBuilder.create<vdrmt::MeterInstanceOp>(
+            mod.getLoc(), sym,
+            modBuilder.getI32IntegerAttr(info.size),
+            modBuilder.getI32IntegerAttr(info.type));
+        declared.insert(sym);
+    }
+
+    // Register
+    struct RegInfo { int32_t size; int32_t elementWidth; };
+    DenseMap<StringAttr, RegInfo> regInfos;
+    auto collectRegInfo = [&](Operation *op, StringAttr sym) {
+        auto sizeAttr  = op->getAttrOfType<IntegerAttr>("vdrmt.register_size");
+        auto widthAttr = op->getAttrOfType<IntegerAttr>("vdrmt.register_element_width");
+        int32_t sz = sizeAttr  ? (int32_t)sizeAttr.getInt()  : 1024;
+        int32_t ew = widthAttr ? (int32_t)widthAttr.getInt() : 32;
+        if (!regInfos.count(sym))
+            regInfos[sym] = {sz, ew};
+    };
+    mod.walk([&](vdrmt::RegisterReadOp  op) { collectRegInfo(op, op.getInstanceAttr().getAttr()); });
+    mod.walk([&](vdrmt::RegisterWriteOp op) { collectRegInfo(op, op.getInstanceAttr().getAttr()); });
+    for (auto &[sym, info] : regInfos) {
+        if (declared.contains(sym)) continue;
+        modBuilder.create<vdrmt::RegisterInstanceOp>(
+            mod.getLoc(), sym,
+            modBuilder.getI32IntegerAttr(info.size),
+            modBuilder.getI32IntegerAttr(info.elementWidth));
+        declared.insert(sym);
+    }
+
+    // Step 3: strip helper attrs (generic via interface).
+    mod.walk([&](vdrmt::VFFAExecuteOpInterface use) {
+        use.removeHelperAttrs();
+    });
+}
 
 // ============================================================================
 // Memory Object Information
@@ -1321,6 +1430,13 @@ private:
       }
     }
       
+    // ── Coarse-grained: lift VFFA instance decls + strip helper attrs ────
+    // Make the emitted vDRMT IR canonical (every VFFA execute op has a
+    // matching module-scope instance decl, and the helper-attr hints used
+    // during conversion are stripped). Downstream fine-grained passes can
+    // then assume this shape.
+    coarseGrainVDRMT(vdrmtModule);
+
     // Write to file
     std::error_code ec;
     llvm::raw_fd_ostream file(vdrmtFile, ec);

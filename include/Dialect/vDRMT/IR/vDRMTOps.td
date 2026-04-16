@@ -765,4 +765,226 @@ def vDRMT_RegisterWriteOp : vDRMT_Op<"register.write",
     }];
 }
 
+//===----------------------------------------------------------------------===//
+// SHA / RegEx / Compression (Fixed-Function Accelerators)
+//===----------------------------------------------------------------------===//
+//
+// These FFAs model BlueField-class accelerators that on BF2/BF3 are reached
+// via DOCA library calls (libdoca_sha, libdoca_regex, libdoca_compress).
+// At the vDRMT level the execute ops are synchronous (one input → one or
+// more outputs); the BF lowering decides whether to emit synchronous or
+// async DOCA submit/poll sequences.
+//
+// All three follow the existing FFA pattern: an instance op declares the
+// hardware resource at module scope; an execute op invokes it.
+
+// ── SHA ──────────────────────────────────────────────────────────────────────
+
+def ShaAlgo_SHA1   : I32EnumAttrCase<"SHA1",   1, "sha1">;
+def ShaAlgo_SHA256 : I32EnumAttrCase<"SHA256", 2, "sha256">;
+def ShaAlgo_SHA512 : I32EnumAttrCase<"SHA512", 3, "sha512">;
+
+def ShaAlgorithm : I32EnumAttr<"ShaAlgorithm",
+    "SHA digest algorithm",
+    [ShaAlgo_SHA1, ShaAlgo_SHA256, ShaAlgo_SHA512]> {
+    let cppNamespace = "mlir::vdrmt";
+}
+
+def vDRMT_ShaInstanceOp : vDRMT_Op<"sha_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a SHA accelerator instance at module scope";
+    let description = [{
+        Declares a named SHA accelerator instance. algorithm selects the
+        digest variant; on BF2/BF3 this maps to a libdoca_sha context.
+
+        Example:
+          vdrmt.sha_instance @auth_sha {algorithm = #vdrmt<sha_algorithm SHA256>}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        ShaAlgorithm:$algorithm
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_ShaComputeOp : vDRMT_Op<"sha.compute",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Compute a SHA digest over an input buffer";
+    let description = [{
+        Computes the SHA digest of [input, input + input_len) and writes
+        the result into the buffer referenced by $digest.
+        Inputs: [input_ref, input_len].  Output side-effect: digest buffer.
+
+        Example:
+          vdrmt.sha.compute @auth_sha(%in, %len) -> %digest
+            : (!vdrmt.ref<i8>, i32) -> !vdrmt.ref<i8>
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        ReferenceType:$input,
+        AnyInteger:$input_len,
+        ReferenceType:$digest
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)` `->` $digest
+        `:` `(` type($input) `,` type($input_len) `)` `->` type($digest) attr-dict
+    }];
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdrmt.sha_algorithm"); }
+    }];
+}
+
+// ── RegEx ────────────────────────────────────────────────────────────────────
+
+def vDRMT_RegexInstanceOp : vDRMT_Op<"regex_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a RegEx accelerator instance at module scope";
+    let description = [{
+        Declares a named RegEx accelerator instance. rules is a string
+        attribute naming a compiled rules file or rule-set identifier;
+        on BF2/BF3 this maps to a libdoca_regex context loaded with that
+        ruleset.
+
+        Example:
+          vdrmt.regex_instance @dns_regex {rules = "dns_block.rof2"}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        StrAttr:$rules
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_RegexMatchOp : vDRMT_Op<"regex.match",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Run RegEx match over an input buffer";
+    let description = [{
+        Runs the RegEx engine over [input, input + input_len). Returns the
+        DOCA-style result triple (match_id, offset, length). A "no match"
+        is signalled by match_id == -1; the P4-style "matched" boolean is
+        therefore (match_id != -1).
+
+        Example:
+          %id, %off, %len = vdrmt.regex.match @dns_regex(%in, %inlen)
+            : (!vdrmt.ref<i8>, i32) -> (i32, i32, i32)
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        ReferenceType:$input,
+        AnyInteger:$input_len
+    );
+    let results = (outs
+        AnyInteger:$match_id,
+        AnyInteger:$offset,
+        AnyInteger:$length
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)`
+        `:` `(` type($input) `,` type($input_len) `)`
+        `->` `(` type($match_id) `,` type($offset) `,` type($length) `)` attr-dict
+    }];
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdrmt.regex_rules"); }
+    }];
+}
+
+// ── Compression ──────────────────────────────────────────────────────────────
+
+def CompressAlgo_DEFLATE : I32EnumAttrCase<"DEFLATE", 1, "deflate">;
+def CompressAlgo_LZ4     : I32EnumAttrCase<"LZ4",     2, "lz4">;
+def CompressAlgo_ZLIB    : I32EnumAttrCase<"ZLIB",    3, "zlib">;
+
+def CompressAlgorithm : I32EnumAttr<"CompressAlgorithm",
+    "Compression algorithm",
+    [CompressAlgo_DEFLATE, CompressAlgo_LZ4, CompressAlgo_ZLIB]> {
+    let cppNamespace = "mlir::vdrmt";
+}
+
+def vDRMT_CompressInstanceOp : vDRMT_Op<"compress_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a compression accelerator instance at module scope";
+    let description = [{
+        Declares a named compression accelerator instance. algorithm selects
+        the codec; on BF2/BF3 this maps to a libdoca_compress context.
+
+        Example:
+          vdrmt.compress_instance @flow_compress {algorithm = #vdrmt<compress_algorithm DEFLATE>}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        CompressAlgorithm:$algorithm
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDRMT_CompressOp : vDRMT_Op<"compress",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Compress an input buffer";
+    let description = [{
+        Compresses [input, input + input_len) into the buffer referenced by
+        $output, writing the produced byte count into the slot referenced
+        by $output_len.  Verifier requires that $output is a sized
+        reference (length must be explicit at the IR level so the BF
+        lowering can pre-allocate / bound-check).
+
+        Example:
+          vdrmt.compress @flow_compress(%in, %inlen) -> (%out, %outlen)
+            : (!vdrmt.ref<i8>, i32) -> (!vdrmt.ref<i8>, !vdrmt.ref<i32>)
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        ReferenceType:$input,
+        AnyInteger:$input_len,
+        ReferenceType:$output,
+        ReferenceType:$output_len
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)` `->` `(` $output `,` $output_len `)`
+        `:` `(` type($input) `,` type($input_len) `)`
+        `->` `(` type($output) `,` type($output_len) `)` attr-dict
+    }];
+    let hasVerifier = 1;
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdrmt.compress_algorithm"); }
+    }];
+}
+
+def vDRMT_DecompressOp : vDRMT_Op<"decompress",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Decompress an input buffer";
+    let description = [{
+        Decompresses [input, input + input_len) into the buffer referenced
+        by $output, writing the produced byte count into the slot referenced
+        by $output_len.  Same verifier requirement as vdrmt.compress.
+
+        Example:
+          vdrmt.decompress @flow_compress(%in, %inlen) -> (%out, %outlen)
+            : (!vdrmt.ref<i8>, i32) -> (!vdrmt.ref<i8>, !vdrmt.ref<i32>)
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        ReferenceType:$input,
+        AnyInteger:$input_len,
+        ReferenceType:$output,
+        ReferenceType:$output_len
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)` `->` `(` $output `,` $output_len `)`
+        `:` `(` type($input) `,` type($input_len) `)`
+        `->` `(` type($output) `,` type($output_len) `)` attr-dict
+    }];
+    let hasVerifier = 1;
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdrmt.compress_algorithm"); }
+    }];
+}
+
 #endif // VDRMTOPS

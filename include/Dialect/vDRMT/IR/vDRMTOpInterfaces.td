@@ -11,8 +11,9 @@
 //     (counter.count, hash5tuple.apply, meter.execute, register.read/write).
 //     Captures the pattern: some inputs → fixed algorithm → some outputs.
 //
-// Structural passes (e.g. VFFSCoarseGrainedPass) use these interfaces to
-// operate on all VFFA types generically rather than enumerating each type.
+// The coarse-grained finalization step inside P4HIRToVDRMT uses these
+// interfaces to operate on all VFFA types generically rather than
+// enumerating each type.
 //
 //===----------------------------------------------------------------------===//
 

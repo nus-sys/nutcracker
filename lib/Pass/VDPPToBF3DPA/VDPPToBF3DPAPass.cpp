@@ -540,6 +540,29 @@ private:
             return failure();
         }
 
+        // Reject ARM-only VFFAs (SHA/RegEx/Compress) — DPA can't reach them.
+        {
+            mlir::Operation *offender = nullptr;
+            mlir::StringRef opName;
+            mod->walk([&](mlir::Operation *op) {
+                if (offender) return;
+                if (mlir::isa<vdpp::ShaInstanceOp, vdpp::ShaComputeOp,
+                              vdpp::RegexInstanceOp, vdpp::RegexMatchOp,
+                              vdpp::CompressInstanceOp, vdpp::CompressOp,
+                              vdpp::DecompressOp>(op)) {
+                    offender = op;
+                    opName = op->getName().getStringRef();
+                }
+            });
+            if (offender) {
+                offender->emitError(
+                    "BF3DPA lowering: ") << opName << " is ARM-only "
+                    "(DPA firmware has no SHA/RegEx/Compress primitive). "
+                    "Partition should have routed this to ARM (vDPP→LLVM).";
+                return failure();
+            }
+        }
+
         // Run DialEgg on each func.func in the module.
         for (auto funcOp : mod->getOps<func::FuncOp>()) {
             if (failed(runDialEggOnFunction(funcOp, eggFilePath, vdppFile,
