@@ -9,10 +9,13 @@ set(LIBS
         MLIRvDRMTDialect
         MLIRbf3drmtDialect
         MLIRbf3dpaDialect
+        MLIRbf2drmtDialect
         MLIRP4HIRPartitionPass
         MLIRP4HIRToVDRMTPass
         MLIRP4HIRToVDPPPass
         MLIRVDRMTToBF3DRMTPass
+        MLIRVDRMTToBF2DRMTPass
+        MLIRBf2drmtToDocaFlowCodegen
         MLIRVDPPToBF3DPAPass
         MLIREmitHandlerCodePass
         MLIRLLVMIRToVDPPPass

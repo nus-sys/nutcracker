@@ -1,0 +1,266 @@
+# ============================================================================
+# NutCracker DOCA Flow Code Generation Template
+# Target: DOCA Flow 2.9 (builder-pattern API)
+#
+# Placeholders use {name} syntax. Available placeholders are documented
+# per-section. The codegen substitutes these at generation time.
+# ============================================================================
+
+[meta]
+doca_version = "2.2"
+description  = "DOCA Flow 2.9 builder-pattern API"
+
+# ── Types & constants ─────────────────────────────────────────────────────────
+
+[types]
+error_t   = "doca_error_t"
+success   = "DOCA_SUCCESS"
+pipe_ptr  = "struct doca_flow_pipe *"
+port_ptr  = "struct doca_flow_port *"
+entry_ptr = "struct doca_flow_pipe_entry *"
+
+# ── Enum mappings ─────────────────────────────────────────────────────────────
+
+[enums.pipe_type]
+basic   = "DOCA_FLOW_PIPE_BASIC"
+hash    = "DOCA_FLOW_PIPE_HASH"
+control = "DOCA_FLOW_PIPE_CONTROL"
+acl     = "DOCA_FLOW_PIPE_ACL"
+lpm     = "DOCA_FLOW_PIPE_LPM"
+
+[enums.fwd_type]
+port = "DOCA_FLOW_FWD_PORT"
+pipe = "DOCA_FLOW_FWD_PIPE"
+rss  = "DOCA_FLOW_FWD_RSS"
+drop = "DOCA_FLOW_FWD_DROP"
+
+[enums.resource_type]
+non_shared = "DOCA_FLOW_RESOURCE_TYPE_NON_SHARED"
+shared     = "DOCA_FLOW_RESOURCE_TYPE_SHARED"
+
+[enums.meter_limit]
+packets = "DOCA_FLOW_METER_LIMIT_TYPE_PACKETS"
+bytes   = "DOCA_FLOW_METER_LIMIT_TYPE_BYTES"
+
+[enums.rss_flags]
+ipv4     = "DOCA_FLOW_RSS_IPV4"
+ipv6     = "DOCA_FLOW_RSS_IPV6"
+tcp      = "DOCA_FLOW_RSS_TCP"
+udp      = "DOCA_FLOW_RSS_UDP"
+
+# ── Match field table ─────────────────────────────────────────────────────────
+# Keys are "{hdr_type}.{field_name}" matching P4 struct/field names as resolved
+# from bf3drmt.struct_extract_ref chains by the codegen.
+#
+# Per-entry fields:
+#   match_member  — path used in "match.{match_member} = mask" (struct member access)
+#   field_string  — path used in action_desc field_string (DOCA string API)
+#   width         — field width in bits (for mask generation)
+#   setup         — extra lines emitted once before all match field assignments
+#                   (e.g. parser_meta guards). Empty string = no setup needed.
+
+["match_fields"."ipv4_t.protocol"]
+match_member = "outer.ip4.next_proto"
+field_string = "outer.ipv4.next_proto"
+width        = 8
+setup        = "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;"
+
+["match_fields"."ipv4_t.src_addr"]
+match_member = "outer.ip4.src_ip"
+field_string = "outer.ipv4.src_ip"
+width        = 32
+setup        = "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;"
+
+["match_fields"."ipv4_t.dst_addr"]
+match_member = "outer.ip4.dst_ip"
+field_string = "outer.ipv4.dst_ip"
+width        = 32
+setup        = "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;"
+
+["match_fields"."ipv4_t.ttl"]
+match_member = "outer.ip4.ttl"
+field_string = "outer.ipv4.ttl"
+width        = 8
+setup        = "match.parser_meta.outer_l3_type = DOCA_FLOW_L3_META_IPV4;\n    match.outer.l3_type = DOCA_FLOW_L3_TYPE_IP4;"
+
+["match_fields"."tcp_t.src_port"]
+match_member = "outer.tcp.l4_port.src_port"
+field_string = "outer.tcp.src_port"
+width        = 16
+setup        = "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;\n    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;"
+
+["match_fields"."tcp_t.dst_port"]
+match_member = "outer.tcp.l4_port.dst_port"
+field_string = "outer.tcp.dst_port"
+width        = 16
+setup        = "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;\n    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;"
+
+["match_fields"."udp_t.src_port"]
+match_member = "outer.udp.l4_port.src_port"
+field_string = "outer.udp.src_port"
+width        = 16
+setup        = "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;\n    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;"
+
+["match_fields"."udp_t.dst_port"]
+match_member = "outer.udp.l4_port.dst_port"
+field_string = "outer.udp.dst_port"
+width        = 16
+setup        = "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_UDP;\n    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_UDP;"
+
+["match_fields"."ethernet_t.ether_type"]
+match_member = "outer.eth.type"
+field_string = "outer.eth.type"
+width        = 16
+setup        = ""
+
+["match_fields"."tcp_t.syn"]
+match_member = "outer.tcp.flags"
+field_string = "outer.tcp.flags"
+width        = 8
+setup        = "match.parser_meta.outer_l4_type = DOCA_FLOW_L4_META_TCP;\n    match.outer.l4_type_ext = DOCA_FLOW_L4_TYPE_EXT_TCP;"
+
+["match_fields"."standard_metadata_t.ingress_port"]
+match_member = "parser_meta.port_meta"
+field_string = "parser_meta.port_meta"
+width        = 32
+setup        = ""
+
+# ── Pipe configuration & creation ─────────────────────────────────────────────
+# Placeholders:
+#   {name}         — pipe symbol name string
+#   {pipe_type}    — expanded from enums.pipe_type
+#   {nr_entries}   — number of entries
+#   {id}           — pipe index in g_pipes[]
+#   {miss_fwd_ptr} — "&fwd_miss" or "NULL"
+#   {descs_arr_ptr}— "&descs" or "NULL"
+
+[pipe]
+cfg_locals = "struct doca_flow_pipe_cfg *pipe_cfg;"
+
+cfg_create = """    result = doca_flow_pipe_cfg_create(&pipe_cfg, port);
+    if (result != DOCA_SUCCESS) goto destroy;
+    result = doca_flow_pipe_cfg_set_name(pipe_cfg, "{name}");
+    if (result != DOCA_SUCCESS) goto destroy;
+    result = doca_flow_pipe_cfg_set_type(pipe_cfg, {pipe_type});
+    if (result != DOCA_SUCCESS) goto destroy;
+    result = doca_flow_pipe_cfg_set_domain(pipe_cfg, DOCA_FLOW_PIPE_DOMAIN_DEFAULT);
+    if (result != DOCA_SUCCESS) goto destroy;
+    result = doca_flow_pipe_cfg_set_nr_entries(pipe_cfg, {nr_entries});
+    if (result != DOCA_SUCCESS) goto destroy;"""
+
+cfg_set_match_with_mask = """    result = doca_flow_pipe_cfg_set_match(pipe_cfg, NULL, &match_mask);
+    if (result != DOCA_SUCCESS) goto destroy;"""
+
+cfg_set_match_no_mask = """    result = doca_flow_pipe_cfg_set_match(pipe_cfg, &match, NULL);
+    if (result != DOCA_SUCCESS) goto destroy;"""
+
+cfg_set_actions = """    result = doca_flow_pipe_cfg_set_actions(pipe_cfg, actions_arr, NULL, {descs_arr_ptr}, 1);
+    if (result != DOCA_SUCCESS) goto destroy;"""
+
+cfg_set_monitor = """    result = doca_flow_pipe_cfg_set_monitor(pipe_cfg, &monitor);
+    if (result != DOCA_SUCCESS) goto destroy;"""
+
+cfg_set_root = """    result = doca_flow_pipe_cfg_set_is_root(pipe_cfg, true);
+    if (result != DOCA_SUCCESS) goto destroy;"""
+
+create = """    result = doca_flow_pipe_create(pipe_cfg, &fwd, {miss_fwd_ptr}, &g_pipes[{id}]);"""
+
+# ── Forwarding ────────────────────────────────────────────────────────────────
+# Placeholders:
+#   {var}     — variable name: "fwd" or "fwd_miss"
+#   {next_id} — next pipe index (pipe/rss only)
+#   {l4}      — rss L4 flag suffix: "TCP" or "UDP" (rss only)
+
+[fwd]
+port = "{var}.type = DOCA_FLOW_FWD_PORT;\n    {var}.port_id = port_id;"
+pipe = "{var}.type = DOCA_FLOW_FWD_PIPE;\n    {var}.next_pipe = g_pipes[{next_id}];"
+drop = "{var}.type = DOCA_FLOW_FWD_DROP;"
+rss  = "{var}.type = DOCA_FLOW_FWD_RSS;\n    {var}.rss_flags = DOCA_FLOW_RSS_IPV4 | DOCA_FLOW_RSS_{l4};"
+
+# ── Action descriptors ────────────────────────────────────────────────────────
+# Corresponds to bf3drmt.copy_field, bf3drmt.add_to_field, and bf3drmt.assign.
+#
+# Placeholders for copy/add:
+#   {i}          — descriptor array index
+#   {src_field}  — DOCA field_string for source (from match_fields.field_string)
+#   {dst_field}  — DOCA field_string for destination
+#   {src_offset} — bit offset into source field
+#   {dst_offset} — bit offset into destination field
+#
+# Placeholders for set_meta (bf3drmt.assign with constant value):
+#   {idx} — meta.u32 slot index
+#   {val} — constant value (hex or decimal)
+
+[action_desc]
+# bf3drmt.copy_field → DOCA_FLOW_ACTION_COPY
+copy = """    desc_array[{i}].type = DOCA_FLOW_ACTION_COPY;
+    desc_array[{i}].field.orig.field_string  = "{src_field}";
+    desc_array[{i}].field.orig.bit_offset    = {src_offset};
+    desc_array[{i}].field.modif.field_string = "{dst_field}";
+    desc_array[{i}].field.modif.bit_offset   = {dst_offset};"""
+
+# bf3drmt.add_to_field → DOCA_FLOW_ACTION_ADD
+add = """    desc_array[{i}].type = DOCA_FLOW_ACTION_ADD;
+    desc_array[{i}].field.orig.field_string  = "{src_field}";
+    desc_array[{i}].field.orig.bit_offset    = {src_offset};
+    desc_array[{i}].field.modif.field_string = "{dst_field}";
+    desc_array[{i}].field.modif.bit_offset   = {dst_offset};"""
+
+# bf3drmt.assign with constant → per-entry metadata constant
+set_meta = "actions.meta.u32[{idx}] = {val};"
+
+# ── Entry addition ────────────────────────────────────────────────────────────
+# Corresponds to the nc_add_pipe_N_entry() function body.
+# Placeholders:
+#   {id}          — pipe index
+#   {monitor_ptr} — "&monitor" if monitor needed, else "NULL"
+#   {flags}       — entry flags constant
+#   {hash_idx}    — hash slot index (hash variant only)
+
+[entry]
+flags_nowait = "DOCA_FLOW_NO_WAIT"
+
+# bf3drmt.pipe type(basic|acl|control|lpm)
+add = """    result = doca_flow_pipe_add_entry(0, g_pipes[{id}], &match, &actions,
+        {monitor_ptr}, NULL, {flags}, status, &entry);
+    if (result != DOCA_SUCCESS) return result;"""
+
+# bf3drmt.pipe type(hash)
+add_hash = """    result = doca_flow_pipe_hash_add_entry({hash_idx}, g_pipes[{id}], &actions,
+        {monitor_ptr}, NULL, {flags}, status, &entry);
+    if (result != DOCA_SUCCESS) return result;"""
+
+# ── Monitor (counter + meter) ─────────────────────────────────────────────────
+# Used when bf3drmt.counter_decl or bf3drmt.meter_decl annotations are present
+# on a bf3drmt.pipe op.
+
+[monitor]
+locals      = "struct doca_flow_monitor monitor;\n        memset(&monitor, 0, sizeof(monitor));"
+set_counter = "monitor.counter_type = DOCA_FLOW_RESOURCE_TYPE_NON_SHARED;"
+set_meter   = "monitor.meter_type   = DOCA_FLOW_RESOURCE_TYPE_SHARED;"
+# Per-entry: bind shared meter slot to this entry (res_id overridden per entry)
+# Placeholder: {res_id} — meter resource id expression
+bind_meter  = "actions.meta.u32[0]  = {res_id};"
+
+# ── Shared resources (meter) ──────────────────────────────────────────────────
+# Used by nc_init_shared_resources() for bf3drmt.meter_decl ops.
+# Placeholders:
+#   {i}           — slot index
+#   {limit_type}  — expanded from enums.meter_limit
+#   {cir}         — committed information rate
+#   {cbs}         — committed burst size
+#   {n_meters}    — total meter count for bind call
+
+[shared_resource.meter]
+cfg_locals = "struct doca_flow_shared_resource_cfg cfg;\n    memset(&cfg, 0, sizeof(cfg));"
+
+cfg_set = """    cfg.domain               = DOCA_FLOW_PIPE_DOMAIN_DEFAULT;
+    cfg.meter_cfg.limit_type = {limit_type};
+    cfg.meter_cfg.cir        = {cir};
+    cfg.meter_cfg.cbs        = {cbs};
+    result = doca_flow_shared_resource_cfg(DOCA_FLOW_SHARED_RESOURCE_METER, {i}, &cfg);
+    if (result != DOCA_SUCCESS) return result;"""
+
+bind = """    result = doca_flow_shared_resources_bind(DOCA_FLOW_SHARED_RESOURCE_METER,
+        meter_ids, {n_meters}, port);
+    if (result != DOCA_SUCCESS) return result;"""

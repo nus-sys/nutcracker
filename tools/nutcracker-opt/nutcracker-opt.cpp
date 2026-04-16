@@ -7,10 +7,12 @@
 #include "Dialect/vDRMT/IR/vDRMTDialect.h"
 #include "Dialect/Backend/BF3/DRMT/IR/BF3DRMTDialect.h"
 #include "Dialect/Backend/BF3/DPA/IR/BF3DPADialect.h"
+#include "Dialect/Backend/BF2/DRMT/IR/BF2DRMTDialect.h"
 #include "Pass/P4HIRPartitionPass.h"
 #include "Pass/P4HIRToVDRMTPass.h"
 #include "Pass/P4HIRToVDPPPass.h"
 #include "Pass/VDRMTToBF3DRMTPass.h"
+#include "Pass/VDRMTToBF2DRMTPass.h"
 #include "Pass/VDPPToBF3DPAPass.h"
 #include "Pass/EmitHandlerCodePass.h"
 #include "Pass/LLVMIRToVDPPPass.h"
@@ -26,10 +28,12 @@ int main(int argc, char **argv) {
   registry.insert<mlir::vdrmt::vDRMTDialect>();
   registry.insert<mlir::bf3drmt::BF3DRMTDialect>();
   registry.insert<mlir::bf3dpa::BF3DPADialect>();
+  registry.insert<mlir::bf2drmt::BF2DRMTDialect>();
   mlir::registerP4HIRPartitionPass();
   mlir::registerP4HIRToVDRMTPass();
   mlir::registerP4HIRToVDPPPass();
   mlir::registerVDRMTToBF3DRMTPass();
+  mlir::registerVDRMTToBF2DRMTPass();
   mlir::registerVDPPToBF3DPAPass();
   mlir::registerEmitHandlerCodePass();
   mlir::registerLLVMIRToVDPPPass();
