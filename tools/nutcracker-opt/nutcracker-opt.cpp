@@ -17,7 +17,6 @@
 #include "Pass/EmitHandlerCodePass.h"
 #include "Pass/LLVMIRToVDPPPass.h"
 #include "Pass/LLVMIRToVDRMTPass.h"
-#include "Pass/VDRMTCoarseGrainedPass.h"
 
 int main(int argc, char **argv) {
   mlir::DialectRegistry registry;
@@ -38,7 +37,6 @@ int main(int argc, char **argv) {
   mlir::registerEmitHandlerCodePass();
   mlir::registerLLVMIRToVDPPPass();
   mlir::registerLLVMIRToVDRMTPass();
-  mlir::registerVDRMTCoarseGrainedPass();
 
   return mlir::asMainReturnCode(
         mlir::MlirOptMain(argc, argv, "NutCracker Compiler", registry)

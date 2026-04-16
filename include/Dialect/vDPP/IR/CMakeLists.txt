@@ -19,6 +19,12 @@ mlir_tablegen(vDPPOpsEnums.cpp.inc -gen-enum-defs)
 add_public_tablegen_target(VDPP_EnumIncGen)
 add_dependencies(mlir-headers VDPP_EnumIncGen)
 
+set(LLVM_TARGET_DEFINITIONS vDPPOpInterfaces.td)
+mlir_tablegen(vDPPOpInterfaces.h.inc -gen-op-interface-decls)
+mlir_tablegen(vDPPOpInterfaces.cpp.inc -gen-op-interface-defs)
+add_public_tablegen_target(VDPP_OpInterfacesIncGen)
+add_dependencies(mlir-headers VDPP_OpInterfacesIncGen)
+
 # set(LLVM_TARGET_DEFINITIONS P4HIR_TypeInterfaces.td)
 # mlir_tablegen(P4HIR_TypeInterfaces.h.inc -gen-type-interface-decls)
 # mlir_tablegen(P4HIR_TypeInterfaces.cpp.inc -gen-type-interface-defs)

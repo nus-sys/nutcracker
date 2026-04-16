@@ -47,7 +47,6 @@
 
 #include "Pass/VDRMTToBF2DRMTPass.h"
 #include "Pass/BF2DRMTToDocaFlowPass.h"
-#include "Pass/VFFSCoarseGrainedPass.h"
 #include "Pass/Egglog.h"
 #include "Pass/Utils.h"
 #include "Dialect/vDRMT/IR/vDRMTDialect.h"
@@ -1019,6 +1018,33 @@ static void lowerVDRMTMeters(ModuleOp mod, OpBuilder &builder) {
     }
 }
 
+/// SHA / RegEx / Compress are software-only (DOCA library) accelerators —
+/// DOCA Flow 2.2 on the BF2 NIC ASIC cannot reach them. Reject any such op
+/// reaching this lowering with a clear diagnostic; the partition pass
+/// should have routed them to vDPP / ARM lowering.
+static LogicalResult rejectArmOnlyVFFAs(ModuleOp mod) {
+    Operation *offender = nullptr;
+    StringRef opName;
+    mod.walk([&](Operation *op) {
+        if (offender) return;
+        if (isa<vdrmt::ShaInstanceOp, vdrmt::ShaComputeOp,
+                vdrmt::RegexInstanceOp, vdrmt::RegexMatchOp,
+                vdrmt::CompressInstanceOp, vdrmt::CompressOp,
+                vdrmt::DecompressOp>(op)) {
+            offender = op;
+            opName = op->getName().getStringRef();
+        }
+    });
+    if (offender) {
+        offender->emitError(
+            "BF2DRMT lowering: ") << opName << " is ARM-only (DOCA Flow 2.2 "
+            "has no SHA/RegEx/Compress primitive). Partition should have "
+            "routed this to vDPP / ARM lowering.";
+        return failure();
+    }
+    return success();
+}
+
 /// BF2 has no general-purpose P4 register primitive in DOCA Flow 2.2.
 /// Pattern A (counter-inc → doca_flow_shared_counter) lands in Stage 2.
 /// Pattern B (entry-as-register → ARM-driven hash-pipe entry update) lands
@@ -1637,13 +1663,9 @@ private:
             return failure();
         }
 
-        // ── Phase 0b: run VFFSCoarseGrainedPass to lift counter decls ──────
-        {
-            PassManager pm(vdrmtMod->getContext());
-            pm.addPass(mlir::createVFFSCoarseGrainedPass());
-            // Non-fatal: ignore errors (no counter ops means nothing to do).
-            (void)pm.run(*vdrmtMod);
-        }
+        // ── Phase 0: reject ARM-only VFFAs (SHA/RegEx/Compress) ────────────
+        if (failed(rejectArmOnlyVFFAs(*vdrmtMod)))
+            return failure();
 
         // ── Phase 1: DialEgg op-level conversion ───────────────────────────
         std::string eggFilePath = "egglog_rules/vdrmt_to_bf2drmt.egg";

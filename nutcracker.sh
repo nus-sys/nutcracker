@@ -340,39 +340,8 @@ run_partition_pass() {
     echo ""
 }
 
-run_vffs_coarse_grained() {
-    local output_dir=$1
-
-    print_step "Step 3b: vFFS Coarse-Grained Pass (lift counter declarations)"
-    print_substep "Partition dir: $output_dir"
-
-    if [ ! -f "$NUTCRACKER_OPT" ]; then
-        print_error "nutcracker-opt not found."
-        exit 1
-    fi
-
-    local processed=0
-    for block_dir in "$output_dir"/block*; do
-        local vdrmt_file="$block_dir/vdrmt.mlir"
-        if [ ! -f "$vdrmt_file" ]; then
-            continue
-        fi
-
-        # Run vffs-coarse-grained in-place via mlir-opt pipeline
-        local tmp_file="$vdrmt_file.vffs_tmp"
-        "$NUTCRACKER_OPT" --vffs-coarse-grained "$vdrmt_file" -o "$tmp_file" 2>/dev/null \
-            && mv "$tmp_file" "$vdrmt_file" \
-            || rm -f "$tmp_file"
-        processed=$((processed + 1))
-    done
-
-    if [ "$processed" -gt 0 ]; then
-        print_success "vFFS coarse-grained pass applied to $processed block(s)"
-    else
-        print_substep "No vdrmt.mlir blocks found (skipping)"
-    fi
-    echo ""
-}
+# run_vffs_coarse_grained removed: P4HIRToVDRMT/VDPP now embed the
+# coarse-grained finalization directly.
 
 run_fine_grained_lowering() {
     local mlir_file=$1
@@ -902,10 +871,9 @@ compile_app() {
     run_partition_pass "$mlir_file" "$output_dir"
     
     # Step 3: Lower to both vDRMT and vDPP
+    # P4HIRToVDRMT/VDPP now embed the coarse-grained finalization (VFFA
+    # instance lifting + helper-attr stripping); no separate step needed.
     run_lowering_passes "$mlir_file" "$output_dir"
-
-    # Step 3b: vFFS coarse-grained pass (lift counter declarations to module scope)
-    run_vffs_coarse_grained "$output_dir"
 
     # Step 4a: Fine-grained lowering: vDRMT → bf3drmt  +  mapper.egg generation
     run_fine_grained_lowering "$mlir_file" "$output_dir"

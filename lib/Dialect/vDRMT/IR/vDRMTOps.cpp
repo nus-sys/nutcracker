@@ -528,6 +528,28 @@ mlir::LogicalResult vdrmt::NextOp::verify() {
     return mlir::success();
 }
 
+// CompressOp / DecompressOp: $output_len must reference an integer slot so
+// the BF lowering can write the produced byte count back through it.
+static mlir::LogicalResult verifyVdrmtOutputLenRef(mlir::Operation *op,
+                                                   mlir::Value outputLen) {
+    auto refTy = mlir::dyn_cast<vdrmt::ReferenceType>(outputLen.getType());
+    if (!refTy)
+        return op->emitOpError("output_len must be a vdrmt.ref type");
+    if (!refTy.getObjectType().isIntOrIndex())
+        return op->emitOpError(
+            "output_len must reference an integer/index slot, got ")
+            << refTy.getObjectType();
+    return mlir::success();
+}
+
+mlir::LogicalResult vdrmt::CompressOp::verify() {
+    return verifyVdrmtOutputLenRef(*this, getOutputLen());
+}
+
+mlir::LogicalResult vdrmt::DecompressOp::verify() {
+    return verifyVdrmtOutputLenRef(*this, getOutputLen());
+}
+
 #define GET_OP_CLASSES
 #include "Dialect/vDRMT/IR/vDRMTDialect.cpp.inc"
 #include "Dialect/vDRMT/IR/vDRMTOps.cpp.inc"

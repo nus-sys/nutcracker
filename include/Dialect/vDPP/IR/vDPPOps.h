@@ -17,6 +17,7 @@
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "Dialect/vDPP/IR/vDPPOpsEnums.h"
+#include "Dialect/vDPP/IR/vDPPOpInterfaces.h"
 #include "Dialect/vDPP/IR/vDPPTypes.h"
 
 #define GET_OP_CLASSES

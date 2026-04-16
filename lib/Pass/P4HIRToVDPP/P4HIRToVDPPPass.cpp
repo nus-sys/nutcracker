@@ -25,6 +25,7 @@
 #include "Dialect/vDPP/IR/vDPPDialect.h"
 #include "Dialect/vDPP/IR/vDPPOps.h"
 #include "Dialect/vDPP/IR/vDPPTypes.h"
+#include "Dialect/vDPP/IR/vDPPOpInterfaces.h"
 
 #include <fstream>
 #include <set>
@@ -34,6 +35,25 @@ using namespace mlir;
 using namespace P4::P4MLIR::P4HIR;
 
 namespace {
+
+// ============================================================================
+// Coarse-grained finalization
+// ============================================================================
+// Lift vDPP VFFA instance declarations to module scope and strip helper
+// attrs. P4HIRToVDPP today emits vdpp.counter.count and vdpp.hash5tuple.apply
+// without helper attrs (instance ops are produced upstream), so Step 2 is
+// vacuous now. The symmetric structure is here so SHA/RegEx/Compress
+// lifting drops in cleanly when LLVMIRToVDPP starts emitting them.
+static void coarseGrainVDPP(ModuleOp mod) {
+    DenseSet<StringAttr> declared;
+    mod.walk([&](vdpp::VFFAInstanceOpInterface inst) {
+        declared.insert(inst.getSymNameAttr());
+    });
+    // Step 2 (per-type lifting) intentionally empty: see comment above.
+    mod.walk([&](vdpp::VFFAExecuteOpInterface use) {
+        use.removeHelperAttrs();
+    });
+}
 
 // ============================================================================
 // Memory Object Information
@@ -1386,6 +1406,9 @@ private:
       });
     }
     
+    // Coarse-grained finalization (lift vDPP VFFA decls + strip helper attrs).
+    coarseGrainVDPP(vdppModule);
+
     // Write to file
     std::error_code ec;
     llvm::raw_fd_ostream file(vdppFile, ec);

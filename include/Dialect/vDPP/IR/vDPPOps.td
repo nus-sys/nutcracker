@@ -444,7 +444,8 @@ def ReturnOp : vDPP_Op<"return", [Pure, Terminator, ReturnLike]> {
 // Fixed-Function Accelerator ops (vDPP-level, software-mapped)
 //===----------------------------------------------------------------------===//
 
-def vDPP_CounterInstanceOp : vDPP_Op<"counter_instance", [Symbol]> {
+def vDPP_CounterInstanceOp : vDPP_Op<"counter_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
     let summary = "Declare a software counter array at module scope (vDPP level)";
     let description = [{
         Declares a named counter array for use in programmable blocks.
@@ -461,7 +462,8 @@ def vDPP_CounterInstanceOp : vDPP_Op<"counter_instance", [Symbol]> {
     let assemblyFormat = "$sym_name attr-dict";
 }
 
-def vDPP_CounterCountOp : vDPP_Op<"counter.count"> {
+def vDPP_CounterCountOp : vDPP_Op<"counter.count",
+        [VFFAExecuteOpInterface]> {
     let summary = "Increment the software counter at the given index";
     let description = [{
         Increments counter instance @sym by 1 at the given index.
@@ -475,9 +477,15 @@ def vDPP_CounterCountOp : vDPP_Op<"counter.count"> {
         AnyInteger:$index
     );
     let assemblyFormat = "$instance `[` $index `]` `:` type($index) attr-dict";
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getIndex()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdpp.counter_size"); }
+    }];
 }
 
-def vDPP_Hash5TupleInstanceOp : vDPP_Op<"hash5tuple_instance", [Symbol]> {
+def vDPP_Hash5TupleInstanceOp : vDPP_Op<"hash5tuple_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
     let summary = "Declare a software hash-function instance at module scope (vDPP level)";
     let description = [{
         Declares a named Hash5Tuple instance backed by a software hash computation.
@@ -494,7 +502,8 @@ def vDPP_Hash5TupleInstanceOp : vDPP_Op<"hash5tuple_instance", [Symbol]> {
     let assemblyFormat = "$sym_name attr-dict";
 }
 
-def vDPP_Hash5TupleApplyOp : vDPP_Op<"hash5tuple.apply"> {
+def vDPP_Hash5TupleApplyOp : vDPP_Op<"hash5tuple.apply",
+        [VFFAExecuteOpInterface]> {
     let summary = "Compute a 5-tuple hash in software";
     let description = [{
         Computes Hash5Tuple(srcAddr, dstAddr, srcPort, dstPort, proto)
@@ -518,6 +527,182 @@ def vDPP_Hash5TupleApplyOp : vDPP_Op<"hash5tuple.apply"> {
         $instance `(` $src_addr `,` $dst_addr `,` $src_port `,` $dst_port `,` $proto `)`
         `:` `(` type($src_addr) `,` type($dst_addr) `,` type($src_port) `,`
                type($dst_port) `,` type($proto) `)` `->` type($result) attr-dict
+    }];
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() {
+            return {getSrcAddr(), getDstAddr(), getSrcPort(), getDstPort(), getProto()};
+        }
+        void removeHelperAttrs() {}
+    }];
+}
+
+//===----------------------------------------------------------------------===//
+// SHA / RegEx / Compression (Fixed-Function Accelerators)
+//===----------------------------------------------------------------------===//
+//
+// These FFAs model BlueField-class accelerators reached via DOCA library
+// calls (libdoca_sha, libdoca_regex, libdoca_compress) on the ARM cores.
+// At the vDPP level, the execute ops are synchronous (one input → one or
+// more outputs); the ARM lowering decides whether to emit synchronous or
+// async DOCA submit/poll sequences.
+//
+// DOCA Flow (the NIC-ASIC pipeline) cannot reach these accelerators, so
+// the vDRMT→BF*DRMT lowerings reject them; only the ARM-targeted
+// lowerings (vDPP→LLVM) actually emit code for them.
+
+// ── SHA ──────────────────────────────────────────────────────────────────────
+
+def vDPP_ShaAlgo_SHA1   : I32EnumAttrCase<"SHA1",   1, "sha1">;
+def vDPP_ShaAlgo_SHA256 : I32EnumAttrCase<"SHA256", 2, "sha256">;
+def vDPP_ShaAlgo_SHA512 : I32EnumAttrCase<"SHA512", 3, "sha512">;
+
+def vDPP_ShaAlgorithm : I32EnumAttr<"ShaAlgorithm",
+    "SHA digest algorithm",
+    [vDPP_ShaAlgo_SHA1, vDPP_ShaAlgo_SHA256, vDPP_ShaAlgo_SHA512]> {
+    let cppNamespace = "mlir::vdpp";
+}
+
+def vDPP_ShaInstanceOp : vDPP_Op<"sha_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a SHA accelerator instance at module scope";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        vDPP_ShaAlgorithm:$algorithm
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDPP_ShaComputeOp : vDPP_Op<"sha.compute",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Compute a SHA digest over an input buffer";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        PointerType:$input,
+        AnyInteger:$input_len,
+        PointerType:$digest
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)` `->` $digest
+        `:` `(` type($input) `,` type($input_len) `)` `->` type($digest) attr-dict
+    }];
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdpp.sha_algorithm"); }
+    }];
+}
+
+// ── RegEx ────────────────────────────────────────────────────────────────────
+
+def vDPP_RegexInstanceOp : vDPP_Op<"regex_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a RegEx accelerator instance at module scope";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        StrAttr:$rules
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDPP_RegexMatchOp : vDPP_Op<"regex.match",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Run RegEx match over an input buffer";
+    let description = [{
+        Returns DOCA-style (match_id, offset, length); match_id == -1 means
+        no match. P4-style "matched" boolean = (match_id != -1).
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        PointerType:$input,
+        AnyInteger:$input_len
+    );
+    let results = (outs
+        AnyInteger:$match_id,
+        AnyInteger:$offset,
+        AnyInteger:$length
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)`
+        `:` `(` type($input) `,` type($input_len) `)`
+        `->` `(` type($match_id) `,` type($offset) `,` type($length) `)` attr-dict
+    }];
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdpp.regex_rules"); }
+    }];
+}
+
+// ── Compression ──────────────────────────────────────────────────────────────
+
+def vDPP_CompressAlgo_DEFLATE : I32EnumAttrCase<"DEFLATE", 1, "deflate">;
+def vDPP_CompressAlgo_LZ4     : I32EnumAttrCase<"LZ4",     2, "lz4">;
+def vDPP_CompressAlgo_ZLIB    : I32EnumAttrCase<"ZLIB",    3, "zlib">;
+
+def vDPP_CompressAlgorithm : I32EnumAttr<"CompressAlgorithm",
+    "Compression algorithm",
+    [vDPP_CompressAlgo_DEFLATE, vDPP_CompressAlgo_LZ4, vDPP_CompressAlgo_ZLIB]> {
+    let cppNamespace = "mlir::vdpp";
+}
+
+def vDPP_CompressInstanceOp : vDPP_Op<"compress_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a compression accelerator instance at module scope";
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        vDPP_CompressAlgorithm:$algorithm
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDPP_CompressOp : vDPP_Op<"compress",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Compress an input buffer";
+    let description = [{
+        $output_len is a pointer to an integer slot; the verifier enforces
+        this so the BF lowering can bound-check the output buffer.
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        PointerType:$input,
+        AnyInteger:$input_len,
+        PointerType:$output,
+        PointerType:$output_len
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)` `->` `(` $output `,` $output_len `)`
+        `:` `(` type($input) `,` type($input_len) `)`
+        `->` `(` type($output) `,` type($output_len) `)` attr-dict
+    }];
+    let hasVerifier = 1;
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdpp.compress_algorithm"); }
+    }];
+}
+
+def vDPP_DecompressOp : vDPP_Op<"decompress",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Decompress an input buffer";
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        PointerType:$input,
+        AnyInteger:$input_len,
+        PointerType:$output,
+        PointerType:$output_len
+    );
+    let assemblyFormat = [{
+        $instance `(` $input `,` $input_len `)` `->` `(` $output `,` $output_len `)`
+        `:` `(` type($input) `,` type($input_len) `)`
+        `->` `(` type($output) `,` type($output_len) `)` attr-dict
+    }];
+    let hasVerifier = 1;
+    let extraClassDeclaration = [{
+        // VFFAExecuteOpInterface
+        mlir::ValueRange getInputs() { return {getInput(), getInputLen()}; }
+        void removeHelperAttrs() { (*this)->removeAttr("vdpp.compress_algorithm"); }
     }];
 }
 
