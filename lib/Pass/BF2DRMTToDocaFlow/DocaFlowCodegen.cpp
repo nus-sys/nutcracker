@@ -235,6 +235,11 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                                const std::map<int, int> &blockHwMap,
                                const std::map<int, int> &armQueueMap,
                                llvm::raw_ostream &out) {
+    // DOCA target version — gates structural differences that can't live in
+    // the template (no destroy-label, value-struct pipe_cfg, monitor at
+    // function scope, nc_required_resources helper for resource prebudget).
+    const bool is22 = (tmpl.get("meta.doca_version") == "2.2");
+
     struct PipeRecord {
         int blockId;
         mlir::OwningOpRef<mlir::ModuleOp> module;
@@ -437,7 +442,7 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             out << "    /* Meter: " << md.name << " (" << szMacro << " slots, "
                 << (md.meterType == 0 ? "packets" : "bytes") << ") */\n"
                 << "    {\n"
-                << "        uint32_t ids[" << szMacro << "];\n"
+                << "        uint32_t meter_ids[" << szMacro << "];\n"
                 << "        memset(&cfg, 0, sizeof(cfg));\n"
                 << "        for (uint32_t i = 0; i < " << szMacro << "; i++) {\n"
                 << "            " << tmpl.render("shared_resource.meter.cfg_set", {
@@ -446,7 +451,7 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
                     {"cir",         "1000000ULL"},
                     {"cbs",         "10000"},
                 }) << "\n"
-                << "            ids[i] = i;\n"
+                << "            meter_ids[i] = i;\n"
                 << "        }\n"
                 << "        " << tmpl.render("shared_resource.meter.bind", {
                     {"n_meters", szMacro},
@@ -455,6 +460,19 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         }
         out << "    return DOCA_SUCCESS;\n}\n\n";
     }
+
+    // 2.2-only resource-pool totals, used by nc_required_resources() helper
+    // emitted after the per-pipe loop. Per-entry non-shared counters draw
+    // from the doca_flow_cfg.resource pool pre-sized at doca_flow_init time.
+    int totalNbCounters = 0;
+    int totalNbMeters   = 0;
+    for (auto &md : allMeterDecls) totalNbMeters += md.size;
+
+    // Set of block IDs that exist as BF2 DRMT pipes.  Successor references
+    // to blocks outside this set (DPA/ARM blocks skipped by BF2) must fall
+    // back to FWD_PORT (egress) instead of FWD_PIPE (would dereference NULL).
+    std::set<int> pipeBlockIds;
+    for (auto &pr : pipes) pipeBlockIds.insert(pr.blockId);
 
     // ── Per-pipe functions ─────────────────────────────────────────────────
     for (auto &pr : pipes) {
@@ -589,6 +607,13 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             }
         }
 
+        // DOCA HWS cannot build a multi-entry table when the match template is
+        // completely empty (nb_flows > 0 + empty match → "items build failed").
+        // Per the DOCA flow_hairpin_vnf sample, a catch-all BASIC pipe leaves
+        // nb_flows at 0 (the default) and uses a single wildcard entry.
+        if (matchFields.empty() && !isHashPipe)
+            nrEntries = 0;
+
         // Count action descriptors needed
         int nDescs = 0;
         for (auto &ar : actionRegions)
@@ -612,15 +637,26 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             if (!ar.meterInstance.empty())      { hasMeter    = true; pipeMeterInstance   = ar.meterInstance; }
             if (!ar.registerAccesses.empty())   { hasRegister = true; }
         }
+        if (hasCounter) totalNbCounters += nrEntries;
+
+        // Hash pipes that only forward (no assigns, no counter/meter) don't
+        // need an actions template — the DOCA flow_hash_pipe sample omits it.
+        // Passing a zero-filled actions struct causes "failed to modify pipe
+        // DPDK actions" at entry-add time.
+        bool hasAnyActions = hasActionDescs || hasCounter || hasMeter;
+        for (auto &ar : actionRegions)
+            for (auto &sl : ar.assigns) { hasAnyActions = true; break; }
+        bool skipActions = isHashPipe && !hasAnyActions;
 
         // ── nc_create_pipe_N(port, port_id) ──────────────────────────────
         out << "/* ── Block " << id << ": " << pipeName
             << " ──────────────────────────── */\n"
             << "static doca_error_t nc_create_pipe_" << id
             << "(struct doca_flow_port *port, int port_id)\n{\n"
-            << "    struct doca_flow_match match;\n"
-            << "    struct doca_flow_actions actions,"
-               " *actions_arr[NB_ACTIONS_ARR] = {&actions};\n";
+            << "    struct doca_flow_match match;\n";
+        if (!skipActions)
+            out << "    struct doca_flow_actions actions,"
+                   " *actions_arr[NB_ACTIONS_ARR] = {&actions};\n";
         if (hasActionDescs) {
             out << "    struct doca_flow_action_desc desc_array[" << nDescs << "];\n"
                 << "    struct doca_flow_action_descs descs,"
@@ -629,11 +665,12 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         out << "    struct doca_flow_fwd fwd;\n";
         if (hasMiss || hasTableKey)
             out << "    struct doca_flow_fwd fwd_miss;\n";
-        out << "    struct doca_flow_pipe_cfg *pipe_cfg;\n"
+        out << "    " << tmpl.render("pipe.cfg_locals") << "\n"
             << "    doca_error_t result;\n\n"
-            << "    memset(&match,   0, sizeof(match));\n"
-            << "    memset(&actions, 0, sizeof(actions));\n"
-            << "    memset(&fwd,     0, sizeof(fwd));\n";
+            << "    memset(&match,   0, sizeof(match));\n";
+        if (!skipActions)
+            out << "    memset(&actions, 0, sizeof(actions));\n";
+        out << "    memset(&fwd,     0, sizeof(fwd));\n";
         if (hasMiss || hasTableKey)
             out << "    memset(&fwd_miss, 0, sizeof(fwd_miss));\n";
         if (hasActionDescs)
@@ -721,9 +758,20 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         else
             out << tmpl.render("pipe.cfg_set_match_no_mask") << "\n";
 
-        out << tmpl.render("pipe.cfg_set_actions", {
-            {"descs_arr_ptr", hasActionDescs ? "&descs" : "NULL"},
-        }) << "\n";
+        if (skipActions) {
+            // Forward-only hash pipe — no actions template (matches DOCA
+            // flow_hash_pipe sample which omits pipe_cfg.actions entirely).
+        } else if (is22) {
+            out << tmpl.render("pipe.cfg_set_actions") << "\n";
+            if (hasActionDescs)
+                out << tmpl.render("pipe.cfg_set_action_descs", {
+                    {"descs_arr_ptr", "descs_arr"},
+                }) << "\n";
+        } else {
+            out << tmpl.render("pipe.cfg_set_actions", {
+                {"descs_arr_ptr", hasActionDescs ? "&descs" : "NULL"},
+            }) << "\n";
+        }
 
         // Monitor: counter and/or meter
         if (hasCounter || hasMeter) {
@@ -731,18 +779,33 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             if (hasCounter) out << "per-entry hardware counter (@" << pipeCounterInstance << ")";
             if (hasCounter && hasMeter) out << " + ";
             if (hasMeter)   out << "shared meter (@" << pipeMeterInstance << ")";
-            out << " */\n    {\n";
-            out << "        " << tmpl.render("monitor.locals") << "\n";
-            if (hasCounter)
-                out << "        " << tmpl.render("monitor.set_counter") << "\n";
-            if (hasMeter)
-                out << "        " << tmpl.render("monitor.set_meter") << "\n";
-            out << tmpl.render("pipe.cfg_set_monitor") << "\n    }\n\n";
+            out << " */\n";
+            if (is22) {
+                // 2.2: monitor must stay alive until doca_flow_pipe_create reads
+                // pipe_cfg.monitor (pointer capture, not field copy). Declare at
+                // function scope.
+                out << "    " << tmpl.render("monitor.locals") << "\n";
+                if (hasCounter)
+                    out << "    " << tmpl.render("monitor.set_counter") << "\n";
+                if (hasMeter)
+                    out << "    " << tmpl.render("monitor.set_meter") << "\n";
+                out << tmpl.render("pipe.cfg_set_monitor") << "\n\n";
+                // NB: `actions.shared.*` (2.9-only shared-meter action binding)
+                // intentionally omitted — shared-meter path is deferred on BF2.
+            } else {
+                out << "    {\n";
+                out << "        " << tmpl.render("monitor.locals") << "\n";
+                if (hasCounter)
+                    out << "        " << tmpl.render("monitor.set_counter") << "\n";
+                if (hasMeter)
+                    out << "        " << tmpl.render("monitor.set_meter") << "\n";
+                out << tmpl.render("pipe.cfg_set_monitor") << "\n    }\n\n";
 
-            if (hasMeter) {
-                out << "    /* Meter action template: bind shared meter (res_id overridden per entry) */\n"
-                    << "    actions.shared.type = DOCA_FLOW_SHARED_RESOURCE_METER;\n"
-                    << "    actions.shared.res_id = UINT32_MAX; /* wildcard mask */\n\n";
+                if (hasMeter) {
+                    out << "    /* Meter action template: bind shared meter (res_id overridden per entry) */\n"
+                        << "    actions.shared.type = DOCA_FLOW_SHARED_RESOURCE_METER;\n"
+                        << "    actions.shared.res_id = UINT32_MAX; /* wildcard mask */\n\n";
+                }
             }
         }
 
@@ -756,7 +819,9 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         int mainNext = (hitNext >= 0) ? hitNext : defaultNext;
 
         auto emitFwd = [&](const std::string &var, int nextId) {
-            if (nextId == -1) {
+            if (nextId == -1 || !pipeBlockIds.count(nextId)) {
+                // No successor, or successor is a DPA/ARM block not in the
+                // BF2 pipe set — egress via port (matches FWD_PORT pattern).
                 out << "    " << tmpl.render("fwd.port", {{"var", var}}) << "\n";
                 return;
             }
@@ -788,31 +853,47 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         };
 
         emitFwd("fwd", mainNext);
-        bool hasMissFwd = hasMiss || (hasTableKey && missNext >= 0);
+        // DOCA 2.2 HWS rejects non-NULL fwd_miss on BASIC pipes — the pipe
+        // builder's "items build" step fails with rc=-22. All DOCA 2.2 samples
+        // pass NULL for fwd_miss on BASIC/hash pipes. On the 2.9 builder path
+        // fwd_miss is supported via a separate builder call, so only suppress
+        // on 2.2.
+        bool hasMissFwd = (hasMiss || (hasTableKey && missNext >= 0))
+                          && !is22;
         if (hasMissFwd) { out << "\n"; emitFwd("fwd_miss", missNext); }
 
         out << "\n" << tmpl.render("pipe.create", {
             {"id",           std::to_string(id)},
             {"miss_fwd_ptr", hasMissFwd ? "&fwd_miss" : "NULL"},
-        }) << "\n"
-            << "destroy:\n"
-            << "    doca_flow_pipe_cfg_destroy(pipe_cfg);\n"
-            << "    return result;\n"
-            << "}\n\n";
+        }) << "\n";
+        if (is22) {
+            // 2.2: pipe_cfg is a stack value-struct, no destroy API. The
+            // template's pipe.create already returns on error; happy path
+            // falls through here.
+            out << "    return DOCA_SUCCESS;\n}\n\n";
+        } else {
+            out << "destroy:\n"
+                << "    doca_flow_pipe_cfg_destroy(pipe_cfg);\n"
+                << "    return result;\n"
+                << "}\n\n";
+        }
 
         // ── nc_add_pipe_N_entry() ──────────────────────────────────────────
         out << "static doca_error_t nc_add_pipe_" << id
-            << "_entry(struct entries_status *status)\n{\n"
-            << "    struct doca_flow_actions actions;\n"
-            << "    struct doca_flow_pipe_entry *entry;\n"
-            << "    doca_error_t result;\n\n"
-            << "    memset(&actions, 0, sizeof(actions));\n\n";
+            << "_entry(struct entries_status *status)\n{\n";
+        if (!skipActions)
+            out << "    struct doca_flow_actions actions;\n";
+        out << "    struct doca_flow_pipe_entry *entry;\n"
+            << "    doca_error_t result;\n\n";
+        if (!skipActions)
+            out << "    memset(&actions, 0, sizeof(actions));\n\n";
 
         if (isHashPipe) {
-            out << "    actions.action_idx = 0;\n\n"
-                << "    /* Add one entry per hash bucket */\n"
+            if (!skipActions)
+                out << "    actions.action_idx = 0;\n\n";
+            out << "    /* Add one entry per hash bucket */\n"
                 << "    for (uint32_t i = 0; i < " << nrEntries << "; i++) {\n";
-            if (hasMeter) {
+            if (hasMeter && !is22) {
                 out << "        /* Bind shared meter slot i to bucket i */\n"
                     << "        actions.shared.type = DOCA_FLOW_SHARED_RESOURCE_METER;\n"
                     << "        actions.shared.res_id = i;\n";
@@ -820,6 +901,7 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
             out << "        " << tmpl.render("entry.add_hash", {
                 {"id",          std::to_string(id)},
                 {"hash_idx",    "i"},
+                {"actions_ptr", skipActions ? "NULL" : "&actions"},
                 {"monitor_ptr", "NULL"},
                 {"flags",       tmpl.get("entry.flags_nowait")},
             }) << "\n"
@@ -893,6 +975,19 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         }
     }
 
+    // ── nc_required_resources() — 2.2 only ─────────────────────────────────
+    // 2.2 requires counter/meter pool sizes on doca_flow_cfg.resource BEFORE
+    // doca_flow_init(). Caller invokes this during app init to get the totals.
+    if (is22) {
+        out << "/* DOCA 2.2: caller must populate doca_flow_cfg.resource with\n"
+            << " * these values BEFORE doca_flow_init(). */\n"
+            << "void nc_required_resources(uint32_t *nb_counters, uint32_t *nb_meters)\n"
+            << "{\n"
+            << "    *nb_counters = " << totalNbCounters << ";\n"
+            << "    *nb_meters   = " << totalNbMeters   << ";\n"
+            << "}\n\n";
+    }
+
     // ── nc_setup_pipeline() ────────────────────────────────────────────────
     // Pipes must be created in reverse topological order so that fwd.next_pipe
     // pointers already point to valid pipe objects at creation time.
@@ -933,8 +1028,8 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         out << "    /* Initialize shared meter resources before creating pipes */\n"
             << "    result = nc_init_shared_resources(port);\n"
             << "    if (result != DOCA_SUCCESS) {\n"
-            << "        DOCA_LOG_ERR(\"Failed to init shared resources: %s\","
-               " doca_error_get_descr(result));\n"
+            << "        DOCA_LOG_ERR(\"Failed to init shared resources: %s\", "
+            << tmpl.get("error.to_string") << "(result));\n"
             << "        return result;\n"
             << "    }\n\n";
     }
@@ -943,7 +1038,7 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         out << "    result = nc_create_pipe_" << id << "(port, port_id);\n"
             << "    if (result != DOCA_SUCCESS) {\n"
             << "        DOCA_LOG_ERR(\"Failed to create pipe " << id
-            << ": %s\", doca_error_get_descr(result));\n"
+            << ": %s\", " << tmpl.get("error.to_string") << "(result));\n"
             << "        return result;\n"
             << "    }\n";
     }
@@ -952,7 +1047,7 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         out << "    result = nc_add_pipe_" << id << "_entry(status);\n"
             << "    if (result != DOCA_SUCCESS) {\n"
             << "        DOCA_LOG_ERR(\"Failed to add entry for pipe " << id
-            << ": %s\", doca_error_get_descr(result));\n"
+            << ": %s\", " << tmpl.get("error.to_string") << "(result));\n"
             << "        return result;\n"
             << "    }\n";
     }

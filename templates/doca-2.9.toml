@@ -19,6 +19,12 @@ pipe_ptr  = "struct doca_flow_pipe *"
 port_ptr  = "struct doca_flow_port *"
 entry_ptr = "struct doca_flow_pipe_entry *"
 
+# ── Error handling ────────────────────────────────────────────────────────────
+# 2.9 uses doca_error_get_descr (renamed from 2.2's doca_get_error_string).
+
+[error]
+to_string = "doca_error_get_descr"
+
 # ── Enum mappings ─────────────────────────────────────────────────────────────
 
 [enums.pipe_type]
@@ -226,7 +232,7 @@ add = """    result = doca_flow_pipe_add_entry(0, g_pipes[{id}], &match, &action
     if (result != DOCA_SUCCESS) return result;"""
 
 # bf3drmt.pipe type(hash)
-add_hash = """    result = doca_flow_pipe_hash_add_entry({hash_idx}, g_pipes[{id}], &actions,
+add_hash = """    result = doca_flow_pipe_hash_add_entry({hash_idx}, g_pipes[{id}], {actions_ptr},
         {monitor_ptr}, NULL, {flags}, status, &entry);
     if (result != DOCA_SUCCESS) return result;"""
 
