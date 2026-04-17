@@ -1,0 +1,2 @@
+option('pipeline_c', type: 'string', value: '../vdsa_output/doca_flow_pipeline.c',
+       description: 'Path to the generated doca_flow_pipeline.c (relative to source root or absolute)')
