@@ -1050,22 +1050,79 @@ static LogicalResult rejectArmOnlyVFFAs(ModuleOp mod) {
 /// Pattern B (entry-as-register → ARM-driven hash-pipe entry update) lands
 /// in Stage 3. Until then, reject any vdrmt.register.* usage so we don't
 /// silently emit invalid DOCA Flow code.
-static LogicalResult lowerVDRMTRegisters(ModuleOp mod, OpBuilder &builder) {
-    Operation *offender = nullptr;
-    mod.walk([&](Operation *op) {
-        if (offender) return;
+// Quick check: does this vdrmt.mlir contain register ops?
+static bool blockHasRegisterOps(MLIRContext *ctx, StringRef vdrmtFile) {
+    auto mod = parseSourceFile<ModuleOp>(vdrmtFile, ctx);
+    if (!mod) return false;
+    bool found = false;
+    mod->walk([&](Operation *op) {
         if (isa<vdrmt::RegisterInstanceOp, vdrmt::RegisterReadOp,
                 vdrmt::RegisterWriteOp>(op))
-            offender = op;
+            found = true;
     });
-    if (offender) {
-        offender->emitError(
-            "BF2DRMT: vdrmt.register.* lowering not yet supported "
-            "(Pattern A → doca_flow_shared_counter in Stage 2; "
-            "Pattern B → ARM-managed entry-as-register in Stage 3). "
-            "DOCA Flow 2.2 has no general-purpose P4 register primitive.");
-        return failure();
+    return found;
+}
+
+// Pattern A check: does this block use registers ONLY for pure increment
+// (read → add constant → write back, same instance, no other use of value)?
+//
+// Heuristic: if the block has vdrmt.cmp or vdrmt.if alongside register ops,
+// the read value is used for decision-making → NOT a pure increment → ARM.
+// If the block has register read/write with NO control-flow ops, it qualifies
+// for counter rewrite.
+static bool canApplyPatternA(MLIRContext *ctx, StringRef vdrmtFile) {
+    auto mod = parseSourceFile<ModuleOp>(vdrmtFile, ctx);
+    if (!mod) return false;
+    bool hasRead = false, hasWrite = false, hasControlFlow = false;
+    mod->walk([&](Operation *op) {
+        if (isa<vdrmt::RegisterReadOp>(op))  hasRead = true;
+        if (isa<vdrmt::RegisterWriteOp>(op)) hasWrite = true;
+        if (isa<vdrmt::CmpOp, vdrmt::IfOp>(op)) hasControlFlow = true;
+    });
+    // Need both read and write (increment pattern), and no control flow
+    // that would consume the read value for branching.
+    return hasRead && hasWrite && !hasControlFlow;
+}
+
+// Pattern A rewrite: replace vdrmt.register.{read,write,instance} with
+// bf2drmt.counter.{count,_decl}. The register.read result is replaced with
+// a zero constant (the counter value is not readable on BF2 hardware), and
+// the register.write is replaced with counter.count at the same index.
+static LogicalResult lowerVDRMTRegisters(ModuleOp mod, OpBuilder &builder) {
+    // 1. Replace vdrmt.register_instance → bf2drmt.counter_decl
+    SmallVector<vdrmt::RegisterInstanceOp> instances;
+    mod.walk([&](vdrmt::RegisterInstanceOp op) { instances.push_back(op); });
+    for (auto inst : instances) {
+        builder.setInsertionPoint(inst);
+        builder.create<bf2drmt::CounterDeclOp>(
+            inst.getLoc(),
+            builder.getStringAttr(inst.getSymName()),
+            inst.getSizeAttr());
+        inst.erase();
     }
+
+    // 2. Replace vdrmt.register.read → zero constant (counter can't return value)
+    SmallVector<vdrmt::RegisterReadOp> reads;
+    mod.walk([&](vdrmt::RegisterReadOp op) { reads.push_back(op); });
+    for (auto read : reads) {
+        builder.setInsertionPoint(read);
+        auto zeroAttr = builder.getIntegerAttr(read.getResult().getType(), 0);
+        auto zero = builder.create<vdrmt::ConstantOp>(
+            read.getLoc(), read.getResult().getType(), zeroAttr);
+        read.getResult().replaceAllUsesWith(zero);
+        read.erase();
+    }
+
+    // 3. Replace vdrmt.register.write → bf2drmt.counter.count
+    SmallVector<vdrmt::RegisterWriteOp> writes;
+    mod.walk([&](vdrmt::RegisterWriteOp op) { writes.push_back(op); });
+    for (auto write : writes) {
+        builder.setInsertionPoint(write);
+        builder.create<bf2drmt::CounterCountOp>(
+            write.getLoc(), write.getInstance(), write.getIndex());
+        write.erase();
+    }
+
     return success();
 }
 
@@ -1078,8 +1135,15 @@ public:
     BF2DRMTBlockGenerator(MLIRContext *context, StringRef inputDir)
         : context(context), inputDir(inputDir.str()) {}
 
+    // Block-to-hardware mapping populated during generate(). Blocks with
+    // register ops that can't be lowered to counters are marked ARM (2)
+    // instead of the default DRMT (0).
+    std::map<int, int> blockHwMap;
+    std::map<int, int> armQueueMap;
+
     LogicalResult generate() {
-        int successCount = 0, skipCount = 0;
+        int successCount = 0, skipCount = 0, armCount = 0;
+        int nextArmQueue = 0;
 
         // ── Phase 0: cross-block memory access isolation analysis ─────────
         llvm::outs() << "\n  Memory access isolation analysis ...\n";
@@ -1104,17 +1168,44 @@ public:
                 continue;
             }
 
+            // Extract block ID from directory name
+            std::string digits;
+            for (char c : dirName) if (std::isdigit(c)) digits += c;
+            int blockId = digits.empty() ? -1 : std::stoi(digits);
+
+            // Check for register ops — pure increment patterns (Pattern A)
+            // are rewritten to bf2drmt.counter.count; everything else falls
+            // back to ARM execution.
+            if (blockHasRegisterOps(context, vdrmtFile)) {
+                if (canApplyPatternA(context, vdrmtFile)) {
+                    llvm::outs() << "  ⟳ " << dirName
+                                 << " → Pattern A (register → counter)\n";
+                    // Fall through to generateBlockBF2DRMT — lowerVDRMTRegisters
+                    // will do the register→counter rewrite.
+                } else {
+                    llvm::outs() << "  ⇢ " << dirName
+                                 << " → ARM fallback (non-increment register use)\n";
+                    blockHwMap[blockId] = 2;  // NC_HW_ARM
+                    armQueueMap[blockId] = nextArmQueue++;
+                    armCount++;
+                    continue;
+                }
+            }
+
             if (failed(generateBlockBF2DRMT(vdrmtFile, bf2drmtFile))) {
                 llvm::errs() << "  ✗ Failed to generate "
                              << dirName << "/bf2drmt.mlir\n";
                 return failure();
             }
+            blockHwMap[blockId] = 0;  // NC_HW_DRMT
             successCount++;
             llvm::outs() << "  ✓ Generated " << dirName << "/bf2drmt.mlir\n";
         }
 
         llvm::outs() << "\n  Summary:\n"
                      << "    ✓ Generated: " << successCount << " blocks\n";
+        if (armCount > 0)
+            llvm::outs() << "    ⇢ ARM:       " << armCount << " blocks\n";
         if (skipCount > 0)
             llvm::outs() << "    ⊘ Skipped:   " << skipCount << " blocks\n";
 
@@ -1650,7 +1741,8 @@ private:
     // EmitHandlerCodePass re-runs this with the full hardware mapping and ARM
     // queue assignments to produce the authoritative deploy/doca_flow_pipeline.c.
     LogicalResult generateDocaFlowCodeBF2() {
-        return mlir::generateDocaFlowCodeBF2(context, inputDir, inputDir, {}, {});
+        return mlir::generateDocaFlowCodeBF2(context, inputDir, inputDir,
+                                              blockHwMap, armQueueMap);
     }
 
 
