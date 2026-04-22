@@ -9,5 +9,5 @@ edition = "2021"
 egglog-ast = { path = "./egglog_ast" }
 ordered-float = "4.0"
 thiserror = "1.0"
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = ">=4.0, <4.5", features = ["derive"] }
 egg = "0.9"

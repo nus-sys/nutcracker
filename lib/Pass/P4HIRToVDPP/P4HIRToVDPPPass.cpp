@@ -292,6 +292,23 @@ public:
     addConversion([](P4::P4MLIR::P4HIR::ExternType type) -> Type {
       return type;
     });
+
+    // Materializations: when the framework needs to bridge a type gap (e.g.
+    // RegisterReadOp returns i32 but a not-yet-converted use expects
+    // !p4hir.bit<32>), it inserts builtin.unrealized_conversion_cast.
+    // These callbacks make that cast constructible.
+    addSourceMaterialization(
+        [](OpBuilder &builder, Type resultType, ValueRange inputs,
+           Location loc) -> Value {
+          return builder.create<mlir::UnrealizedConversionCastOp>(
+              loc, resultType, inputs).getResult(0);
+        });
+    addTargetMaterialization(
+        [](OpBuilder &builder, Type resultType, ValueRange inputs,
+           Location loc) -> Value {
+          return builder.create<mlir::UnrealizedConversionCastOp>(
+              loc, resultType, inputs).getResult(0);
+        });
   }
 };
 
@@ -370,52 +387,46 @@ public:
     
     auto kind = static_cast<int>(op.getKind());
     
-    // Map P4HIR BinOpKind to vDPP operations
-    // Based on P4HIR enum values
+    // Map P4HIR BinOpKind to vDPP operations.
+    // Enum: 1=Mul, 2=Div, 3=Mod, 4=Add, 5=Sub, 6=AddSat, 7=SubSat,
+    //       8=Or, 9=Xor, 10=And (from P4HIR_Ops.td BinOpKind)
     switch (kind) {
-      case 0: // Add
-        rewriter.replaceOpWithNewOp<vdpp::AddOp>(
-          op, convertedType, adaptor.getLhs(), adaptor.getRhs());
-        break;
-      case 1: // Sub
-        rewriter.replaceOpWithNewOp<vdpp::SubOp>(
-          op, convertedType, adaptor.getLhs(), adaptor.getRhs());
-        break;
-      case 2: // Mul
+      case 1: // Mul
         rewriter.replaceOpWithNewOp<vdpp::MulOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 3: // Div (signed)
+      case 2: // Div
         rewriter.replaceOpWithNewOp<vdpp::DivOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 4: // Mod/Rem
-        // vDPP doesn't have mod, skip for now
-        return failure();
-      case 5: // Shl
-        rewriter.replaceOpWithNewOp<vdpp::ShlOp>(
+      case 3: // Mod
+        return op.emitError("vDPP mod not yet supported");
+      case 4: // Add
+        rewriter.replaceOpWithNewOp<vdpp::AddOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 6: // Shr (logical)
-        rewriter.replaceOpWithNewOp<vdpp::LShrOp>(
+      case 5: // Sub
+        rewriter.replaceOpWithNewOp<vdpp::SubOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 7: // Shr (arithmetic)
-        rewriter.replaceOpWithNewOp<vdpp::AShrOp>(
+      case 6: // AddSat
+        rewriter.replaceOpWithNewOp<vdpp::AddOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 8: // BAnd (bitwise and) - This is what you need!
-      case 10: // And (also bitwise and)
-        rewriter.replaceOpWithNewOp<vdpp::AndOp>(
+      case 7: // SubSat
+        rewriter.replaceOpWithNewOp<vdpp::SubOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 9: // BOr (bitwise or)
-      case 11: // Or
+      case 8: // BOr
         rewriter.replaceOpWithNewOp<vdpp::OrOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
-      case 12: // Xor
+      case 9: // BXor
         rewriter.replaceOpWithNewOp<vdpp::XorOp>(
+          op, convertedType, adaptor.getLhs(), adaptor.getRhs());
+        break;
+      case 10: // BAnd
+        rewriter.replaceOpWithNewOp<vdpp::AndOp>(
           op, convertedType, adaptor.getLhs(), adaptor.getRhs());
         break;
       default:
@@ -602,6 +613,129 @@ struct InstantiateOpErasePattern
                                   OpAdaptor /*adaptor*/,
                                   ConversionPatternRewriter &rewriter) const override {
         if (!op->use_empty()) return failure();  // Not ready yet; will retry
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// ── Counter / Register / Meter / Table call patterns ────────────────────────
+// Mirror the P4HIR→vDRMT patterns but emit vDPP ops.
+
+// p4hir.call_method @Counter::@count → vdpp.counter.count
+struct CounterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty()) return failure();
+        if (callee.getRootReference().getValue() != "Counter" ||
+            callee.getNestedReferences().back().getValue() != "count")
+            return failure();
+
+        Value instanceVal = op.getBase();
+        StringRef instanceName = "unknown_counter";
+        int32_t size = 1024;
+        if (auto instOp = instanceVal.getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
+            instanceName = instOp.getName();
+            if (!instOp.getArgOperands().empty())
+                if (auto cst = instOp.getArgOperands()[0]
+                                     .getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>())
+                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                        size = (int32_t)ia.getInt();
+        }
+        if (op.getArgOperands().empty()) return failure();
+        Value idx = adaptor.getArgOperands()[0];
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+        auto countOp = rewriter.replaceOpWithNewOp<vdpp::CounterCountOp>(op, symRef, idx);
+        countOp->setAttr("vdpp.counter_size", rewriter.getI32IntegerAttr(size));
+        return success();
+    }
+};
+
+// p4hir.call_method @Register::@read → vdpp.register.read
+// p4hir.call_method @Register::@write → vdpp.register.write
+struct RegisterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor adaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        auto callee = op.getCallee();
+        if (callee.getNestedReferences().empty()) return failure();
+        auto rootRef   = callee.getRootReference().getValue();
+        auto methodRef = callee.getNestedReferences().back().getValue();
+        if (rootRef != "Register") return failure();
+        if (methodRef != "read" && methodRef != "write") return failure();
+
+        Value instanceVal = op.getBase();
+        StringRef instanceName = "unknown_register";
+        int32_t size = 1024, elementWidth = 32;
+        if (auto instOp = instanceVal.getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
+            instanceName = instOp.getName();
+            if (!instOp.getArgOperands().empty())
+                if (auto cst = instOp.getArgOperands()[0]
+                                     .getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>())
+                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                        size = (int32_t)ia.getInt();
+            if (auto instType = instOp.getType())
+                if (auto intTy = dyn_cast<IntegerType>(instType))
+                    elementWidth = (int32_t)intTy.getWidth();
+        }
+        auto args   = adaptor.getArgOperands();
+        auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
+
+        if (methodRef == "read") {
+            if (args.empty()) return failure();
+            auto elemTy = rewriter.getIntegerType(elementWidth);
+            llvm::errs() << "  [RegisterCallPattern] read: instance=" << instanceName
+                         << " idx_type=" << args[0].getType()
+                         << " elem_type=" << elemTy << "\n";
+            auto readOp = rewriter.replaceOpWithNewOp<vdpp::RegisterReadOp>(
+                op, elemTy, symRef, args[0]);
+            readOp->setAttr("vdpp.register_size",          rewriter.getI32IntegerAttr(size));
+            readOp->setAttr("vdpp.register_element_width", rewriter.getI32IntegerAttr(elementWidth));
+        } else {
+            if (args.size() < 2) return failure();
+            auto writeOp = rewriter.create<vdpp::RegisterWriteOp>(
+                op.getLoc(), symRef, args[0], args[1]);
+            writeOp->setAttr("vdpp.register_size",          rewriter.getI32IntegerAttr(size));
+            writeOp->setAttr("vdpp.register_element_width", rewriter.getI32IntegerAttr(elementWidth));
+            rewriter.eraseOp(op);
+        }
+        return success();
+    }
+};
+
+// Drop p4hir.table_apply — on the software (ARM/DPA) path, the table match is
+// not performed by hardware; the block handler implements the action directly.
+struct TableApplyDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::TableApplyOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::TableApplyOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Drop p4hir.call — action bodies are inlined by the partitioner.
+struct CallOpDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
+        rewriter.eraseOp(op);
+        return success();
+    }
+};
+
+// Drop leftover p4hir.call_method that wasn't matched by a specific extern
+// pattern (Counter/Register/Hash5Tuple). Lower priority than those patterns.
+struct CallMethodDropPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp> {
+    using OpConversionPattern::OpConversionPattern;
+    LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::CallMethodOp op,
+                                  OpAdaptor,
+                                  ConversionPatternRewriter &rewriter) const override {
         rewriter.eraseOp(op);
         return success();
     }
@@ -1286,6 +1420,12 @@ private:
 
     // Mark func.return as illegal so it gets converted to vdpp.return
     target.addIllegalOp<func::ReturnOp>();
+
+    // Allow unrealized_conversion_cast to persist — they bridge type gaps
+    // between P4HIR types (!p4hir.bit<N>) and builtin types (iN) when
+    // conversion patterns fire in different order. A post-conversion
+    // cleanup pass can reconcile or erase them.
+    target.addLegalOp<mlir::UnrealizedConversionCastOp>();
     
     // Helper: build the full pattern set.  Called twice — once for the main
     // conversion, and once for a follow-up pass that handles ops in blocks
@@ -1302,7 +1442,8 @@ private:
         AssignOpConversion,
         StructExtractOpConversion,
         StructExtractRefOpConversion,
-        Hash5TupleCallPattern,
+        TableApplyDropPattern,
+        CallOpDropPattern,
         InstantiateOpErasePattern,
         VariableOpConversion,
         ScopeOpConversion,
@@ -1310,6 +1451,13 @@ private:
         BrOpConversion,
         CondBrOpConversion
       >(typeConverter, context);
+      // Extern call patterns: higher benefit so they match before CallMethodDropPattern.
+      p.add<
+        Hash5TupleCallPattern,
+        CounterCallPattern,
+        RegisterCallPattern
+      >(typeConverter, context, /*benefit=*/PatternBenefit(2));
+      p.add<CallMethodDropPattern>(typeConverter, context, /*benefit=*/PatternBenefit(1));
       p.add<IfOpConversion>(typeConverter, context, exitInfo);
       p.add<ReturnOpConversion>(typeConverter, context, exitInfo);
       return p;
@@ -1377,20 +1525,58 @@ private:
         instOp->erase();
     });
 
-    // Declare Hash5Tuple instances used in this block at module scope.
-    // Each block module is self-contained, so the instance declaration must
-    // be present in the same vdpp.mlir file as the apply op that uses it.
+    // Declare VFFA instances used in this block at module scope.
+    // Each block module is self-contained, so instance declarations must
+    // be present in the same vdpp.mlir file as the ops that reference them.
     {
       std::set<std::string> declaredInstances;
+      OpBuilder instBuilder(vdppModule.getBody(),
+                            vdppModule.getBody()->begin());
+
       vdppFunc.walk([&](vdpp::Hash5TupleApplyOp applyOp) {
         std::string instName = applyOp.getInstance().str();
-        if (declaredInstances.insert(instName).second) {
-          OpBuilder instBuilder(vdppModule.getBody(),
-                                vdppModule.getBody()->begin());
+        if (declaredInstances.insert(instName).second)
           instBuilder.create<vdpp::Hash5TupleInstanceOp>(
               vdppFunc.getLoc(),
               instBuilder.getStringAttr(StringRef(instName)));
-        }
+      });
+
+      vdppFunc.walk([&](vdpp::CounterCountOp countOp) {
+        std::string instName = countOp.getInstance().str();
+        int32_t size = 1024;
+        if (auto attr = countOp->getAttrOfType<IntegerAttr>("vdpp.counter_size"))
+          size = (int32_t)attr.getInt();
+        if (declaredInstances.insert(instName).second)
+          instBuilder.create<vdpp::CounterInstanceOp>(
+              vdppFunc.getLoc(),
+              instBuilder.getStringAttr(StringRef(instName)),
+              instBuilder.getI32IntegerAttr(size));
+      });
+
+      // Register instances: collect from both read and write ops.
+      auto declareRegister = [&](StringRef instName, int32_t size, int32_t elemWidth) {
+        if (declaredInstances.insert(instName.str()).second)
+          instBuilder.create<vdpp::RegisterInstanceOp>(
+              vdppFunc.getLoc(),
+              instBuilder.getStringAttr(instName),
+              instBuilder.getI32IntegerAttr(size),
+              instBuilder.getI32IntegerAttr(elemWidth));
+      };
+      vdppFunc.walk([&](vdpp::RegisterReadOp readOp) {
+        int32_t size = 1024, elemWidth = 32;
+        if (auto a = readOp->getAttrOfType<IntegerAttr>("vdpp.register_size"))
+          size = (int32_t)a.getInt();
+        if (auto a = readOp->getAttrOfType<IntegerAttr>("vdpp.register_element_width"))
+          elemWidth = (int32_t)a.getInt();
+        declareRegister(readOp.getInstance(), size, elemWidth);
+      });
+      vdppFunc.walk([&](vdpp::RegisterWriteOp writeOp) {
+        int32_t size = 1024, elemWidth = 32;
+        if (auto a = writeOp->getAttrOfType<IntegerAttr>("vdpp.register_size"))
+          size = (int32_t)a.getInt();
+        if (auto a = writeOp->getAttrOfType<IntegerAttr>("vdpp.register_element_width"))
+          elemWidth = (int32_t)a.getInt();
+        declareRegister(writeOp.getInstance(), size, elemWidth);
       });
     }
 
