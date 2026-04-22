@@ -207,18 +207,19 @@ rss  = "{var}.type = DOCA_FLOW_FWD_RSS;\n    {var}.rss_outer_flags = DOCA_FLOW_R
 #   {idx} — meta.u32 slot index
 #   {val} — constant value (hex or decimal)
 
+# DOCA 2.2 action_desc uses `.copy.{src,dst}` and `.add.{dst}` instead of
+# the 2.9 `.field.{orig,modif}` layout. The `width` field is also explicit
+# per-union-variant (not shared).
 [action_desc]
 copy = """    desc_array[{i}].type = DOCA_FLOW_ACTION_COPY;
-    desc_array[{i}].field.orig.field_string  = "{src_field}";
-    desc_array[{i}].field.orig.bit_offset    = {src_offset};
-    desc_array[{i}].field.modif.field_string = "{dst_field}";
-    desc_array[{i}].field.modif.bit_offset   = {dst_offset};"""
+    desc_array[{i}].copy.src.field_string  = "{src_field}";
+    desc_array[{i}].copy.src.bit_offset    = {src_offset};
+    desc_array[{i}].copy.dst.field_string  = "{dst_field}";
+    desc_array[{i}].copy.dst.bit_offset    = {dst_offset};"""
 
 add = """    desc_array[{i}].type = DOCA_FLOW_ACTION_ADD;
-    desc_array[{i}].field.orig.field_string  = "{src_field}";
-    desc_array[{i}].field.orig.bit_offset    = {src_offset};
-    desc_array[{i}].field.modif.field_string = "{dst_field}";
-    desc_array[{i}].field.modif.bit_offset   = {dst_offset};"""
+    desc_array[{i}].add.dst.field_string   = "{dst_field}";
+    desc_array[{i}].add.dst.bit_offset     = {dst_offset};"""
 
 set_meta = "actions.meta.u32[{idx}] = {val};"
 

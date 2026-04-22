@@ -537,6 +537,69 @@ def vDPP_Hash5TupleApplyOp : vDPP_Op<"hash5tuple.apply",
     }];
 }
 
+def vDPP_RegisterInstanceOp : vDPP_Op<"register_instance",
+        [Symbol, VFFAInstanceOpInterface]> {
+    let summary = "Declare a software register array at module scope (vDPP level)";
+    let description = [{
+        Declares a named register array (key-value store) for use in
+        programmable blocks.  On ARM, the backend is an RTE hash table
+        (size configurable, default 4096).
+
+        Example:
+          vdpp.register_instance @pkt_counter {size = 1024 : i32, element_width = 32 : i32}
+    }];
+    let arguments = (ins
+        SymbolNameAttr:$sym_name,
+        I32Attr:$size,
+        I32Attr:$element_width
+    );
+    let assemblyFormat = "$sym_name attr-dict";
+}
+
+def vDPP_RegisterReadOp : vDPP_Op<"register.read",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Read one element from a software register array";
+    let description = [{
+        Reads the value at the given index from a register instance.
+        On ARM, this performs an RTE hash lookup.
+
+        Example:
+          %val = vdpp.register.read @pkt_counter[%idx] : i32 -> i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index
+    );
+    let results = (outs AnyInteger:$result);
+    let assemblyFormat = "$instance `[` $index `]` `:` type($index) `->` type($result) attr-dict";
+    let extraClassDeclaration = [{
+        mlir::ValueRange getInputs() { return {getIndex()}; }
+        void removeHelperAttrs() {}
+    }];
+}
+
+def vDPP_RegisterWriteOp : vDPP_Op<"register.write",
+        [VFFAExecuteOpInterface]> {
+    let summary = "Write one element into a software register array";
+    let description = [{
+        Writes a value at the given index into a register instance.
+        On ARM, this performs an RTE hash insert/update.
+
+        Example:
+          vdpp.register.write @pkt_counter[%idx] = %val : i32, i32
+    }];
+    let arguments = (ins
+        FlatSymbolRefAttr:$instance,
+        AnyInteger:$index,
+        AnyInteger:$value
+    );
+    let assemblyFormat = "$instance `[` $index `]` `=` $value `:` type($index) `,` type($value) attr-dict";
+    let extraClassDeclaration = [{
+        mlir::ValueRange getInputs() { return {getIndex(), getValue()}; }
+        void removeHelperAttrs() {}
+    }];
+}
+
 //===----------------------------------------------------------------------===//
 // SHA / RegEx / Compression (Fixed-Function Accelerators)
 //===----------------------------------------------------------------------===//

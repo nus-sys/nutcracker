@@ -819,14 +819,19 @@ mlir::LogicalResult doGenerate(MLIRContext *ctx, llvm::StringRef inputDir,
         int mainNext = (hitNext >= 0) ? hitNext : defaultNext;
 
         auto emitFwd = [&](const std::string &var, int nextId) {
-            if (nextId == -1 || !pipeBlockIds.count(nextId)) {
-                // No successor, or successor is a DPA/ARM block not in the
-                // BF2 pipe set — egress via port (matches FWD_PORT pattern).
+            if (nextId == -1) {
                 out << "    " << tmpl.render("fwd.port", {{"var", var}}) << "\n";
                 return;
             }
+            // Check hardware mapping FIRST — ARM/DPA blocks need FWD_RSS
+            // even though they're not in the DRMT pipe set.
             auto hwIt = blockHwMap.find(nextId);
             int hw = (hwIt != blockHwMap.end()) ? hwIt->second : 0;
+            if (!pipeBlockIds.count(nextId) && hw == 0) {
+                // Not a DRMT pipe AND not mapped to ARM/DPA — egress via port.
+                out << "    " << tmpl.render("fwd.port", {{"var", var}}) << "\n";
+                return;
+            }
             if (hw == 2) { // ARM
                 auto qIt = armQueueMap.find(nextId);
                 int qidx = (qIt != armQueueMap.end()) ? qIt->second : 0;
