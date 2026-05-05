@@ -20,6 +20,7 @@
 #include "Pass/BF3DRMTToDocaFlowPass.h"
 
 #include "Dialect/vDPP/IR/vDPPDialect.h"
+#include "Dialect/vDRMT/IR/vDRMTDialect.h"
 #include "Dialect/Backend/BF3/DPA/IR/BF3DPADialect.h"
 #include "Dialect/Backend/BF3/DRMT/IR/BF3DRMTDialect.h"
 #include "Dialect/Backend/BF3/DRMT/IR/BF3DRMTOps.h"
@@ -275,6 +276,7 @@ public:
 
     void getDependentDialects(mlir::DialectRegistry &registry) const override {
         registry.insert<mlir::vdpp::vDPPDialect>();
+        registry.insert<mlir::vdrmt::vDRMTDialect>();
         registry.insert<mlir::bf3dpa::BF3DPADialect>();
         registry.insert<mlir::bf3drmt::BF3DRMTDialect>();
         registry.insert<mlir::func::FuncDialect>();
