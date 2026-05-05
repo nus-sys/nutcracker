@@ -299,12 +299,91 @@
     (bf3drmt_assign ?val ?ref)
     :ruleset rules)
 
-;; ── Arithmetic binop: forward supported kinds directly ────────────────────
-;;   BinOpKind values: Mod=3, Add=4, Sub=5, AddSat=6, SubSat=7
+;; ── Arithmetic binop: forward valid kinds to bf3drmt ─────────────────────
+;;   BF3DRMT valid BinOpKind: Mod=3, Add=4, Sub=5, AddSat=6, SubSat=7,
+;;   Or=8, Xor=9, And=10.
+;;   Mul=1 and Div=2 are intentionally absent from BF3DRMTBinOpKind — they
+;;   are expanded to shift+add equivalents by the rules below.
 
-(rewrite
-    (vdrmt_binop ?lhs ?rhs ?kind ?t)
-    (bf3drmt_binop ?lhs ?rhs ?kind ?t)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 3  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 3  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 4  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 4  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 5  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 5  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 6  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 6  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 7  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 7  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 8  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 8  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 9  (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 9  (I32))) ?t) :ruleset rules)
+(rewrite (vdrmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 10 (I32))) ?t)
+         (bf3drmt_binop ?l ?r (NamedAttr "kind" (IntegerAttr 10 (I32))) ?t) :ruleset rules)
+
+;; ── Mul by compile-time power-of-2 constant → shl ────────────────────────
+;;   mul(2, x) or mul(x, 2)  →  shl(x, 1)
+;;   mul(3, x) or mul(x, 3)  →  add(x, shl(x, 1))   [x + 2x = 3x]
+;;   mul(4, x) or mul(x, 4)  →  shl(x, 2)
+;;   The introduced vdrmt_shl nodes are caught by the const-shl rules above
+;;   and further rewritten to concat+slice (BF3 native form).
+
+(rule
+    ((= ?mul (vdrmt_binop ?cst ?x (NamedAttr "kind" (IntegerAttr 1 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 2 (I32))) ?t)))
+    ((union ?mul (vdrmt_shl ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 1 (I32))) ?t) ?t)))
+    :ruleset rules)
+(rule
+    ((= ?mul (vdrmt_binop ?x ?cst (NamedAttr "kind" (IntegerAttr 1 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 2 (I32))) ?t)))
+    ((union ?mul (vdrmt_shl ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 1 (I32))) ?t) ?t)))
+    :ruleset rules)
+
+(rule
+    ((= ?mul (vdrmt_binop ?cst ?x (NamedAttr "kind" (IntegerAttr 1 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 3 (I32))) ?t)))
+    ((union ?mul
+        (bf3drmt_binop ?x
+            (vdrmt_shl ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 1 (I32))) ?t) ?t)
+            (NamedAttr "kind" (IntegerAttr 4 (I32))) ?t)))
+    :ruleset rules)
+(rule
+    ((= ?mul (vdrmt_binop ?x ?cst (NamedAttr "kind" (IntegerAttr 1 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 3 (I32))) ?t)))
+    ((union ?mul
+        (bf3drmt_binop ?x
+            (vdrmt_shl ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 1 (I32))) ?t) ?t)
+            (NamedAttr "kind" (IntegerAttr 4 (I32))) ?t)))
+    :ruleset rules)
+
+(rule
+    ((= ?mul (vdrmt_binop ?cst ?x (NamedAttr "kind" (IntegerAttr 1 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 4 (I32))) ?t)))
+    ((union ?mul (vdrmt_shl ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 2 (I32))) ?t) ?t)))
+    :ruleset rules)
+(rule
+    ((= ?mul (vdrmt_binop ?x ?cst (NamedAttr "kind" (IntegerAttr 1 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 4 (I32))) ?t)))
+    ((union ?mul (vdrmt_shl ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 2 (I32))) ?t) ?t)))
+    :ruleset rules)
+
+;; ── Div by compile-time power-of-2 constant → shr ────────────────────────
+;;   div(x, 2)  →  shr(x, 1)
+;;   div(x, 4)  →  shr(x, 2)
+;;   The introduced vdrmt_shr nodes are caught by the const-shr rules above
+;;   and rewritten to concat+slice.
+
+(rule
+    ((= ?div (vdrmt_binop ?x ?cst (NamedAttr "kind" (IntegerAttr 2 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 2 (I32))) ?t)))
+    ((union ?div (vdrmt_shr ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 1 (I32))) ?t) ?t)))
+    :ruleset rules)
+
+(rule
+    ((= ?div (vdrmt_binop ?x ?cst (NamedAttr "kind" (IntegerAttr 2 (I32))) ?t))
+     (= ?cst (vdrmt_constant (NamedAttr "value" (IntegerAttr 4 (I32))) ?t)))
+    ((union ?div (vdrmt_shr ?x (vdrmt_constant (NamedAttr "value" (IntegerAttr 2 (I32))) ?t) ?t)))
     :ruleset rules)
 
 ;; ── Struct access pattern: struct_extract(read(src, struct_t), field, T) ──
