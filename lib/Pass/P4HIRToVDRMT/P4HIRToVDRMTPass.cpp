@@ -622,6 +622,11 @@ public:
       } else {
         newValueAttr = valueAttr;
       }
+    } else if (auto boolAttr =
+                   mlir::dyn_cast<P4::P4MLIR::P4HIR::BoolAttr>(valueAttr)) {
+      // !p4hir.bool true/false → IntegerAttr(i1, 1/0)
+      convertedType = IntegerType::get(op.getContext(), 1);
+      newValueAttr  = IntegerAttr::get(convertedType, boolAttr.getValue() ? 1 : 0);
     } else if (auto validityAttr =
                    mlir::dyn_cast<P4::P4MLIR::P4HIR::ValidityBitAttr>(valueAttr)) {
       // validity.bit valid → 1 : i1, invalid → 0 : i1
@@ -818,6 +823,61 @@ public:
         op, convertedType, rewriter.getStringAttr(name),
         /*init=*/nullptr);
     return success();
+  }
+};
+
+// Convert p4hir.unary → vDRMT equivalent.
+//   not(x)  → vdrmt.cmp(eq, x, 0)   [EQ kind = 5]
+//   minus(x)→ vdrmt.binop(sub, 0, x)
+//   cmpl(x) → vdrmt.binop(xor, x, -1)
+//   plus(x) → x  (identity)
+class UnaryOpConversion : public OpConversionPattern<P4::P4MLIR::P4HIR::UnaryOp> {
+public:
+  using OpConversionPattern::OpConversionPattern;
+
+  LogicalResult matchAndRewrite(P4::P4MLIR::P4HIR::UnaryOp op,
+                                OpAdaptor adaptor,
+                                ConversionPatternRewriter &rewriter) const override {
+    using K = P4::P4MLIR::P4HIR::UnaryOpKind;
+
+    Type convertedType = getTypeConverter()->convertType(op.getType());
+    if (!convertedType) return failure();
+
+    switch (op.getKind()) {
+    case K::LNot: {
+      // !x  →  cmp(eq, x, 0)
+      auto zero = rewriter.create<vdrmt::ConstantOp>(
+          op.getLoc(), convertedType, rewriter.getIntegerAttr(convertedType, 0));
+      rewriter.replaceOpWithNewOp<vdrmt::CmpOp>(
+          op, rewriter.getI1Type(),
+          adaptor.getInput(), zero.getResult(),
+          rewriter.getI32IntegerAttr(5)); // EQ = 5
+      return success();
+    }
+    case K::Neg: {
+      // -x  →  binop(sub, 0, x)
+      auto zero = rewriter.create<vdrmt::ConstantOp>(
+          op.getLoc(), convertedType, rewriter.getIntegerAttr(convertedType, 0));
+      rewriter.replaceOpWithNewOp<vdrmt::BinOp>(
+          op, convertedType, vdrmt::BinOpKind::Sub,
+          zero.getResult(), adaptor.getInput());
+      return success();
+    }
+    case K::Cmpl: {
+      // ~x  →  binop(xor, x, -1)
+      auto allOnes = rewriter.create<vdrmt::ConstantOp>(
+          op.getLoc(), convertedType, rewriter.getIntegerAttr(convertedType, -1));
+      rewriter.replaceOpWithNewOp<vdrmt::BinOp>(
+          op, convertedType, vdrmt::BinOpKind::Xor,
+          adaptor.getInput(), allOnes.getResult());
+      return success();
+    }
+    case K::UPlus:
+      rewriter.replaceOp(op, adaptor.getInput());
+      return success();
+    default:
+      return failure();
+    }
   }
 };
 
@@ -1240,6 +1300,52 @@ private:
     }
   }
 
+  // Preprocess: fold p4hir.struct_extract(p4hir.table_apply)[field] → bool constant.
+  // In the vDRMT model every table always executes some action, so "hit" is
+  // always true and "miss" is always false.  After all struct_extract users of
+  // a table_apply are folded away the table_apply itself is erased (it will
+  // still be handled by TableApplyDropPattern if it has no struct_extract uses,
+  // but this pass covers the .hit/.miss/.action_run cases that trip the type
+  // converter because the table-result struct contains a P4HIR enum field).
+  static void lowerTableApplyHitCheck(func::FuncOp f) {
+    using namespace P4::P4MLIR::P4HIR;
+
+    SmallVector<StructExtractOp> worklist;
+    f.walk([&](StructExtractOp op) {
+      if (op.getInput().getDefiningOp<TableApplyOp>())
+        worklist.push_back(op);
+    });
+
+    for (auto extractOp : worklist) {
+      auto tableApply = extractOp.getInput().getDefiningOp<TableApplyOp>();
+      if (!tableApply) continue; // already erased by a prior iteration
+
+      MLIRContext *ctx = extractOp.getContext();
+      OpBuilder builder(extractOp);
+
+      // Identify the field name from the table-result struct type.
+      StringRef fieldName;
+      if (auto structTy = mlir::dyn_cast<StructType>(extractOp.getInput().getType())) {
+        unsigned idx = extractOp.getFieldIndex();
+        if (idx < structTy.getElements().size())
+          fieldName = structTy.getElements()[idx].name;
+      }
+
+      // hit → true, everything else (miss, action_run) → false.
+      bool val = (fieldName == "hit");
+      auto boolTy   = BoolType::get(ctx);
+      auto boolAttr = P4::P4MLIR::P4HIR::BoolAttr::get(ctx, boolTy, val);
+      // ConstOp has AllTypesMatch<["value","res"]> so type is inferred from the attr.
+      auto cst = builder.create<ConstOp>(extractOp.getLoc(), boolAttr);
+
+      extractOp.getResult().replaceAllUsesWith(cst.getResult());
+      extractOp->erase();
+
+      if (tableApply->use_empty())
+        tableApply->erase();
+    }
+  }
+
   LogicalResult generateBlockVDRMT(StringRef p4hirFile,
                                   StringRef vdrmtFile,
                                   BlockMetadata &meta,
@@ -1326,6 +1432,7 @@ private:
       BinOpConversion,
       ShrOpConversion,
       ShlOpConversion,
+      UnaryOpConversion,
       StructExtractOpConversion,
       StructExtractRefOpConversion,
       ConstOpConversion,
@@ -1368,6 +1475,11 @@ private:
     // Preprocess: lower p4hir.ternary(A, {yield B}, {yield false}) → binop(and,A,B)
     // This must happen before DialectConversion since ternary has no conversion pattern.
     lowerTernaryToBinOp(vdrmtFunc);
+    // Preprocess: fold struct_extract(table_apply)[hit/miss] → bool constant.
+    // Must run before DialectConversion: the table-result struct type contains a
+    // P4HIR enum field that the type converter can't handle, so the downstream
+    // StructExtractOpConversion would fail on adaptor.getInput().
+    lowerTableApplyHitCheck(vdrmtFunc);
 
     // Apply conversion
     if (failed(applyPartialConversion(vdrmtFunc, target, std::move(patterns)))) {

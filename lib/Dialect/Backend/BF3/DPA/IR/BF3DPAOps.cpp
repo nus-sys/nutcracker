@@ -67,6 +67,8 @@ mlir::LogicalResult ConstantOp::verify() {
     if (typedAttr.getType() != getRes().getType())
         return emitOpError("value type '") << typedAttr.getType()
                << "' does not match result type '" << getRes().getType() << "'";
+    if (mlir::isa<mlir::FloatType>(getRes().getType()))
+        return emitOpError("BF3DPA does not support floating-point types");
     return mlir::success();
 }
 
@@ -183,9 +185,13 @@ static mlir::LogicalResult checkPtrPartition(mlir::Value ptr,
 }
 
 mlir::LogicalResult LoadOp::verify() {
+    if (mlir::isa<mlir::FloatType>(getResult().getType()))
+        return emitOpError("BF3DPA does not support floating-point types");
     return checkPtrPartition(getPtr(), *this);
 }
 
 mlir::LogicalResult StoreOp::verify() {
+    if (mlir::isa<mlir::FloatType>(getValue().getType()))
+        return emitOpError("BF3DPA does not support floating-point types");
     return checkPtrPartition(getPtr(), *this);
 }

@@ -21,6 +21,7 @@
 #include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Ops.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Types.h"
+#include "p4mlir/Dialect/P4HIR/P4HIR_Attrs.h"
 #include "p4mlir/Transforms/Passes.h"
 #include "Dialect/vDPP/IR/vDPPDialect.h"
 #include "Dialect/vDPP/IR/vDPPOps.h"
@@ -672,14 +673,23 @@ struct RegisterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp
         int32_t size = 1024, elementWidth = 32;
         if (auto instOp = instanceVal.getDefiningOp<P4::P4MLIR::P4HIR::InstantiateOp>()) {
             instanceName = instOp.getName();
+            // Extract size from the first constructor argument.
+            // P4HIR uses IntAttr (not mlir::IntegerAttr) for bit<N> constants.
             if (!instOp.getArgOperands().empty())
                 if (auto cst = instOp.getArgOperands()[0]
-                                     .getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>())
-                    if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
+                                     .getDefiningOp<P4::P4MLIR::P4HIR::ConstOp>()) {
+                    if (auto ia = dyn_cast<P4::P4MLIR::P4HIR::IntAttr>(cst.getValue()))
+                        size = (int32_t)ia.getUInt();
+                    else if (auto ia = dyn_cast<IntegerAttr>(cst.getValue()))
                         size = (int32_t)ia.getInt();
-            if (auto instType = instOp.getType())
-                if (auto intTy = dyn_cast<IntegerType>(instType))
-                    elementWidth = (int32_t)intTy.getWidth();
+                }
+            // Extract element width from the ExternType's first type argument,
+            // e.g. !p4hir.extern<"Register"<!b16i>> → width 16.
+            if (auto extTy = dyn_cast<P4::P4MLIR::P4HIR::ExternType>(instOp.getType()))
+                if (!extTy.getTypeArguments().empty())
+                    if (auto bitsTy = dyn_cast<P4::P4MLIR::P4HIR::BitsType>(
+                            extTy.getTypeArguments()[0]))
+                        elementWidth = (int32_t)bitsTy.getWidth();
         }
         auto args   = adaptor.getArgOperands();
         auto symRef = FlatSymbolRefAttr::get(rewriter.getStringAttr(instanceName));
@@ -687,9 +697,6 @@ struct RegisterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp
         if (methodRef == "read") {
             if (args.empty()) return failure();
             auto elemTy = rewriter.getIntegerType(elementWidth);
-            llvm::errs() << "  [RegisterCallPattern] read: instance=" << instanceName
-                         << " idx_type=" << args[0].getType()
-                         << " elem_type=" << elemTy << "\n";
             auto readOp = rewriter.replaceOpWithNewOp<vdpp::RegisterReadOp>(
                 op, elemTy, symRef, args[0]);
             readOp->setAttr("vdpp.register_size",          rewriter.getI32IntegerAttr(size));
@@ -705,6 +712,41 @@ struct RegisterCallPattern : OpConversionPattern<P4::P4MLIR::P4HIR::CallMethodOp
         return success();
     }
 };
+
+// Preprocess: fold p4hir.struct_extract(p4hir.table_apply)[field] → bool constant.
+// Must run BEFORE applyPartialConversion: the table-result struct type contains a
+// P4HIR enum field (action_run) that the type converter cannot handle, so the
+// StructExtractOpConversion would fail on adaptor.getInput().
+// In the vDPP/software path every table is dispatched by the ARM handler, so
+// "hit" is always true (some action runs), "miss" is always false.
+static void lowerTableApplyHitCheck(func::FuncOp f) {
+    using namespace P4::P4MLIR::P4HIR;
+    SmallVector<StructExtractOp> worklist;
+    f.walk([&](StructExtractOp op) {
+        if (op.getInput().getDefiningOp<TableApplyOp>())
+            worklist.push_back(op);
+    });
+    for (auto extractOp : worklist) {
+        auto tableApply = extractOp.getInput().getDefiningOp<TableApplyOp>();
+        if (!tableApply) continue;
+        MLIRContext *ctx = extractOp.getContext();
+        OpBuilder builder(extractOp);
+        StringRef fieldName;
+        if (auto structTy = mlir::dyn_cast<StructType>(extractOp.getInput().getType())) {
+            unsigned idx = extractOp.getFieldIndex();
+            if (idx < structTy.getElements().size())
+                fieldName = structTy.getElements()[idx].name;
+        }
+        bool val = (fieldName == "hit");
+        auto boolTy   = BoolType::get(ctx);
+        auto boolAttr = P4::P4MLIR::P4HIR::BoolAttr::get(ctx, boolTy, val);
+        auto cst = builder.create<ConstOp>(extractOp.getLoc(), boolAttr);
+        extractOp.getResult().replaceAllUsesWith(cst.getResult());
+        extractOp->erase();
+        if (tableApply->use_empty())
+            tableApply->erase();
+    }
+}
 
 // Drop p4hir.table_apply — on the software (ARM/DPA) path, the table match is
 // not performed by hardware; the block handler implements the action directly.
@@ -1503,6 +1545,12 @@ private:
         bodyBuilder.clone(op, mapping);
     }
 
+    // Preprocess: fold struct_extract(table_apply)[hit/miss] → bool constant.
+    // Must run before applyPartialConversion for the same reason as in the
+    // vDRMT pass: the table-result struct carries a P4HIR enum that the type
+    // converter can't lower.
+    lowerTableApplyHitCheck(vdppFunc);
+
     // First conversion pass.
     if (failed(applyPartialConversion(vdppFunc, target, buildPatterns()))) {
       vdppModule.erase();
@@ -1523,6 +1571,21 @@ private:
     vdppFunc.walk([&](P4::P4MLIR::P4HIR::InstantiateOp instOp) {
       if (instOp->use_empty())
         instOp->erase();
+    });
+
+    // Remove dead unrealized_conversion_cast ops left by the type-conversion
+    // framework.  These arise when InstantiateOp (always-legal) consumes a
+    // cast-bridged value that later becomes dead once the InstantiateOp itself
+    // is erased (e.g. the Counter-size argument cast: i32 → !b32i).
+    // Walk in post-order so inner ops are visited before their users.
+    vdppFunc.walk([](mlir::UnrealizedConversionCastOp castOp) {
+      if (castOp->use_empty())
+        castOp->erase();
+    });
+    // A second pass removes any constants that became dead after the cast erasure.
+    vdppFunc.walk([](Operation *op) {
+      if (op->use_empty() && op->hasTrait<OpTrait::ConstantLike>())
+        op->erase();
     });
 
     // Declare VFFA instances used in this block at module scope.
