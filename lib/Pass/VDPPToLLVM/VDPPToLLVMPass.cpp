@@ -396,14 +396,76 @@ LogicalResult emitVDPPAsLLVMIR(int blockId, StringRef vdppFilePath,
         return failure();
     }
 
-    // Erase module-level vdpp.hash5tuple_instance declarations: they have no
-    // LLVM IR equivalent and would otherwise be flagged as illegal ops.
+    // Erase module-level instance declarations that have no LLVM IR equivalent.
     {
         llvm::SmallVector<mlir::Operation *> toErase;
         for (auto &op : *mod->getBody())
-            if (mlir::isa<vdpp::Hash5TupleInstanceOp>(op))
+            if (mlir::isa<vdpp::Hash5TupleInstanceOp,
+                          vdpp::CounterInstanceOp,
+                          vdpp::RegisterInstanceOp>(op))
                 toErase.push_back(&op);
         for (auto *op : toErase) op->erase();
+    }
+
+    // Lower vdpp.counter.count / vdpp.register.read/write to external LLVM
+    // function calls.  Each instance gets its own named extern, e.g.
+    //   nc_counter_count_syn_count(i32 idx)
+    //   nc_register_read_bloom_filter(i32 idx) → iW
+    //   nc_register_write_bloom_filter(i32 idx, iW val)
+    // The actual implementations are provided by the runtime.
+    {
+        MLIRContext *ctx = mod->getContext();
+        OpBuilder builder(ctx);
+        auto voidTy = LLVM::LLVMVoidType::get(ctx);
+        auto i32Ty  = IntegerType::get(ctx, 32);
+
+        auto getOrCreateFn = [&](StringRef name,
+                                  LLVM::LLVMFunctionType fnTy) -> LLVM::LLVMFuncOp {
+            if (auto fn = mod->lookupSymbol<LLVM::LLVMFuncOp>(name))
+                return fn;
+            builder.setInsertionPointToEnd(mod->getBody());
+            return builder.create<LLVM::LLVMFuncOp>(
+                mod->getLoc(), name, fnTy, LLVM::Linkage::External);
+        };
+
+        llvm::SmallVector<vdpp::CounterCountOp> counterOps;
+        mod->walk([&](vdpp::CounterCountOp op) { counterOps.push_back(op); });
+        for (auto op : counterOps) {
+            std::string fnName = "nc_counter_count_" + op.getInstance().str();
+            auto fn = getOrCreateFn(fnName,
+                LLVM::LLVMFunctionType::get(voidTy, {i32Ty}));
+            builder.setInsertionPoint(op);
+            builder.create<LLVM::CallOp>(op.getLoc(), fn,
+                                         ValueRange{op.getIndex()});
+            op.erase();
+        }
+
+        llvm::SmallVector<vdpp::RegisterReadOp> readOps;
+        mod->walk([&](vdpp::RegisterReadOp op) { readOps.push_back(op); });
+        for (auto op : readOps) {
+            Type elemTy = op.getResult().getType(); // already iW (builtin)
+            std::string fnName = "nc_register_read_" + op.getInstance().str();
+            auto fn = getOrCreateFn(fnName,
+                LLVM::LLVMFunctionType::get(elemTy, {i32Ty}));
+            builder.setInsertionPoint(op);
+            auto call = builder.create<LLVM::CallOp>(op.getLoc(), fn,
+                                                      ValueRange{op.getIndex()});
+            op.replaceAllUsesWith(call->getResult(0));
+            op.erase();
+        }
+
+        llvm::SmallVector<vdpp::RegisterWriteOp> writeOps;
+        mod->walk([&](vdpp::RegisterWriteOp op) { writeOps.push_back(op); });
+        for (auto op : writeOps) {
+            Type valTy = op.getValue().getType(); // already iW (builtin)
+            std::string fnName = "nc_register_write_" + op.getInstance().str();
+            auto fn = getOrCreateFn(fnName,
+                LLVM::LLVMFunctionType::get(voidTy, {i32Ty, valTy}));
+            builder.setInsertionPoint(op);
+            builder.create<LLVM::CallOp>(op.getLoc(), fn,
+                                         ValueRange{op.getIndex(), op.getValue()});
+            op.erase();
+        }
     }
 
     // Step 1: preprocess — fix function signature and vdpp.return.
