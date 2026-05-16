@@ -16,6 +16,8 @@
 #include "Pass/P4HIRPartitionPass.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Dialect.h"
 #include "p4mlir/Dialect/P4HIR/P4HIR_Ops.h"
+#include "p4mlir/Dialect/P4HIR/P4HIR_Attrs.h"
+#include "p4mlir/Dialect/P4HIR/P4HIR_Types.h"
 #include "Dialect/vDRMT/IR/vDRMTDialect.h"
 #include "Dialect/vDRMT/IR/vDRMTOps.h"
 #include "Dialect/vDPP/IR/vDPPDialect.h"
@@ -137,6 +139,12 @@ struct BasicBlock {
   bool hasNestedControlCall = false;
   bool setsDropBit = false;  // writes standard_meta.drop = 1
   bool isTerminal = false;   // synthetic forward/drop terminal block
+
+  // Table unfolding: match block holds key reads + lookup; action blocks hold bodies.
+  bool isTableMatchBlock = false;
+  bool isTableActionBlock = false;
+  std::string tableActionName;     // action name for action blocks
+  Operation *tableOpPtr = nullptr; // TableOp in original IR for match blocks
   
   struct MappingCapability {
     bool canMapToVDRMT = true;
@@ -671,6 +679,8 @@ private:
   // Implicit else: no-else if-condition block → index in blocks[] where
   // continuation starts (or past-end if nothing follows → wire to FORWARD).
   DenseMap<BasicBlock*, size_t> pendingImplicitElseIdx;
+  // Table match block → ordered list of per-action successor blocks.
+  DenseMap<BasicBlock*, SmallVector<BasicBlock*>> pendingActionSuccessors;
   
   SmallVector<BasicBlock*> flattenControl(ControlOp controlOp) {
     SmallVector<BasicBlock*> blocks;
@@ -700,20 +710,20 @@ private:
       return blocks;
     }
     
-    llvm::outs() << "    control_apply region has " << applyRegion->getBlocks().size() 
+    llvm::outs() << "    control_apply region has " << applyRegion->getBlocks().size()
                  << " blocks\n";
-    
+
     for (auto &mlirBlock : applyRegion->getBlocks()) {
-      llvm::outs() << "      Processing block with " << mlirBlock.getOperations().size() 
+      llvm::outs() << "      Processing block with " << mlirBlock.getOperations().size()
                    << " operations\n";
-      flattenBlock(&mlirBlock, blocks, controlName);
+      flattenBlock(&mlirBlock, blocks, controlName, controlOp);
     }
     
     return blocks;
   }
   
-  void flattenBlock(Block *mlirBlock, SmallVector<BasicBlock*> &blocks, 
-                    const std::string& controlName) {
+  void flattenBlock(Block *mlirBlock, SmallVector<BasicBlock*> &blocks,
+                    const std::string& controlName, ControlOp controlOp) {
     auto *bb = new BasicBlock();
     bb->blockId = nextBlockId++;
     bb->controlName = controlName;
@@ -741,7 +751,7 @@ private:
                      << " with " << bb->operations.size() << " ops\n";
 
         // Flatten branches and track successors.
-        auto branchSuccessors = flattenIfBranches(ifOp, blocks, bb, controlName);
+        auto branchSuccessors = flattenIfBranches(ifOp, blocks, bb, controlName, controlOp);
         pendingSuccessors[bb] = branchSuccessors;
 
         // If the P4 source had no else branch, record the index where the
@@ -755,25 +765,69 @@ private:
           pendingImplicitElseIdx[condBB] = blocks.size();
         
       } else if (auto tableApply = dyn_cast<TableApplyOp>(&op)) {
-        llvm::outs() << "            → TableApplyOp\n";
+        llvm::outs() << "            → TableApplyOp: unfolding into match + action blocks\n";
 
+        // Flush any pre-table ops as their own block.
         if (!bb->operations.empty()) {
           bb->analyze();
           blocks.push_back(bb);
-          // Pre-table ops block falls through to the table block (pushed next).
           pendingFallthroughIdx[bb] = blocks.size();
           bb = new BasicBlock();
           bb->blockId = nextBlockId++;
           bb->controlName = controlName;
         }
 
+        // Find the TableOp definition in the enclosing control.
+        TableOp tableOp;
+        auto tableName = tableApply.getCallee().getLeafReference();
+        controlOp.walk([&](TableOp t) {
+          if (t.getSymName() == tableName) {
+            tableOp = t;
+            return WalkResult::interrupt();
+          }
+          return WalkResult::advance();
+        });
+
+        // Build the match block: key reads + table lookup.
         bb->operations.push_back(&op);
+        bb->isTableMatchBlock = true;
         bb->hasTableApply = true;
+        if (tableOp) bb->tableOpPtr = tableOp.getOperation();
         bb->analyze();
         blocks.push_back(bb);
-        // Table block falls through to the first block created after it.
-        pendingFallthroughIdx[bb] = blocks.size();
+        BasicBlock *matchBlock = bb;
 
+        // Build one action block per action listed in table_actions.
+        SmallVector<BasicBlock*> actionBlocks;
+        if (tableOp) {
+          tableOp.walk([&](TableActionsOp actionsOp) {
+            for (auto &innerOp : actionsOp.getBody().front().getOperations()) {
+              if (auto actionRef = dyn_cast<TableActionOp>(&innerOp)) {
+                auto actionName = actionRef.getAction().getLeafReference().str();
+                auto *actionBB = new BasicBlock();
+                actionBB->blockId = nextBlockId++;
+                actionBB->controlName = controlName;
+                actionBB->isTableActionBlock = true;
+                actionBB->tableActionName = actionName;
+                actionBB->capability.canMapToVDRMT = true;
+                actionBB->capability.canMapToVDPP = true;
+                blocks.push_back(actionBB);
+                actionBlocks.push_back(actionBB);
+                llvm::outs() << "              Created action block " << actionBB->blockId
+                             << " for action '" << actionName << "'\n";
+              }
+            }
+            return WalkResult::interrupt();
+          });
+        }
+        pendingActionSuccessors[matchBlock] = actionBlocks;
+
+        // All action blocks fall through to the continuation (not yet pushed).
+        size_t continuationIdx = blocks.size();
+        for (auto *actionBB : actionBlocks)
+          pendingFallthroughIdx[actionBB] = continuationIdx;
+
+        // Start the post-table continuation block.
         bb = new BasicBlock();
         bb->blockId = nextBlockId++;
         bb->controlName = controlName;
@@ -795,16 +849,18 @@ private:
     }
   }
   
-  // NEW: Returns successors for linking later
+  // Returns successors for linking later
   SmallVector<BasicBlock*> flattenIfBranches(IfOp ifOp, SmallVector<BasicBlock*> &blocks,
-                                              BasicBlock *conditionBB, const std::string& controlName) {
+                                              BasicBlock *conditionBB,
+                                              const std::string& controlName,
+                                              ControlOp controlOp) {
     SmallVector<BasicBlock*> successors;
 
     // ── then branch ──────────────────────────────────────────────────────────
     llvm::outs() << "              Processing then branch (recursive)\n";
     size_t beforeThen = blocks.size();
     for (auto &thenBlock : ifOp.getThenRegion().getBlocks())
-      flattenBlock(&thenBlock, blocks, controlName);
+      flattenBlock(&thenBlock, blocks, controlName, controlOp);
 
     if (blocks.size() > beforeThen) {
       BasicBlock *thenEntry = blocks[beforeThen];
@@ -819,7 +875,7 @@ private:
       llvm::outs() << "              Processing else branch (recursive)\n";
       size_t beforeElse = blocks.size();
       for (auto &elseBlock : ifOp.getElseRegion().getBlocks())
-        flattenBlock(&elseBlock, blocks, controlName);
+        flattenBlock(&elseBlock, blocks, controlName, controlOp);
 
       if (blocks.size() > beforeElse) {
         BasicBlock *elseEntry = blocks[beforeElse];
@@ -837,7 +893,22 @@ private:
     llvm::outs() << "\n  Linking block successors...\n";
 
     for (auto *bb : blocks) {
-      if (pendingSuccessors.count(bb)) {
+      if (pendingActionSuccessors.count(bb)) {
+        // Table match block: one exit per action, in table_actions order.
+        auto &actionBlocks = pendingActionSuccessors[bb];
+        int exitId = 0;
+        for (auto *actionBB : actionBlocks) {
+          bb->successors.push_back(actionBB);
+          ControlFlowExit exit;
+          exit.exitId = exitId++;
+          exit.successorBlockId = actionBB->blockId;
+          exit.condition = actionBB->tableActionName;
+          bb->exits.push_back(exit);
+          actionBB->predecessors.push_back(bb);
+          llvm::outs() << "    Block " << bb->blockId << " action exit '"
+                       << actionBB->tableActionName << "' → Block " << actionBB->blockId << "\n";
+        }
+      } else if (pendingSuccessors.count(bb)) {
         // If-condition block: then/else branch exits.
         auto &successorBlocks = pendingSuccessors[bb];
         bb->successors = successorBlocks;
@@ -1005,6 +1076,17 @@ private:
     return success();
   }
     
+  // Create a zero-value placeholder constant for the given P4HIR bit type.
+  // Used to substitute action parameters (which come from table entries at
+  // runtime) when inlining action bodies into per-block MLIR for dataflow
+  // analysis — the specific value doesn't matter, only reads/writes do.
+  Value createZeroConst(OpBuilder &builder, Type type) {
+    auto bitsType = dyn_cast<BitsType>(type);
+    if (!bitsType) return {};
+    auto zeroAttr = IntAttr::get(type, llvm::APInt(bitsType.getWidth(), 0));
+    return builder.create<ConstOp>(UnknownLoc::get(context), zeroAttr);
+  }
+
   // Ensure that 'v' (a value defined in the original control) is available in
   // 'mapping'. If not, recursively clone its defining op (and all its
   // transitive dependencies) using 'builder'.
@@ -1107,74 +1189,106 @@ private:
       mapping.map(originalControl.getArgument(i), funcBody->getArgument(i));
     }
     
-    for (auto *op : bb->operations) {
-      if (auto ifOp = dyn_cast<IfOp>(op)) {
-        if (bb->branchPointIfOps.count(op)) {
-          // This IfOp was partitioned: its branches became separate blocks.
-          // Reconstruct with empty bodies (condition-only marker).
-          Value condition = ifOp.getCondition();
-          Value mappedCondition = mapping.lookupOrDefault(condition);
-
-          bool hasElse = !ifOp.getElseRegion().empty();
-
-          auto emptyBuilder = [](OpBuilder &b, Location loc) {
-            b.create<YieldOp>(loc);
-          };
-
-          if (hasElse) {
-            builder.create<IfOp>(
-              UnknownLoc::get(context),
-              mappedCondition,
-              true,
-              emptyBuilder,
-              DictionaryAttr(),
-              emptyBuilder,
-              DictionaryAttr()
-            );
-          } else {
-            builder.create<IfOp>(
-              UnknownLoc::get(context),
-              mappedCondition,
-              false,
-              emptyBuilder,
-              DictionaryAttr()
-            );
-          }
-        } else {
-          // Inline IfOp (action-level control flow): clone with full content,
-          // then inline any p4hir.call to actions so the output module is
-          // self-contained (no dangling callee references).
-          Operation *cloned = builder.clone(*op, mapping);
-          inlineActionCalls(cloned, originalControl, mapping);
-          for (unsigned i = 0; i < op->getNumResults(); ++i) {
-            mapping.map(op->getResult(i), cloned->getResult(i));
-          }
+    if (bb->isTableMatchBlock && bb->tableOpPtr) {
+      // Emit the key reads from the table_key region, then the table_apply.
+      auto tableOp = dyn_cast<TableOp>(bb->tableOpPtr);
+      tableOp.walk([&](TableKeyOp keyOp) {
+        for (auto &innerOp : keyOp.getBody().front().getOperations()) {
+          for (auto operand : innerOp.getOperands())
+            ensureAvailable(operand, mapping, builder);
+          Operation *cloned = builder.clone(innerOp, mapping);
+          for (unsigned i = 0; i < innerOp.getNumResults(); ++i)
+            mapping.map(innerOp.getResult(i), cloned->getResult(i));
         }
+        return WalkResult::interrupt();
+      });
+      // The table_apply op is always operations[0] for a match block.
+      if (!bb->operations.empty()) {
+        Operation *applyOp = bb->operations[0];
+        Operation *cloned = builder.clone(*applyOp, mapping);
+        for (unsigned i = 0; i < applyOp->getNumResults(); ++i)
+          mapping.map(applyOp->getResult(i), cloned->getResult(i));
+      }
 
-      } else {
-        // Ensure all values used in this op's subtree (including nested
-        // regions) that are defined outside this op are available in mapping.
-        // This covers extern instances (e.g. p4hir.instantiate @Hash5Tuple)
-        // defined at control scope but referenced inside p4hir.scope regions.
-        op->walk([&](Operation *nested) {
-          for (auto operand : nested->getOperands()) {
-            Operation *defOp = operand.getDefiningOp();
-            if (!defOp) continue; // block argument, already mapped
-            if (!op->isAncestor(defOp))
-              ensureAvailable(operand, mapping, builder);
+    } else if (bb->isTableActionBlock) {
+      // Find the action FuncOp — first in the control, then at module scope
+      // (e.g., NoAction is defined at the module level).
+      FuncOp actionFunc;
+      originalControl.walk([&](FuncOp f) {
+        if (f.getSymName() == bb->tableActionName) {
+          actionFunc = f;
+          return WalkResult::interrupt();
+        }
+        return WalkResult::advance();
+      });
+      if (!actionFunc) {
+        originalModule.walk([&](FuncOp f) {
+          if (f.getSymName() == bb->tableActionName) {
+            actionFunc = f;
+            return WalkResult::interrupt();
           }
+          return WalkResult::advance();
         });
-        Operation *cloned = builder.clone(*op, mapping);
-
-        for (unsigned i = 0; i < op->getNumResults(); ++i) {
-          mapping.map(op->getResult(i), cloned->getResult(i));
+      }
+      if (actionFunc && !actionFunc.getBody().empty()) {
+        Block &actionEntry = actionFunc.getBody().front();
+        // Map action function arguments (runtime table entry params) to zero
+        // placeholders — the concrete value is unknown statically, but reads
+        // and writes through hdr/meta remain visible for dataflow analysis.
+        for (auto arg : actionEntry.getArguments()) {
+          Value zero = createZeroConst(builder, arg.getType());
+          if (zero) mapping.map(arg, zero);
+        }
+        for (auto &aOp : actionEntry.getOperations()) {
+          if (aOp.hasTrait<OpTrait::IsTerminator>()) break;
+          for (auto operand : aOp.getOperands())
+            ensureAvailable(operand, mapping, builder);
+          Operation *cloned = builder.clone(aOp, mapping);
+          for (unsigned i = 0; i < aOp.getNumResults(); ++i)
+            mapping.map(aOp.getResult(i), cloned->getResult(i));
         }
       }
+
+    } else {
+      // Normal block: clone each op, handling IfOps specially.
+      for (auto *op : bb->operations) {
+        if (auto ifOp = dyn_cast<IfOp>(op)) {
+          if (bb->branchPointIfOps.count(op)) {
+            // Partitioned IfOp: emit a condition-only marker with empty bodies.
+            Value mappedCondition = mapping.lookupOrDefault(ifOp.getCondition());
+            bool hasElse = !ifOp.getElseRegion().empty();
+            auto emptyBuilder = [](OpBuilder &b, Location loc) {
+              b.create<YieldOp>(loc);
+            };
+            if (hasElse)
+              builder.create<IfOp>(UnknownLoc::get(context), mappedCondition, true,
+                                   emptyBuilder, DictionaryAttr(), emptyBuilder, DictionaryAttr());
+            else
+              builder.create<IfOp>(UnknownLoc::get(context), mappedCondition, false,
+                                   emptyBuilder, DictionaryAttr());
+          } else {
+            // Inline IfOp (action-level control flow) with full content.
+            Operation *cloned = builder.clone(*op, mapping);
+            inlineActionCalls(cloned, originalControl, mapping);
+            for (unsigned i = 0; i < op->getNumResults(); ++i)
+              mapping.map(op->getResult(i), cloned->getResult(i));
+          }
+        } else {
+          op->walk([&](Operation *nested) {
+            for (auto operand : nested->getOperands()) {
+              Operation *defOp = operand.getDefiningOp();
+              if (!defOp) continue;
+              if (!op->isAncestor(defOp))
+                ensureAvailable(operand, mapping, builder);
+            }
+          });
+          Operation *cloned = builder.clone(*op, mapping);
+          for (unsigned i = 0; i < op->getNumResults(); ++i)
+            mapping.map(op->getResult(i), cloned->getResult(i));
+        }
+      }
+      inlineActionCalls(func, originalControl, mapping);
     }
-    
-    // Inline any top-level action calls that weren't inside an IfOp
-    // (e.g. leaf blocks that contain only a bare action call like count_syn()).
-    inlineActionCalls(func, originalControl, mapping);
 
     builder.create<func::ReturnOp>(UnknownLoc::get(context));
 
@@ -1202,6 +1316,10 @@ private:
     meta["setsDropBit"] = bb->setsDropBit;
     meta["operations"] = (int64_t)bb->operations.size();
     meta["hasTableApply"] = bb->hasTableApply;
+    meta["isTableMatchBlock"] = bb->isTableMatchBlock;
+    meta["isTableActionBlock"] = bb->isTableActionBlock;
+    if (bb->isTableActionBlock)
+      meta["tableActionName"] = bb->tableActionName;
     meta["hasMemoryAccess"] = bb->hasMemoryAccess;
     meta["hasConditionalBranch"] = bb->hasConditionalBranch;
     meta["hasNestedControlCall"] = bb->hasNestedControlCall;
@@ -1273,8 +1391,10 @@ private:
         file << (bb->setsDropBit ? "fillcolor=\"salmon\"" : "fillcolor=\"lightgreen\"") << ", ";
       } else if (bb->hasConditionalBranch) {
         file << "fillcolor=\"lightyellow\", ";
-      } else if (bb->hasTableApply) {
+      } else if (bb->isTableMatchBlock) {
         file << "fillcolor=\"lightblue\", ";
+      } else if (bb->isTableActionBlock) {
+        file << "fillcolor=\"plum\", ";
       } else if (bb->hasMemoryAccess) {
         file << "fillcolor=\"lightgreen\", ";
       } else {
@@ -1300,7 +1420,8 @@ private:
         file << "━━━━━━━━━━━━━━━━━━\\nTotal: " << bb->operations.size() << " ops\\l";
 
         if (bb->hasConditionalBranch) file << "[BRANCH]\\l";
-        if (bb->hasTableApply)        file << "[TABLE]\\l";
+        if (bb->isTableMatchBlock)    file << "[TABLE MATCH]\\l";
+        if (bb->isTableActionBlock)   file << "[ACTION: " << bb->tableActionName << "]\\l";
         if (bb->hasMemoryAccess)      file << "[MEMORY]\\l";
         if (bb->setsDropBit)          file << "[DROP]\\l";
 
