@@ -1194,6 +1194,11 @@ private:
       auto tableOp = dyn_cast<TableOp>(bb->tableOpPtr);
       tableOp.walk([&](TableKeyOp keyOp) {
         for (auto &innerOp : keyOp.getBody().front().getOperations()) {
+          // Skip p4hir.match_key — it is a pure annotation declaring which
+          // fields are keys; the dataflow is already visible through the
+          // preceding read/struct_extract ops. Emitting it would require
+          // lowering pass support for a semantically dead op.
+          if (isa<TableKeyEntryOp>(&innerOp)) continue;
           for (auto operand : innerOp.getOperands())
             ensureAvailable(operand, mapping, builder);
           Operation *cloned = builder.clone(innerOp, mapping);
@@ -1202,13 +1207,9 @@ private:
         }
         return WalkResult::interrupt();
       });
-      // The table_apply op is always operations[0] for a match block.
-      if (!bb->operations.empty()) {
-        Operation *applyOp = bb->operations[0];
-        Operation *cloned = builder.clone(*applyOp, mapping);
-        for (unsigned i = 0; i < applyOp->getNumResults(); ++i)
-          mapping.map(applyOp->getResult(i), cloned->getResult(i));
-      }
+      // Do NOT emit p4hir.table_apply: its result is unused after unfolding
+      // (the action dispatch is encoded in the block graph exit edges) and
+      // it has no lowering in either vDRMT or vDPP after proper unfolding.
 
     } else if (bb->isTableActionBlock) {
       // Find the action FuncOp — first in the control, then at module scope
@@ -1241,8 +1242,16 @@ private:
         }
         for (auto &aOp : actionEntry.getOperations()) {
           if (aOp.hasTrait<OpTrait::IsTerminator>()) break;
-          for (auto operand : aOp.getOperands())
-            ensureAvailable(operand, mapping, builder);
+          // Walk nested regions so extern instances (e.g. Hash5Tuple) defined
+          // at control scope but used inside p4hir.scope regions are cloned.
+          aOp.walk([&](Operation *nested) {
+            for (auto operand : nested->getOperands()) {
+              Operation *defOp = operand.getDefiningOp();
+              if (!defOp) continue;
+              if (!aOp.isAncestor(defOp))
+                ensureAvailable(operand, mapping, builder);
+            }
+          });
           Operation *cloned = builder.clone(aOp, mapping);
           for (unsigned i = 0; i < aOp.getNumResults(); ++i)
             mapping.map(aOp.getResult(i), cloned->getResult(i));
